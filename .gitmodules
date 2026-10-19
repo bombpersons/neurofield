@@ -1,0 +1,3 @@
+[submodule "external/psx"]
+	path = external/psx
+	url = https://github.com/bombpersons/psx

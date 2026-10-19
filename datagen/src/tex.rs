@@ -1,0 +1,203 @@
+//! Eight fixed 64x64 4-bit CLUT textures, generated procedurally and packed
+//! into one VRAM texture page (4 across, 2 down) at x=640.
+
+use crate::rng::hash;
+use psx_gpu::prim::{Blend, Clut, Env, Prim, TexDepth, TexPage};
+use psx_gpu::vram::rgb8_to_rgb15;
+
+pub const N: usize = 8;
+pub const SIZE: usize = 64;
+const PAGE_X: u16 = 640;
+const CLUT_Y: u16 = 480;
+
+/// Dark and light ends of each texture's 16-step palette.
+const PALETTES: [([u8; 3], [u8; 3]); N] = [
+    ([40, 14, 10], [205, 115, 80]),
+    ([28, 28, 34], [175, 170, 150]),
+    ([34, 20, 8], [195, 145, 85]),
+    ([18, 26, 40], [225, 222, 200]),
+    ([10, 24, 8], [115, 175, 60]),
+    ([14, 17, 22], [155, 165, 175]),
+    ([40, 10, 42], [215, 175, 120]),
+    ([6, 10, 32], [245, 205, 90]),
+];
+
+pub struct Texture {
+    /// Palette indices, row-major 64x64.
+    pub idx: Vec<u8>,
+    pub pal: [[u8; 3]; 16],
+}
+
+pub fn page() -> TexPage {
+    TexPage::at(PAGE_X, 0, TexDepth::Clut4, Blend::Half)
+}
+
+pub fn clut(t: u8) -> Clut {
+    Clut::at(0, CLUT_Y + t as u16)
+}
+
+/// Top-left texel of texture `t` inside the page.
+pub fn uv_origin(t: u8) -> (u8, u8) {
+    ((t as usize % 4 * SIZE) as u8, (t as usize / 4 * SIZE) as u8)
+}
+
+/// Tileable value noise over a `period`-cell lattice, 0..1.
+fn value_noise(x: f32, y: f32, period: i32, seed: u64) -> f32 {
+    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let corner = |i: i32, j: i32| {
+        let (i, j) = (i.rem_euclid(period) as u64, j.rem_euclid(period) as u64);
+        (hash(seed ^ (i << 20) ^ (j << 40)) & 0xFFFF) as f32 / 65535.0
+    };
+    let s = |t: f32| t * t * (3.0 - 2.0 * t);
+    let (sx, sy) = (s(fx), s(fy));
+    let top = corner(x0, y0) * (1.0 - sx) + corner(x0 + 1, y0) * sx;
+    let bot = corner(x0, y0 + 1) * (1.0 - sx) + corner(x0 + 1, y0 + 1) * sx;
+    top * (1.0 - sy) + bot * sy
+}
+
+/// Fractal noise that tiles over the 64-texel texture.
+fn fbm(x: usize, y: usize, base: i32, octaves: u32, seed: u64) -> f32 {
+    let (mut sum, mut amp, mut norm, mut period) = (0.0, 1.0, 0.0, base);
+    for o in 0..octaves {
+        let scale = period as f32 / SIZE as f32;
+        sum += amp * value_noise(x as f32 * scale, y as f32 * scale, period, seed + o as u64);
+        norm += amp;
+        amp *= 0.5;
+        period *= 2;
+    }
+    sum / norm
+}
+
+fn texel(t: usize, x: usize, y: usize) -> f32 {
+    let n = fbm(x, y, 4, 4, 100 + t as u64);
+    let grain = fbm(x, y, 16, 2, 200 + t as u64);
+    match t {
+        // Brick: 16-texel courses, 32-texel bricks offset every other course.
+        0 => {
+            let row = y / 16;
+            let bx = (x + if row % 2 == 1 { 16 } else { 0 }) % 32;
+            if y % 16 < 2 || bx < 2 {
+                0.08 + 0.1 * grain
+            } else {
+                0.45 + 0.35 * n + 0.15 * grain
+            }
+        }
+        // Stone: noise with dark cracks along a ridge of a second noise field.
+        1 => {
+            let ridge = (fbm(x, y, 4, 3, 300) - 0.5).abs();
+            if ridge < 0.025 {
+                0.05
+            } else {
+                0.25 + 0.6 * n + 0.15 * grain
+            }
+        }
+        // Planks: 16-texel boards with wavy grain and a dark gap.
+        2 => {
+            if x % 16 == 0 {
+                0.05
+            } else {
+                let w = (y as f32 * 0.35 + n * 9.0 + (x / 16) as f32 * 2.1).sin() * 0.5 + 0.5;
+                0.3 + 0.45 * w + 0.15 * grain
+            }
+        }
+        // Tiles: 16-texel checker with grout.
+        3 => {
+            if x % 16 == 0 || y % 16 == 0 {
+                0.15
+            } else if (x / 16 + y / 16) % 2 == 0 {
+                0.75 + 0.2 * grain
+            } else {
+                0.35 + 0.2 * grain
+            }
+        }
+        // Moss: blotchy high-frequency noise.
+        4 => (0.2 + 0.8 * fbm(x, y, 8, 3, 400) * (0.6 + 0.6 * grain)).min(1.0),
+        // Grate: bars every 8 texels with rivets at crossings.
+        5 => {
+            let (bx, by) = (x % 8 < 2, y % 8 < 2);
+            if bx && by {
+                0.95
+            } else if bx || by {
+                0.55 + 0.25 * grain
+            } else {
+                0.04 + 0.08 * n
+            }
+        }
+        // Wallpaper: diamond lattice.
+        6 => {
+            let (u, v) = ((x % 16) as f32 - 7.5, (y % 16) as f32 - 7.5);
+            let d = u.abs() + v.abs();
+            if d < 3.5 {
+                0.9
+            } else if (d - 7.0).abs() < 1.0 {
+                0.15
+            } else {
+                0.45 + 0.2 * n
+            }
+        }
+        // Rings: concentric bands around the centre, warped by noise.
+        _ => {
+            let (u, v) = (x as f32 - 31.5, y as f32 - 31.5);
+            let r = (u * u + v * v).sqrt() + n * 10.0;
+            (r * 0.45).sin() * 0.4 + 0.5 + 0.1 * grain
+        }
+    }
+}
+
+pub fn make_all() -> Vec<Texture> {
+    (0..N)
+        .map(|t| {
+            let (lo, hi) = PALETTES[t];
+            let mut pal = [[0u8; 3]; 16];
+            for (i, c) in pal.iter_mut().enumerate() {
+                let k = i as f32 / 15.0;
+                for ch in 0..3 {
+                    c[ch] = (lo[ch] as f32 + (hi[ch] as f32 - lo[ch] as f32) * k).round() as u8;
+                }
+            }
+            let idx =
+                (0..SIZE * SIZE).map(|i| (texel(t, i % SIZE, i / SIZE).clamp(0.0, 1.0) * 15.0).round() as u8).collect();
+            Texture { idx, pal }
+        })
+        .collect()
+}
+
+/// GP0 uploads for the texture page and the CLUTs.
+pub fn uploads(texs: &[Texture]) -> Vec<Prim> {
+    // The page region is 256x128 texels = 64x128 halfwords (4 texels each).
+    let (w, h) = (64usize, 2 * SIZE);
+    let mut page = vec![0u16; w * h];
+    for (t, tex) in texs.iter().enumerate() {
+        let (u0, v0) = uv_origin(t as u8);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let (u, v) = (u0 as usize + x, v0 as usize + y);
+                page[v * w + u / 4] |= (tex.idx[y * SIZE + x] as u16) << ((u % 4) * 4);
+            }
+        }
+    }
+    let mut out = vec![Prim::Env(Env::Upload { x: PAGE_X, y: 0, w: w as u16, h: h as u16, data: page })];
+    for (t, tex) in texs.iter().enumerate() {
+        // 0x0000 is transparent on the PS1, so nudge pure black off it.
+        let data = tex.pal.iter().map(|&[r, g, b]| rgb8_to_rgb15(r, g, b).max(0x0421)).collect();
+        out.push(Prim::Env(Env::Upload { x: 0, y: CLUT_Y + t as u16, w: 16, h: 1, data }));
+    }
+    out
+}
+
+/// RGB8 atlas of all textures (256x128), laid out as in VRAM.
+pub fn atlas_rgb(texs: &[Texture]) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (4 * SIZE, 2 * SIZE);
+    let mut out = vec![0u8; w * h * 3];
+    for (t, tex) in texs.iter().enumerate() {
+        let (u0, v0) = uv_origin(t as u8);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let o = ((v0 as usize + y) * w + u0 as usize + x) * 3;
+                out[o..o + 3].copy_from_slice(&tex.pal[tex.idx[y * SIZE + x] as usize]);
+            }
+        }
+    }
+    (w as u32, h as u32, out)
+}
