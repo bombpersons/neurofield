@@ -3,15 +3,10 @@
 Local smoke test:
     python train/train.py --data data/test --out runs/smoke --small --steps 30
 
-On Colab, as a detached process that resumes from out/ckpt.pt (see colab_launch.py):
-    python train.py --data /content/data/train --out /content/out --minutes 100 --batch 32 \
-        --log-every 100 --sample-every 1000
-
-Or inside a persistent kernel (state survives between `colab exec` calls):
-    import sys; sys.path.insert(0, "/content/neurofield/train")
-    from train import Trainer
-    t = Trainer("/content/data/train", "/content/out")
-    t.run(minutes=8)        # repeat; writes samples, checkpoints and log.jsonl
+On Colab, run it inside the persistent kernel with train/colab_chunk.py: state
+survives between `colab exec` calls, and a busy kernel keeps a free-tier VM
+alive where a detached process does not. Mirror checkpoints locally with
+train/colab_sync.sh in case the VM is reclaimed anyway.
 """
 
 import argparse
