@@ -3,7 +3,8 @@
 //! Gouraud-shaded, affine-textured, dithered triangles through psx-gpu.
 //! Triangles near the camera are subdivided (as many games did) so that
 //! near-plane rejection leaves small gaps rather than whole missing walls.
-//! Fog darkens vertex colours by screen depth, fading to black.
+//! Light from a torch carried with the camera is added per vertex, then fog
+//! darkens vertex colours by screen depth, fading to black.
 
 use crate::scene::{Camera, Scene, Vert};
 use crate::tex;
@@ -42,6 +43,7 @@ fn mid(a: &Vert, b: &Vert) -> Vert {
         p: [0, 1, 2].map(|c| (a.p[c] + b.p[c]) / 2),
         uv: [0, 1].map(|c| ((a.uv[c] as u16 + b.uv[c] as u16) / 2) as u8),
         col: [0, 1, 2].map(|c| ((a.col[c] as u16 + b.col[c] as u16) / 2) as u8),
+        alb: [0, 1, 2].map(|c| ((a.alb[c] as u16 + b.alb[c] as u16) / 2) as u8),
     }
 }
 
@@ -52,6 +54,15 @@ struct Frame<'a> {
 }
 
 impl Frame<'_> {
+    /// Light from the torch carried with the camera: albedo × colour × falloff × Lambert.
+    fn torch(&self, v: &Vert, n: [f32; 3]) -> [f32; 3] {
+        let to = [0, 1, 2].map(|c| (self.cam.pos[c] - v.p[c]) as f32);
+        let dist = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt().max(1.0);
+        let fall = (1.0 - dist / self.cam.torch_radius.max(1) as f32).max(0.0).powi(2);
+        let lambert = ((n[0] * to[0] + n[1] * to[1] + n[2] * to[2]) / dist).max(0.0);
+        [0, 1, 2].map(|c| v.alb[c] as f32 * self.cam.torch[c] * fall * lambert)
+    }
+
     fn fog(&self, sz: u16) -> f32 {
         let t = (sz as f32 - self.cam.fog_near as f32) / (self.cam.fog_far - self.cam.fog_near).max(1) as f32;
         1.0 - t.clamp(0.0, 1.0)
@@ -81,10 +92,17 @@ impl Frame<'_> {
             return;
         }
         let otz = self.gte.avsz3();
+        // Triangles are wound along their outward normal.
+        let e1 = [0, 1, 2].map(|c| (v[1].p[c] - v[0].p[c]) as f32);
+        let e2 = [0, 1, 2].map(|c| (v[2].p[c] - v[0].p[c]) as f32);
+        let cr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let len = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt().max(1e-6);
+        let n = cr.map(|c| c / len);
         let verts = (0..3)
             .map(|i| {
                 let f = self.fog(r.sz[i]);
-                let c = v[i].col.map(|c| (c as f32 * f) as u8);
+                let t = self.torch(&v[i], n);
+                let c = [0, 1, 2].map(|k| ((v[i].col[k] as f32 + t[k]) * f).min(255.0) as u8);
                 PolyVertex {
                     xy: Xy(r.sxy[i].x, r.sxy[i].y),
                     color: Rgb(c[0], c[1], c[2]),

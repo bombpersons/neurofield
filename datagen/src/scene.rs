@@ -21,7 +21,10 @@ pub struct Vert {
     pub p: [i32; 3],
     /// Texel coordinates inside the texture page.
     pub uv: [u8; 2],
+    /// Baked lighting (ambient, sun, room lights) times the surface tint; 128 is neutral.
     pub col: [u8; 3],
+    /// Unlit surface tint on the same scale, for light added at render time.
+    pub alb: [u8; 3],
 }
 
 /// Wound so `(v1 - v0) x (v2 - v0)` points along the surface normal.
@@ -83,8 +86,10 @@ pub struct Scene {
     pub rooms: Vec<Room>,
     pub outdoor: bool,
     pub tris: Vec<Tri>,
-    /// Cells holding a prop, which the walker treats as solid.
+    /// Cells holding a prop or creature, which the walker treats as solid.
     pub blocked: Vec<bool>,
+    /// Cells kept clear of props and creatures (beside doors).
+    pub(crate) reserved: Vec<bool>,
     sun_dir: [f32; 3],
     sun_col: [f32; 3],
     ambient: [f32; 3],
@@ -103,14 +108,52 @@ pub struct Camera {
     pub h: u16,
     pub fog_near: i32,
     pub fog_far: i32,
+    /// Light carried with the camera: RGB strength (0 = none) and reach in world units.
+    pub torch: [f32; 3],
+    pub torch_radius: i32,
 }
 
-fn norm(v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn norm(v: [f32; 3]) -> [f32; 3] {
     let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
     [v[0] / l, v[1] / l, v[2] / l]
 }
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+/// 3x3 rotation, row-major: `apply(m, v)` = m · v.
+pub(crate) type M3 = [[f32; 3]; 3];
+
+pub(crate) fn apply(m: M3, v: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|r| m[r][0] * v[0] + m[r][1] * v[1] + m[r][2] * v[2])
+}
+
+pub(crate) fn mul(a: M3, b: M3) -> M3 {
+    [0, 1, 2].map(|r| [0, 1, 2].map(|c| (0..3).map(|k| a[r][k] * b[k][c]).sum()))
+}
+
+/// Yaw about the vertical axis: local +x turns toward +z as `a` grows.
+pub(crate) fn rot_y(a: f32) -> M3 {
+    let (s, c) = a.sin_cos();
+    [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]]
+}
+
+/// Pitch about local x: swings local +y (down) toward +z (forward) as `a` grows.
+pub(crate) fn rot_x(a: f32) -> M3 {
+    let (s, c) = a.sin_cos();
+    [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
+}
+
+/// Roll about local z: swings local +y (down) toward -x as `a` grows.
+pub(crate) fn rot_z(a: f32) -> M3 {
+    let (s, c) = a.sin_cos();
+    [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+}
+
+/// A warm, flickery torch: RGB strength around 1.
+pub fn torch_colour(rng: &mut Rng) -> [f32; 3] {
+    let k = rng.fr(0.8, 1.6);
+    [k, k * rng.fr(0.7, 0.85), k * rng.fr(0.45, 0.6)]
+}
+
+pub(crate) fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
@@ -138,7 +181,7 @@ impl Scene {
     }
 
     /// Floor y of cell (cx, cz) at world point `p` = (x, z); stairs are stepped.
-    fn cell_floor(&self, cx: i32, cz: i32, p: [f32; 2]) -> Option<f32> {
+    pub(crate) fn cell_floor(&self, cx: i32, cz: i32, p: [f32; 2]) -> Option<f32> {
         match self.cell(cx, cz) {
             Cell::Floor { y0, y1, axis, slope, .. } => {
                 let t = Self::along(cx, cz, axis, p);
@@ -154,7 +197,7 @@ impl Scene {
     }
 
     /// Ceiling y of cell (cx, cz) at `p`: a straight slope even over stairs.
-    fn cell_ceiling(&self, cx: i32, cz: i32, p: [f32; 2]) -> Option<f32> {
+    pub(crate) fn cell_ceiling(&self, cx: i32, cz: i32, p: [f32; 2]) -> Option<f32> {
         match self.cell(cx, cz) {
             Cell::Floor { y0, y1, axis, height, .. } => {
                 let t = Self::along(cx, cz, axis, p);
@@ -294,13 +337,18 @@ impl Scene {
             outdoor,
             tris: Vec::new(),
             blocked: vec![false; (w * d) as usize],
+            reserved: vec![false; (w * d) as usize],
             sun_dir: norm([rng.fr(-1.0, 1.0), rng.fr(0.6, 1.5), rng.fr(-1.0, 1.0)]),
             sun_col: [sun, sun * rng.fr(0.85, 1.0), sun * rng.fr(0.7, 1.0)],
             ambient: [amb * rng.fr(0.8, 1.0), amb * rng.fr(0.8, 1.0), amb],
             lights,
         };
         scene.build_level();
+        if !scene.outdoor {
+            scene.build_doors(rng);
+        }
         scene.build_props(rng);
+        scene.build_creatures(rng);
         scene
     }
 
@@ -391,7 +439,7 @@ impl Scene {
     }
 
     /// `uv` is relative to the texture's origin (0..=63).
-    fn tri(&mut self, mut v: [([i32; 3], [u8; 2]); 3], n: [f32; 3], tex: u8, tint: [f32; 3]) {
+    pub(crate) fn tri(&mut self, mut v: [([i32; 3], [u8; 2]); 3], n: [f32; 3], tex: u8, tint: [f32; 3]) {
         let e1 = [0, 1, 2].map(|c| (v[1].0[c] - v[0].0[c]) as f32);
         let e2 = [0, 1, 2].map(|c| (v[2].0[c] - v[0].0[c]) as f32);
         let cross = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
@@ -402,18 +450,19 @@ impl Scene {
             v.swap(1, 2);
         }
         let (u0, v0) = tex::uv_origin(tex);
-        let v = v.map(|(p, uv)| Vert { p, uv: [u0 + uv[0], v0 + uv[1]], col: self.shade(p, n, tint) });
+        let alb = tint.map(|c| (c * 128.0).clamp(0.0, 255.0) as u8);
+        let v = v.map(|(p, uv)| Vert { p, uv: [u0 + uv[0], v0 + uv[1]], col: self.shade(p, n, tint), alb });
         self.tris.push(Tri { v, tex });
     }
 
     /// Quad with corners in "Z" order (tl, tr, bl, br).
-    fn quad_uv(&mut self, c: [[i32; 3]; 4], uv: [[u8; 2]; 4], n: [f32; 3], tex: u8, tint: [f32; 3]) {
+    pub(crate) fn quad_uv(&mut self, c: [[i32; 3]; 4], uv: [[u8; 2]; 4], n: [f32; 3], tex: u8, tint: [f32; 3]) {
         self.tri([(c[0], uv[0]), (c[1], uv[1]), (c[2], uv[2])], n, tex, tint);
         self.tri([(c[1], uv[1]), (c[3], uv[3]), (c[2], uv[2])], n, tex, tint);
     }
 
     /// Quad textured with one full tile.
-    fn quad(&mut self, c: [[i32; 3]; 4], n: [f32; 3], tex: u8, tint: [f32; 3]) {
+    pub(crate) fn quad(&mut self, c: [[i32; 3]; 4], n: [f32; 3], tex: u8, tint: [f32; 3]) {
         self.quad_uv(c, [[0, 0], [63, 0], [0, 63], [63, 63]], n, tex, tint);
     }
 
@@ -587,13 +636,22 @@ impl Scene {
 
     /// Box standing at `base` (x, bottom y, z), yawed about the vertical axis.
     fn add_box(&mut self, base: [f32; 3], half: [f32; 2], height: f32, yaw: f32, tex: u8, tint: [f32; 3]) {
-        let (s, c) = yaw.sin_cos();
+        let centre = [base[0], base[1] - height / 2.0, base[2]];
+        self.add_obox(centre, rot_y(yaw), [half[0], height / 2.0, half[1]], tex, tint);
+    }
+
+    /// Box centred at `centre` with half extents `half` along the columns of `m`.
+    pub(crate) fn add_obox(&mut self, centre: [f32; 3], m: M3, half: [f32; 3], tex: u8, tint: [f32; 3]) {
+        // Local y = -half is the top (y points down), matching the face table.
         let p = |sx: usize, sy: usize, sz: usize| {
-            let (lx, lz) = (if sx == 1 { half[0] } else { -half[0] }, if sz == 1 { half[1] } else { -half[1] });
-            let y = base[1] - if sy == 1 { height } else { 0.0 };
-            [(base[0] + lx * c - lz * s).round() as i32, y.round() as i32, (base[2] + lx * s + lz * c).round() as i32]
+            let l = [
+                if sx == 1 { half[0] } else { -half[0] },
+                if sy == 1 { -half[1] } else { half[1] },
+                if sz == 1 { half[2] } else { -half[2] },
+            ];
+            let w = apply(m, l);
+            [0, 1, 2].map(|c| (centre[c] + w[c]).round() as i32)
         };
-        let rot = |n: [f32; 3]| [n[0] * c - n[2] * s, n[1], n[0] * s + n[2] * c];
         let faces: [([[usize; 3]; 4], [f32; 3]); 6] = [
             ([[1, 1, 0], [1, 1, 1], [1, 0, 0], [1, 0, 1]], [1.0, 0.0, 0.0]),
             ([[0, 1, 1], [0, 1, 0], [0, 0, 1], [0, 0, 0]], [-1.0, 0.0, 0.0]),
@@ -603,7 +661,7 @@ impl Scene {
             ([[0, 0, 1], [1, 0, 1], [0, 0, 0], [1, 0, 0]], [0.0, 1.0, 0.0]),
         ];
         for (corners, n) in faces {
-            self.quad(corners.map(|[x, y, z]| p(x, y, z)), rot(n), tex, tint);
+            self.quad(corners.map(|[x, y, z]| p(x, y, z)), apply(m, n), tex, tint);
         }
     }
 
@@ -620,33 +678,42 @@ impl Scene {
         self.quad([corners[0], corners[1], corners[3], corners[2]], [0.0, 1.0, 0.0], tex, tint);
     }
 
+    /// Reserve cell (cx, cz) of room `ri` for an obstacle, if that keeps the way
+    /// through clear: not in a narrow room, not beside a doorway or door, and
+    /// every other floor cell still reachable. Marks the cell blocked on success.
+    pub(crate) fn claim_cell(&mut self, ri: usize, cx: i32, cz: i32) -> bool {
+        let r = &self.rooms[ri];
+        let inside = |x: i32, z: i32| x >= r.x && x < r.x + r.w && z >= r.z && z < r.z + r.d;
+        let doorway = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .iter()
+            .any(|&(dx, dz)| !inside(cx + dx, cz + dz) && matches!(self.cell(cx + dx, cz + dz), Cell::Floor { .. }));
+        let k = (cz * self.w + cx) as usize;
+        if r.w < 3 || r.d < 3 || doorway || self.blocked[k] || self.reserved[k] {
+            return false;
+        }
+        let entry = (r.x + r.w / 2, r.z + r.d / 2);
+        let before = self.reachable(entry).len();
+        self.blocked[k] = true;
+        if (cx, cz) == entry || self.reachable(entry).len() < before - 1 {
+            self.blocked[k] = false;
+            return false;
+        }
+        true
+    }
+
     fn build_props(&mut self, rng: &mut Rng) {
         for ri in 0..self.rooms.len() {
             let r = self.rooms[ri].clone();
             let count = rng.range(0, if self.outdoor { 7 } else { 5 });
             for _ in 0..count {
                 let (cx, cz) = (r.x + rng.range(0, r.w), r.z + rng.range(0, r.d));
-                // Keep the way through clear: no props in narrow rooms or beside a doorway.
-                let inside = |x: i32, z: i32| x >= r.x && x < r.x + r.w && z >= r.z && z < r.z + r.d;
-                let doorway = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
-                    !inside(cx + dx, cz + dz) && matches!(self.cell(cx + dx, cz + dz), Cell::Floor { .. })
-                });
-                let k = (cz * self.w + cx) as usize;
-                if r.w < 3 || r.d < 3 || doorway || self.blocked[k] {
-                    continue;
-                }
-                // Only block the cell if every other floor cell stays reachable.
-                let entry = (r.x + r.w / 2, r.z + r.d / 2);
-                let before = self.reachable(entry).len();
-                self.blocked[k] = true;
-                if (cx, cz) == entry || self.reachable(entry).len() < before - 1 {
-                    self.blocked[k] = false;
+                if !self.claim_cell(ri, cx, cz) {
                     continue;
                 }
                 let (px, pz) = ((cx as f32 + rng.fr(0.25, 0.75)) * TF, (cz as f32 + rng.fr(0.25, 0.75)) * TF);
                 let fy = r.floor as f32;
                 let ceiling = if self.outdoor { 6.0 } else { r.height as f32 } * TF;
-                let tex = rng.next() as u8 % tex::N as u8;
+                let tex = rng.next() as u8 % 8;
                 let tint = [0, 1, 2].map(|_| rng.fr(0.5, 1.0));
                 match rng.range(0, 20) {
                     0..=8 => {
@@ -692,6 +759,8 @@ impl Scene {
             h: rng.range(110, 180) as u16,
             fog_near: (fog_near * TF) as i32,
             fog_far: ((fog_near + rng.fr(3.0, 10.0)) * TF) as i32,
+            torch: if rng.chance(0.5) { torch_colour(rng) } else { [0.0; 3] },
+            torch_radius: (rng.fr(2.0, 4.0) * TF) as i32,
         }
     }
 }

@@ -1,11 +1,18 @@
-//! Eight fixed 64x64 4-bit CLUT textures, generated procedurally and packed
-//! into one VRAM texture page (4 across, 2 down) at x=640.
+//! Twelve fixed 64x64 4-bit CLUT textures, generated procedurally and packed
+//! into one VRAM texture page (4 across, 3 down) at x=640: eight for the
+//! level, three for creatures and one for doors.
 
 use crate::rng::hash;
 use psx_gpu::prim::{Blend, Clut, Env, Prim, TexDepth, TexPage};
 use psx_gpu::vram::rgb8_to_rgb15;
 
-pub const N: usize = 8;
+pub const N: usize = 12;
+pub const SCALES: u8 = 8;
+pub const BONE: u8 = 9;
+pub const FUR: u8 = 10;
+pub const DOOR: u8 = 11;
+/// Rows of textures in the page.
+const ROWS: usize = N.div_ceil(4);
 pub const SIZE: usize = 64;
 const PAGE_X: u16 = 640;
 const CLUT_Y: u16 = 480;
@@ -20,6 +27,10 @@ const PALETTES: [([u8; 3], [u8; 3]); N] = [
     ([14, 17, 22], [155, 165, 175]),
     ([40, 10, 42], [215, 175, 120]),
     ([6, 10, 32], [245, 205, 90]),
+    ([8, 22, 18], [120, 170, 110]),
+    ([42, 36, 26], [230, 222, 195]),
+    ([22, 12, 8], [150, 105, 70]),
+    ([24, 14, 6], [170, 120, 70]),
 ];
 
 pub struct Texture {
@@ -137,10 +148,47 @@ fn texel(t: usize, x: usize, y: usize) -> f32 {
             }
         }
         // Rings: concentric bands around the centre, warped by noise.
-        _ => {
+        7 => {
             let (u, v) = (x as f32 - 31.5, y as f32 - 31.5);
             let r = (u * u + v * v).sqrt() + n * 10.0;
             (r * 0.45).sin() * 0.4 + 0.5 + 0.1 * grain
+        }
+        // Scales: offset rows of rounded plates, dark at the rims.
+        8 => {
+            let row = y / 8;
+            let (u, v) = (((x + row % 2 * 4) % 8) as f32 - 3.5, (y % 8) as f32 - 1.0);
+            let d = (u * u + v * v).sqrt() / 4.5;
+            (0.85 - d * 0.6 + 0.15 * grain).clamp(0.05, 1.0)
+        }
+        // Bone: pale and smooth, with thin dark cracks and pitting.
+        9 => {
+            let ridge = (fbm(x, y, 8, 2, 900) - 0.5).abs();
+            if ridge < 0.012 {
+                0.15
+            } else {
+                0.6 + 0.3 * n + 0.1 * grain
+            }
+        }
+        // Fur: vertical streaks that wander with noise.
+        10 => {
+            let w = ((x as f32 + n * 12.0) * 1.3).sin() * 0.5 + 0.5;
+            0.25 + 0.45 * w * (0.6 + 0.6 * grain)
+        }
+        // Door: vertical planks crossed by two iron bands with studs.
+        _ => {
+            let band = (14..20).contains(&y) || (44..50).contains(&y);
+            if band {
+                if x % 10 == 4 && (y == 16 || y == 46) {
+                    0.95
+                } else {
+                    0.12
+                }
+            } else if x % 16 == 0 {
+                0.05
+            } else {
+                let w = (y as f32 * 0.3 + n * 8.0 + (x / 16) as f32 * 1.7).sin() * 0.5 + 0.5;
+                0.35 + 0.4 * w + 0.1 * grain
+            }
         }
     }
 }
@@ -165,8 +213,8 @@ pub fn make_all() -> Vec<Texture> {
 
 /// GP0 uploads for the texture page and the CLUTs.
 pub fn uploads(texs: &[Texture]) -> Vec<Prim> {
-    // The page region is 256x128 texels = 64x128 halfwords (4 texels each).
-    let (w, h) = (64usize, 2 * SIZE);
+    // The page region is 256 texels wide = 64 halfwords (4 texels each).
+    let (w, h) = (64usize, ROWS * SIZE);
     let mut page = vec![0u16; w * h];
     for (t, tex) in texs.iter().enumerate() {
         let (u0, v0) = uv_origin(t as u8);
@@ -186,9 +234,9 @@ pub fn uploads(texs: &[Texture]) -> Vec<Prim> {
     out
 }
 
-/// RGB8 atlas of all textures (256x128), laid out as in VRAM.
+/// RGB8 atlas of all textures (256 wide), laid out as in VRAM.
 pub fn atlas_rgb(texs: &[Texture]) -> (u32, u32, Vec<u8>) {
-    let (w, h) = (4 * SIZE, 2 * SIZE);
+    let (w, h) = (4 * SIZE, ROWS * SIZE);
     let mut out = vec![0u8; w * h * 3];
     for (t, tex) in texs.iter().enumerate() {
         let (u0, v0) = uv_origin(t as u8);

@@ -4,7 +4,7 @@
 //! straight across open floor, and now and then stops to look around.
 
 use crate::rng::Rng;
-use crate::scene::{Camera, Scene, MAX_STEP, T};
+use crate::scene::{torch_colour, Camera, Scene, MAX_STEP, T};
 use std::collections::VecDeque;
 
 const TF: f32 = T as f32;
@@ -33,6 +33,8 @@ pub struct Walker {
     target_pitch: f32,
     fog_near: i32,
     fog_far: i32,
+    torch: [f32; 3],
+    torch_radius: i32,
 }
 
 fn centre(c: (i32, i32)) -> (f32, f32) {
@@ -72,6 +74,8 @@ impl Walker {
             target_pitch: 0.0,
             fog_near: fog_near as i32,
             fog_far: (fog_near + rng.fr(3.0, 6.0) * TF) as i32,
+            torch: if rng.chance(0.75) { torch_colour(rng) } else { [0.0; 3] },
+            torch_radius: (rng.fr(2.0, 4.0) * TF) as i32,
         })
     }
 
@@ -120,6 +124,8 @@ impl Walker {
             h: H,
             fog_near: self.fog_near,
             fog_far: self.fog_far,
+            torch: self.torch,
+            torch_radius: self.torch_radius,
         }
     }
 

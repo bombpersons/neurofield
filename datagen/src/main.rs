@@ -10,6 +10,8 @@
 //!
 //! See `format.json` in each output directory for the array layouts.
 
+mod creature;
+mod door;
 mod npy;
 mod render;
 mod rng;
@@ -24,16 +26,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walker::Walker;
 
-const TRI_FEATURES: usize = 25;
-const VIEW_FEATURES: usize = 19;
+const TRI_FEATURES: usize = 34;
+const VIEW_FEATURES: usize = 23;
 
 const FORMAT: &str = r#"{
-  "units": "positions and fog distances in tiles (256 world units); y points down, the lowest floor is y = 0 and floors rise to y = -1",
-  "tris.npy": "float32 [T, 25] per triangle: v0 xyz, v1 xyz, v2 xyz (0-8); v0 uv, v1 uv, v2 uv in texture tiles, 0..1 (9-14); texture id 0-7 (15); v0 rgb, v1 rgb, v2 rgb baked vertex colour / 255, where 128/255 is neutral texture modulation (16-24)",
+  "units": "positions and distances in tiles (256 world units); y points down, the lowest floor is y = 0 and floors rise to y = -1",
+  "tris.npy": "float32 [T, 34] per triangle: v0 xyz, v1 xyz, v2 xyz (0-8); v0 uv, v1 uv, v2 uv in texture tiles, 0..1 (9-14); texture id 0-11 (15); v0 rgb, v1 rgb, v2 rgb baked vertex colour / 255 (16-24); v0 rgb, v1 rgb, v2 rgb unlit surface tint / 255 (25-33). On both colour scales 128/255 is neutral texture modulation. Triangles are wound so (v1 - v0) x (v2 - v0) is the outward normal",
+  "textures": "0-7 level (brick, stone, planks, tiles, moss, grate, wallpaper, rings), 8 scales, 9 bone, 10 fur, 11 door; see `datagen textures`",
   "tri_offsets.npy": "int64 [S + 1]: scene s owns tris[tri_offsets[s] : tri_offsets[s + 1]]",
-  "views.npy": "float32 [V, 19] per view: scene index within the shard (0); camera position xyz (1-3); world-to-view rotation, row-major (4-12; row 2 is the view direction); projection distance H in pixels, screen centre (160, 120) (13); fog near, fog far (14-15); yaw, pitch, roll in turns (16-18)",
+  "views.npy": "float32 [V, 23] per view: scene index within the shard (0); camera position xyz (1-3); world-to-view rotation, row-major (4-12; row 2 is the view direction); projection distance H in pixels, screen centre (160, 120) (13); fog near, fog far (14-15); yaw, pitch, roll in turns (16-18); torch rgb strength, 0 = no torch (19-21); torch reach (22)",
   "images.npy": "uint8 [V, 240, 320, 3]",
-  "projection": "view = R (p - pos); screen = (160 + H * view.x / view.z, 120 + H * view.y / view.z)"
+  "projection": "view = R (p - pos); screen = (160 + H * view.x / view.z, 120 + H * view.y / view.z); vertices nearer than view.z = H / 2 are not drawn",
+  "shading": "per vertex: colour = baked + tint * torch * max(0, 1 - d / reach)^2 * max(0, n . l), d and l toward the camera; then times fog = 1 - clamp((view.z - fog near) / (fog far - fog near), 0, 1); then texel * colour / 128"
 }
 "#;
 
@@ -51,6 +55,9 @@ fn tri_features(scene: &Scene, out: &mut Vec<f32>) {
         for v in &t.v {
             out.extend(v.col.map(|c| c as f32 / 255.0));
         }
+        for v in &t.v {
+            out.extend(v.alb.map(|c| c as f32 / 255.0));
+        }
     }
 }
 
@@ -63,6 +70,8 @@ fn view_features(scene_index: usize, cam: &Camera, out: &mut Vec<f32>) {
     out.push(cam.fog_near as f32 / T as f32);
     out.push(cam.fog_far as f32 / T as f32);
     out.extend([cam.yaw, cam.pitch, cam.roll].map(|a| a as f32 / 4096.0));
+    out.extend(cam.torch);
+    out.push(cam.torch_radius as f32 / T as f32);
 }
 
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) {
@@ -247,6 +256,35 @@ fn main() {
         _ => {
             eprintln!("usage: datagen gen|walk|textures --out PATH [...]");
             std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug {
+    use super::*;
+    use scene::Cell;
+
+    /// Print one generated level: per cell, floor level (in steps above 0) / clearance, or #.
+    #[test]
+    #[ignore]
+    fn dump_level() {
+        let i: u64 = std::env::var("SCENE").unwrap().parse().unwrap();
+        let mut rng = Rng::new(1u64.wrapping_mul(1_000_003) ^ i);
+        let (scene, _) = walkable_scene(&mut rng, 6);
+        for z in 0..scene.d {
+            let row: Vec<String> = (0..scene.w)
+                .map(|x| match scene.cell(x, z) {
+                    Cell::Solid { .. } => "  ## ".into(),
+                    Cell::Floor { y0, y1, height, slope, .. } => {
+                        format!("{}{}/{}{} ", -y0 / 64, -y1 / 64, height, if slope == scene::Slope::Flat { ' ' } else { '~' })
+                    }
+                })
+                .collect();
+            println!("z{z:2} {}", row.join(""));
+        }
+        for r in &scene.rooms {
+            println!("room x{} z{} w{} d{} floor {} h {}", r.x, r.z, r.w, r.d, r.floor / 64, r.height);
         }
     }
 }
