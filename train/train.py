@@ -3,7 +3,11 @@
 Local smoke test:
     python train/train.py --data data/test --out runs/smoke --small --steps 30
 
-On Colab, inside a persistent kernel (state survives between `colab exec` calls):
+On Colab, as a detached process that resumes from out/ckpt.pt (see colab_launch.py):
+    python train.py --data /content/data/train --out /content/out --minutes 100 --batch 32 \
+        --log-every 100 --sample-every 1000
+
+Or inside a persistent kernel (state survives between `colab exec` calls):
     import sys; sys.path.insert(0, "/content/neurofield/train")
     from train import Trainer
     t = Trainer("/content/data/train", "/content/out")
@@ -137,6 +141,8 @@ if __name__ == "__main__":
     ap.add_argument("--minutes", type=float, default=None)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--sample-every", type=int, default=10**9)
     a = ap.parse_args()
     t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers)
-    t.run(minutes=a.minutes, steps=a.steps, log_every=10, sample_every=10**9)
+    t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every)
