@@ -34,8 +34,8 @@ class Trainer:
         assert n_shards >= 2, "need at least two shards (the last one is held out)"
         self.train_set = Shards(data, range(n_shards - 1))
         self.val_set = Shards(data, [n_shards - 1])
-        cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
-        self.model = Renderer(**cfg).to(self.device)
+        self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
+        self.model = Renderer(**self.cfg).to(self.device)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
         self.lr = lr
         self.amp = self.device == "cuda"
@@ -118,7 +118,8 @@ class Trainer:
         self.log(val_l1=val)
         self.sample(self.out / f"sample_{self.step:07d}.png")
         self.sample(self.out / "sample_latest.png")
-        torch.save({"model": self.model.state_dict(), "opt": self.opt.state_dict(), "step": self.step}, self.out / "ckpt.pt")
+        state = {"model": self.model.state_dict(), "opt": self.opt.state_dict(), "step": self.step, "cfg": self.cfg}
+        torch.save(state, self.out / "ckpt.pt")
 
     def log(self, **kv):
         rec = {"step": self.step, **kv}

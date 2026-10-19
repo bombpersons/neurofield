@@ -22,7 +22,9 @@ CAM_FEATURES = 1 + 2 + 3 + 1
 
 class Shards(Dataset):
     def __init__(self, root, shards=None):
-        dirs = sorted(Path(root).glob("shard_*"))
+        """`root` holds shard_* directories, or is itself one shard (e.g. a walk)."""
+        root = Path(root)
+        dirs = [root] if (root / "views.npy").exists() else sorted(root.glob("shard_*"))
         if shards is not None:
             dirs = [dirs[i] for i in shards if i < len(dirs)]
         self.shards = []
