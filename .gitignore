@@ -1,2 +1,4 @@
 /data/
+/runs/
 target/
+__pycache__/
