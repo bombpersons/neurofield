@@ -1,7 +1,9 @@
 """One training chunk in the persistent Colab kernel.
 
-    colab exec -s neurofield --timeout 120 -f train/colab_chunk.py   # client may time out; the kernel keeps training
+    colab exec -s neurofield --timeout 7000 -f train/colab_chunk.py   # in a background shell
 
+Keep the client attached for the whole chunk: free-tier VMs were reclaimed
+10-15 minutes after it disconnected, even with the kernel busy training.
 The first call builds the Trainer (resuming from /content/out/ckpt.pt if
 present); later calls reuse it from the kernel's globals and train on.
 """
@@ -16,4 +18,4 @@ if "trainer" not in globals():
     from train import Trainer
 
     trainer = Trainer("/content/data/train", "/content/out", batch=32, workers=2)
-trainer.run(minutes=MINUTES, log_every=100, sample_every=1000)
+trainer.run(minutes=MINUTES, log_every=100, sample_every=500)

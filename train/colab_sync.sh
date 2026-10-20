@@ -12,7 +12,7 @@ mkdir -p "$dest"
 while true; do
     for f in log.jsonl sample_latest.png ckpt.pt; do
         out=$(timeout 300 colab download -s "$session" "/content/out/$f" "$dest/$f.part" 2>&1)
-        if grep -q "appears to be lost" <<<"$out"; then
+        if grep -qE "appears to be lost|Session .* not found" <<<"$out"; then
             echo "session lost; last checkpoint kept in $dest"
             exit 1
         fi
