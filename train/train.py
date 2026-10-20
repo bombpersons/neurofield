@@ -12,6 +12,7 @@ train/colab_sync.sh in case the VM is reclaimed anyway.
 import argparse
 import itertools
 import json
+import math
 import time
 from pathlib import Path
 
@@ -65,8 +66,12 @@ class Trainer:
         for _ in itertools.count():
             yield from self.loader
 
-    def _lr(self):
-        return self.lr * min(1.0, (self.step + 1) / 500)
+    def _lr(self, progress=None):
+        """Warm-up from the first step; with `progress` (0..1 through a run), a cosine decay to 5%."""
+        lr = self.lr * min(1.0, (self.step + 1) / 500)
+        if progress is not None:
+            lr *= 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        return lr
 
     def forward(self, batch):
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch)
@@ -81,12 +86,18 @@ class Trainer:
             perceptual = self.lpips(pred * 2 - 1, target * 2 - 1).float().mean()
         return l1 + self.lpips_weight * perceptual, l1, perceptual
 
-    def run(self, minutes=None, steps=None, log_every=50, sample_every=500):
+    def run(self, minutes=None, steps=None, log_every=50, sample_every=500, decay=False):
+        """Train for `minutes` and/or `steps`. With `decay`, the learning rate follows a cosine
+        over this run (by time when `minutes` is given), so each run ends settled; the next
+        run restarts at the full rate."""
         self.model.train()
         start, done, l1s, lps = time.time(), 0, [], []
         while (steps is None or done < steps) and (minutes is None or time.time() - start < minutes * 60):
+            progress = None
+            if decay:
+                progress = (time.time() - start) / (minutes * 60) if minutes else done / steps
             for g in self.opt.param_groups:
-                g["lr"] = self._lr()
+                g["lr"] = self._lr(progress)
             pred, target = self.forward(next(self.batches))
             loss, l1, perceptual = self.losses(pred, target)
             self.opt.zero_grad(set_to_none=True)
@@ -102,7 +113,7 @@ class Trainer:
             if self.step % log_every == 0:
                 self.log(
                     train_l1=float(np.mean(l1s[-log_every:])), train_lpips=float(np.mean(lps[-log_every:])),
-                    secs=time.time() - start,
+                    lr=self.opt.param_groups[0]["lr"], secs=time.time() - start,
                 )
             if self.step % sample_every == 0:
                 self.checkpoint()
@@ -155,6 +166,7 @@ if __name__ == "__main__":
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--sample-every", type=int, default=10**9)
     ap.add_argument("--lpips", type=float, default=0.1, help="weight of the perceptual loss")
+    ap.add_argument("--decay", action="store_true", help="cosine learning-rate decay over this run")
     a = ap.parse_args()
     t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips)
-    t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every)
+    t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every, decay=a.decay)

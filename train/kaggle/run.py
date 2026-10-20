@@ -7,7 +7,9 @@
 Clones neurofield, builds datagen, generates the training data, then trains
 from the checkpoint in the private dataset bombpersons/neurofield-ckpt (if
 there is one) until shortly before Kaggle's 12-hour limit, so the final
-checkpoint is written. Everything in /kaggle/working/out comes back as output.
+checkpoint is written. The learning rate decays over the run, and each run
+generates new levels (seeded by its start time). Everything in
+/kaggle/working/out comes back as output.
 To continue from a finished run, upload its ckpt.pt as a new version of that
 dataset (`kaggle datasets version -p DIR -m note`) and push again.
 """
@@ -22,6 +24,7 @@ import time
 START = time.time()
 HOURS = 11.25  # of Kaggle's 12, leaving room for setup overruns and the last checkpoint
 SCENES, VIEWS, SHARD = 4000, 8, 250
+SEED = int(START)  # fresh levels every run, so no scene is seen in more than one
 REPO, DATA, OUT = "/tmp/neurofield", "/tmp/data/train", "/kaggle/working/out"
 
 
@@ -39,7 +42,7 @@ sh(f"cd {REPO} && git log --oneline -1")
 sh("pip install -q lpips")
 sh("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -q")
 sh(f"cd {REPO}/datagen && ~/.cargo/bin/cargo build --release -q")
-sh(f"{REPO}/datagen/target/release/datagen gen --out {DATA} --scenes {SCENES} --views {VIEWS} --shard-scenes {SHARD} 2>&1 | tail -2")
+sh(f"{REPO}/datagen/target/release/datagen gen --out {DATA} --scenes {SCENES} --views {VIEWS} --shard-scenes {SHARD} --seed {SEED} 2>&1 | tail -2")
 
 os.makedirs(OUT, exist_ok=True)
 ckpts = glob.glob("/kaggle/input/**/ckpt.pt", recursive=True)
@@ -53,4 +56,4 @@ from train import Trainer  # noqa: E402
 trainer = Trainer(DATA, OUT, batch=32, workers=3)
 minutes = HOURS * 60 - (time.time() - START) / 60
 print(f"setup took {(time.time() - START) / 60:.1f} min, training for {minutes:.0f} min", flush=True)
-trainer.run(minutes=minutes, log_every=100, sample_every=500)
+trainer.run(minutes=minutes, log_every=100, sample_every=500, decay=True)
