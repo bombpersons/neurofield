@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the realtime viewer with the newest checkpoint under runs/.
 #
-#   ./view.sh [--seed 7]               newest runs/*/ckpt.pt
+#   ./view.sh [--seed 7]               newest runs/*/ckpt.pt or runs/*/out/ckpt.pt (Kaggle)
 #   CKPT=runs/x/ckpt.pt ./view.sh      a particular checkpoint
 #
 # Exports the checkpoint to ONNX when it is newer than its model.onnx, sets up
@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ckpt=${CKPT:-$(ls -t runs/*/ckpt.pt 2>/dev/null | head -n 1)}
+ckpt=${CKPT:-$(ls -t runs/*/ckpt.pt runs/*/out/ckpt.pt 2>/dev/null | head -n 1)}
 [ -n "$ckpt" ] || { echo "no runs/*/ckpt.pt yet" >&2; exit 1; }
 onnx=$(dirname "$ckpt")/model.onnx
 
