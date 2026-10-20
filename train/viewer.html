@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Walk Viewer</title>
+<style>
+  :root { --bg: #111; --fg: #ccc; --dim: #777; }
+  body { background: var(--bg); color: var(--fg); font: 14px monospace; margin: 0; display: flex; flex-direction: column; align-items: center; padding: 16px; }
+  canvas { image-rendering: pixelated; width: min(960px, 100%); aspect-ratio: 4 / 3; background: #000; }
+  canvas.both { aspect-ratio: 8 / 3; }
+  #hud { margin: 8px 0; }
+  #keys { color: var(--dim); }
+  b { color: #fff; }
+</style>
+</head>
+<body>
+<canvas id="c" width="320" height="240"></canvas>
+<div id="hud"></div>
+<div id="keys">space: rasteriser / network &nbsp; b: side by side &nbsp; p: pause &nbsp; ←/→: step &nbsp; -/+: speed</div>
+<script>
+const N = __FRAMES__, EVERY = __EVERY__, FPS = 30 / EVERY;
+const c = document.getElementById("c"), ctx = c.getContext("2d"), hud = document.getElementById("hud");
+const frames = [];
+for (let i = 0; i < N; i++) {
+  const im = new Image();
+  im.src = String(i * EVERY).padStart(5, "0") + ".png";
+  frames.push(im);
+}
+let mode = "network", i = 0, paused = false, speed = 1, acc = 0, last = performance.now();
+function draw() {
+  const im = frames[i];
+  if (!im.complete || !im.naturalWidth) return;
+  const w = im.naturalWidth / 2, h = im.naturalHeight;
+  if (mode === "both") {
+    c.width = 2 * w; c.height = h; c.className = "both";
+    ctx.drawImage(im, 0, 0);
+  } else {
+    c.width = w; c.height = h; c.className = "";
+    ctx.drawImage(im, mode === "network" ? w : 0, 0, w, h, 0, 0, w, h);
+  }
+  const loaded = frames.filter(f => f.complete).length;
+  hud.innerHTML = `<b>${mode === "both" ? "rasteriser | network" : mode}</b> &nbsp; frame ${i + 1}/${N}` +
+    `${paused ? " &nbsp; paused" : ""} &nbsp; ${speed}x${loaded < N ? ` &nbsp; loading ${loaded}/${N}` : ""}`;
+}
+function tick(t) {
+  if (!paused) {
+    acc += (t - last) / 1000 * FPS * speed;
+    const n = Math.floor(acc);
+    if (n > 0) { i = (i + n) % N; acc -= n; }
+  }
+  last = t;
+  draw();
+  requestAnimationFrame(tick);
+}
+addEventListener("keydown", e => {
+  if (e.key === " ") mode = mode === "network" ? "rasteriser" : "network";
+  else if (e.key === "b") mode = mode === "both" ? "network" : "both";
+  else if (e.key === "p") paused = !paused;
+  else if (e.key === "ArrowRight") { paused = true; i = (i + 1) % N; }
+  else if (e.key === "ArrowLeft") { paused = true; i = (i + N - 1) % N; }
+  else if (e.key === "+" || e.key === "=") speed = Math.min(4, speed * 2);
+  else if (e.key === "-") speed = Math.max(0.125, speed / 2);
+  else return;
+  e.preventDefault();
+});
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

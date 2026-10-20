@@ -60,6 +60,27 @@ Rendering rules worth knowing when reading the data:
 - Vertex colour 128/255 is neutral texture modulation; lighting is baked into
   the colours, fog is applied at render time from camera depth.
 
+## Realtime viewer (`viewer/`)
+
+Walks a generated level live, drawn by the PS1 rasteriser or by the trained
+network (run on the CPU with ONNX Runtime, about 30 fps on 12 cores). Export a
+checkpoint first, using a venv with `onnx`, `onnxscript` and `onnxruntime`:
+
+```bash
+.venv/bin/python train/export_onnx.py --ckpt runs/colab2/ckpt.pt --out runs/colab2/model.onnx
+```
+
+```bash
+cd viewer && cargo run --release -- --model ../runs/colab2/model.onnx --seed 7
+```
+
+Space switches between rasteriser and network, B shows both side by side, Tab
+switches between the auto-walk and driving yourself (arrows or WASD, Q/E to
+strafe, PgUp/PgDn to look), N makes a new level, P pauses. With the same
+seed the level and auto-walk match `datagen walk --seed S`.
+`--check N --out DIR` skips the window and writes the first N frames' tokens
+and network images, to compare against `train/data.py` and PyTorch.
+
 The psx crates come from a git submodule pinned to a known commit, so clone with:
 
 ```bash

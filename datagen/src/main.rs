@@ -10,24 +10,13 @@
 //!
 //! See `format.json` in each output directory for the array layouts.
 
-mod creature;
-mod door;
-mod npy;
-mod render;
-mod rng;
-mod scene;
-mod tex;
-mod walker;
-
+use datagen::rng::Rng;
+use datagen::scene::{Camera, Scene};
+use datagen::{npy, render, tex, tri_features, view_features, walkable_scene, TRI_FEATURES, VIEW_FEATURES};
 use rayon::prelude::*;
-use rng::Rng;
-use scene::{Camera, Scene, T};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use walker::Walker;
 
-const TRI_FEATURES: usize = 34;
-const VIEW_FEATURES: usize = 23;
 
 const FORMAT: &str = r#"{
   "units": "positions and distances in tiles (256 world units); y points down, the lowest floor is y = 0 and floors rise to y = -1",
@@ -40,39 +29,6 @@ const FORMAT: &str = r#"{
   "shading": "per vertex: colour = baked + tint * torch * max(0, 1 - d / reach)^2 * max(0, n . l), d and l toward the camera; then times fog = 1 - clamp((view.z - fog near) / (fog far - fog near), 0, 1); then texel * colour / 128"
 }
 "#;
-
-fn tri_features(scene: &Scene, out: &mut Vec<f32>) {
-    for t in &scene.tris {
-        for v in &t.v {
-            out.extend(v.p.map(|c| c as f32 / T as f32));
-        }
-        let (u0, v0) = tex::uv_origin(t.tex);
-        for v in &t.v {
-            out.push((v.uv[0] - u0) as f32 / tex::SIZE as f32);
-            out.push((v.uv[1] - v0) as f32 / tex::SIZE as f32);
-        }
-        out.push(t.tex as f32);
-        for v in &t.v {
-            out.extend(v.col.map(|c| c as f32 / 255.0));
-        }
-        for v in &t.v {
-            out.extend(v.alb.map(|c| c as f32 / 255.0));
-        }
-    }
-}
-
-fn view_features(scene_index: usize, cam: &Camera, out: &mut Vec<f32>) {
-    out.push(scene_index as f32);
-    out.extend(cam.pos.map(|c| c as f32 / T as f32));
-    let m = render::view_matrix(cam);
-    out.extend(m.m.iter().flatten().map(|&e| e as f32 / 4096.0));
-    out.push(cam.h as f32);
-    out.push(cam.fog_near as f32 / T as f32);
-    out.push(cam.fog_far as f32 / T as f32);
-    out.extend([cam.yaw, cam.pitch, cam.roll].map(|a| a as f32 / 4096.0));
-    out.extend(cam.torch);
-    out.push(cam.torch_radius as f32 / T as f32);
-}
 
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) {
     let file = std::io::BufWriter::new(std::fs::File::create(path).expect("create png"));
@@ -141,19 +97,6 @@ enum CameraMode {
     FirstPerson,
     /// Independent random cameras with varied height, tilt, roll and lens.
     Free,
-}
-
-/// A level the first-person walker can move around in, and the walker.
-fn walkable_scene(rng: &mut Rng, min_cells: usize) -> (Scene, Walker) {
-    loop {
-        let scene = Scene::generate(rng);
-        if scene.floor_cells().len() < min_cells {
-            continue;
-        }
-        if let Some(w) = Walker::new(&scene, rng) {
-            return (scene, w);
-        }
-    }
 }
 
 fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, mode: CameraMode) {
@@ -263,7 +206,7 @@ fn main() {
 #[cfg(test)]
 mod debug {
     use super::*;
-    use scene::Cell;
+    use datagen::scene::{self, Cell};
 
     /// Print one generated level: per cell, floor level (in steps above 0) / clearance, or #.
     #[test]

@@ -187,6 +187,34 @@ impl Walker {
             self.y += (fy - EYE - self.y) * 0.35;
         }
     }
+
+    /// One frame of player control instead of `step`: `forward` and `strafe`
+    /// in -1..1 of walking speed, `turn` in -1..1 of the turn rate (positive =
+    /// right), `look` the pitch to ease toward. Slides along walls; drops any
+    /// planned walk, so `step` replans from wherever this leaves the body.
+    pub fn drive(&mut self, scene: &Scene, forward: f32, strafe: f32, turn: f32, look: f32) {
+        self.path.clear();
+        self.pause = 0;
+        self.target_pitch = look;
+        self.pitch += (look - self.pitch) * 0.15;
+        self.yaw += turn * MAX_TURN;
+        let a = self.yaw / 4096.0 * std::f32::consts::TAU;
+        let (s, c) = a.sin_cos();
+        // Forward is (-sin, cos) as in `yaw_towards`; right is down x forward.
+        let dx = (-s * forward + c * strafe) * SPEED;
+        let dz = (c * forward + s * strafe) * SPEED;
+        let from = scene.floor_y(self.x, self.z).unwrap_or(0.0);
+        for (mx, mz) in [(dx, dz), (dx, 0.0), (0.0, dz)] {
+            if (mx != 0.0 || mz != 0.0) && Self::free(scene, self.x + mx, self.z + mz, from).is_some() {
+                self.x += mx;
+                self.z += mz;
+                break;
+            }
+        }
+        if let Some(fy) = scene.floor_y(self.x, self.z) {
+            self.y += (fy - EYE - self.y) * 0.35;
+        }
+    }
 }
 
 #[cfg(test)]

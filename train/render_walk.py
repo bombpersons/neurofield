@@ -2,7 +2,8 @@
 
     python train/render_walk.py --walk data/walk0 --ckpt runs/x/ckpt.pt --out runs/x/walk0
 
-Writes side-by-side frames (rasteriser | network) and an animated GIF.
+Writes side-by-side frames (rasteriser | network), an animated GIF, and
+viewer.html, which plays the walk and toggles between the two with Space.
 """
 
 import argparse
@@ -35,6 +36,8 @@ def render_walk(model, walk_dir, out_dir, device, batch=16, every=1, gif_scale=1
             im.save(out / f"{idx[i + k]:05d}.png")
             frames.append(im.resize((im.width // gif_scale, im.height // gif_scale)) if gif_scale > 1 else im)
     frames[0].save(out / "walk.gif", save_all=True, append_images=frames[1:], duration=1000 // 30 * every, loop=0)
+    viewer = (Path(__file__).parent / "viewer.html").read_text()
+    (out / "viewer.html").write_text(viewer.replace("__FRAMES__", str(len(idx))).replace("__EVERY__", str(every)))
     return out / "walk.gif"
 
 
