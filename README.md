@@ -7,8 +7,10 @@ comes out when it gets things wrong.
 ![PS1 rasteriser (left) and the network (right) on four frames of a walk](docs/comparison.png)
 
 *Work in progress: the PS1 rasteriser (left) and the network (right) after
-3,500 training steps, on frames of a walk through a level it never saw. It has
-the layout, lighting and surface colours, in 16-pixel blocks; no textures yet.*
+68,500 training steps, on frames of a walk through a level it never saw. It has
+the layout, lighting and textures (bricks, tiles, wood grain, the wire grid),
+softened and a little wavy; fine detail such as the door's iron bands and the
+far end of a corridor still dissolves.*
 
 ## Data generator (`datagen/`)
 
