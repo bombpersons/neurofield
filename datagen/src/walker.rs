@@ -17,6 +17,8 @@ const RADIUS: f32 = 100.0;
 const SPEED: f32 = 14.0;
 /// Turn rate cap per frame (4096 = 360°).
 const MAX_TURN: f32 = 40.0;
+/// Furthest the gaze tilts up or down (512 = 45°).
+pub const MAX_PITCH: f32 = 512.0;
 
 pub struct Walker {
     pub x: f32,
@@ -131,8 +133,8 @@ impl Walker {
 
     pub fn step(&mut self, scene: &Scene, rng: &mut Rng) {
         // Gaze: usually level, sometimes a glance up or down.
-        if rng.chance(0.008) {
-            self.target_pitch = rng.fr(-170.0, 170.0);
+        if rng.chance(0.012) {
+            self.target_pitch = rng.fr(-MAX_PITCH, MAX_PITCH);
         } else if rng.chance(0.02) {
             self.target_pitch = 0.0;
         }

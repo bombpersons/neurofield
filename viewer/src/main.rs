@@ -17,7 +17,7 @@ mod tokens;
 use datagen::render::{self, H, W};
 use datagen::rng::Rng;
 use datagen::scene::Scene;
-use datagen::walker::Walker;
+use datagen::walker::{Walker, MAX_PITCH};
 use datagen::{npy, tex, tri_features, view_features, walkable_scene};
 use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
 use net::Net;
@@ -166,7 +166,7 @@ fn main() {
                 let forward = key(Key::Up, Key::W) - key(Key::Down, Key::S);
                 let strafe = key(Key::E, Key::E) - key(Key::Q, Key::Q);
                 let turn = key(Key::Right, Key::D) - key(Key::Left, Key::A);
-                let look = (key(Key::PageDown, Key::PageDown) - key(Key::PageUp, Key::PageUp)) * 300.0;
+                let look = (key(Key::PageDown, Key::PageDown) - key(Key::PageUp, Key::PageUp)) * MAX_PITCH;
                 let len = (forward * forward + strafe * strafe).sqrt().max(1.0);
                 level.walker.drive(&level.scene, forward / len, strafe / len, turn, look);
             } else {

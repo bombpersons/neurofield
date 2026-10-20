@@ -15,6 +15,7 @@ import json
 import time
 from pathlib import Path
 
+import lpips
 import numpy as np
 import torch
 from PIL import Image
@@ -25,7 +26,7 @@ from model import Renderer, loss_fn
 
 
 class Trainer:
-    def __init__(self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None):
+    def __init__(self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1):
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -35,6 +36,9 @@ class Trainer:
         self.val_set = Shards(data, [n_shards - 1])
         self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
         self.model = Renderer(**self.cfg).to(self.device)
+        # A perceptual loss on top of L1, against the blur that L1 alone settles for.
+        self.lpips_weight = lpips_weight
+        self.lpips = lpips.LPIPS(net="alex", verbose=False).to(self.device).eval().requires_grad_(False)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
         self.lr = lr
         self.amp = self.device == "cuda"
@@ -70,37 +74,49 @@ class Trainer:
             pred = self.model(feats, tex, pad, cams)
         return pred.float(), images
 
+    def losses(self, pred, target):
+        """(training loss, L1, LPIPS) for a batch."""
+        l1 = loss_fn(pred, target)
+        with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
+            perceptual = self.lpips(pred * 2 - 1, target * 2 - 1).float().mean()
+        return l1 + self.lpips_weight * perceptual, l1, perceptual
+
     def run(self, minutes=None, steps=None, log_every=50, sample_every=500):
         self.model.train()
-        start, done, losses = time.time(), 0, []
+        start, done, l1s, lps = time.time(), 0, [], []
         while (steps is None or done < steps) and (minutes is None or time.time() - start < minutes * 60):
             for g in self.opt.param_groups:
                 g["lr"] = self._lr()
             pred, target = self.forward(next(self.batches))
-            loss = loss_fn(pred, target)
+            loss, l1, perceptual = self.losses(pred, target)
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.opt)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.opt)
             self.scaler.update()
-            losses.append(loss.item())
+            l1s.append(l1.item())
+            lps.append(perceptual.item())
             self.step += 1
             done += 1
             if self.step % log_every == 0:
-                self.log(train_l1=float(np.mean(losses[-log_every:])), secs=time.time() - start)
+                self.log(
+                    train_l1=float(np.mean(l1s[-log_every:])), train_lpips=float(np.mean(lps[-log_every:])),
+                    secs=time.time() - start,
+                )
             if self.step % sample_every == 0:
                 self.checkpoint()
         self.checkpoint()
-        return float(np.mean(losses)) if losses else None
+        return float(np.mean(l1s)) if l1s else None
 
     @torch.no_grad()
     def validate(self, batches=8):
+        """Mean (L1, LPIPS) over the first validation batches."""
         self.model.eval()
         loader = DataLoader(self.val_set, batch_size=16, shuffle=False, collate_fn=collate)
-        ls = [loss_fn(*self.forward(b)).item() for b in itertools.islice(loader, batches)]
+        ls = [[x.item() for x in self.losses(*self.forward(b))[1:]] for b in itertools.islice(loader, batches)]
         self.model.train()
-        return float(np.mean(ls))
+        return tuple(float(x) for x in np.mean(ls, 0))
 
     @torch.no_grad()
     def sample(self, path):
@@ -113,8 +129,8 @@ class Trainer:
         Image.fromarray((grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)).save(path)
 
     def checkpoint(self):
-        val = self.validate()
-        self.log(val_l1=val)
+        val_l1, val_lpips = self.validate()
+        self.log(val_l1=val_l1, val_lpips=val_lpips)
         self.sample(self.out / f"sample_{self.step:07d}.png")
         self.sample(self.out / "sample_latest.png")
         state = {"model": self.model.state_dict(), "opt": self.opt.state_dict(), "step": self.step, "cfg": self.cfg}
@@ -138,6 +154,7 @@ if __name__ == "__main__":
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--sample-every", type=int, default=10**9)
+    ap.add_argument("--lpips", type=float, default=0.1, help="weight of the perceptual loss")
     a = ap.parse_args()
-    t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers)
+    t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips)
     t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every)
