@@ -4,6 +4,12 @@ Train a network to render PS1-style first-person dungeons, in the spirit of
 King's Field, from geometry + camera, and see what dream-like strangeness
 comes out when it gets things wrong.
 
+![PS1 rasteriser (left) and the network (right) on four frames of a walk](docs/comparison.png)
+
+*Work in progress: the PS1 rasteriser (left) and the network (right) after
+3,500 training steps, on frames of a walk through a level it never saw. It has
+the layout, lighting and surface colours, in 16-pixel blocks; no textures yet.*
+
 ## Data generator (`datagen/`)
 
 Rust, using the software GTE and GPU from
