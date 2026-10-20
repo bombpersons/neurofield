@@ -69,8 +69,15 @@ Rendering rules worth knowing when reading the data:
 ## Realtime viewer (`viewer/`)
 
 Walks a generated level live, drawn by the PS1 rasteriser or by the trained
-network (run on the CPU with ONNX Runtime, about 30 fps on 12 cores). Export a
-checkpoint first, using a venv with `onnx`, `onnxscript` and `onnxruntime`:
+network (run on the CPU with ONNX Runtime, about 30 fps on 12 cores). The
+quick way, which exports the newest `runs/*/ckpt.pt` if needed (setting up
+`.venv` the first time), builds the viewer and opens it:
+
+```bash
+./view.sh --seed 7
+```
+
+By hand: export a checkpoint, using a venv with `onnx`, `onnxscript` and `onnxruntime`:
 
 ```bash
 .venv/bin/python train/export_onnx.py --ckpt runs/colab2/ckpt.pt --out runs/colab2/model.onnx
