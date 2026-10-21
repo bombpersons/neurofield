@@ -81,7 +81,7 @@ fn check(net: &mut Net, seed: u64, frames: usize, out: &Path, effect: usize) {
     let mut counts = Vec::new();
     for f in 0..frames {
         let mut t = level.tokens();
-        let dream = effects::apply(effect, f as f32 / TICK as f32, &mut t);
+        let dream = effects::apply(effect, f as f32 / TICK as f32, &mut t, &level.tris);
         npy::write(&out.join(format!("feats_{f:05}.npy")), &[t.len(), tokens::TRI_FEATURES], &t.feats).unwrap();
         npy::write(&out.join(format!("tex_{f:05}.npy")), &[t.len()], &t.tex).unwrap();
         npy::write(&out.join(format!("cam_{f:05}.npy")), &[tokens::CAM_FEATURES], &t.cam).unwrap();
@@ -197,7 +197,7 @@ fn main() {
         if mode != Mode::Raster {
             let t0 = Instant::now();
             let mut t = level.tokens();
-            let dream = effects::apply(effect, effect_t, &mut t);
+            let dream = effects::apply(effect, effect_t, &mut t, &level.tris);
             tris = t.len();
             let rgb = net.render(&t, &dream).expect("inference");
             for (px, c) in neural.iter_mut().zip(rgb.chunks_exact(3)) {

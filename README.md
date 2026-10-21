@@ -94,7 +94,7 @@ switches between the auto-walk and driving yourself (arrows or WASD, Q/E to
 strafe, PgUp/PgDn to look), N makes a new level, P pauses. F and G step
 through dream effects that disturb the network and drift slowly with time:
 textures morphing into each other, triangles forgotten and remembered,
-vertices wobbling, the attention smeared or made stark, fog, torch and lens
+the level rippling in slow waves, the attention smeared or made stark, fog, torch and lens
 wandering, and all at once. With the same
 seed the level and auto-walk match `datagen walk --seed S`.
 `--check N --out DIR` skips the window and writes the first N frames' tokens

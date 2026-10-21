@@ -5,6 +5,7 @@
 
 use crate::net::{Dream, NUM_TEX};
 use crate::tokens::{Tokens, TRI_FEATURES};
+use datagen::TRI_FEATURES as RAW;
 use std::f32::consts::TAU;
 
 pub const EFFECTS: [&str; 14] = [
@@ -13,7 +14,7 @@ pub const EFFECTS: [&str; 14] = [
     "texture drift",
     "texture intensity",
     "forgetting",
-    "vertex jitter",
+    "vertex waves",
     "smeared attention",
     "stark attention",
     "query shimmer",
@@ -21,7 +22,7 @@ pub const EFFECTS: [&str; 14] = [
     "torch dance",
     "lens breathing",
     "colour drift",
-    "dream (morph + smear + jitter + forgetting)",
+    "dream (morph + smear + waves + forgetting)",
 ];
 
 /// Whether `effect` reaches inside the network (needs a model exported with the dream inputs).
@@ -69,18 +70,25 @@ fn forget(tok: &mut Tokens, t: f32, threshold: f32) {
     tok.retain(|id| noise(id as u64 ^ 0xF0, t * 0.5) > threshold);
 }
 
-/// Wobble each triangle's screen position by up to about `amount` (NDC; the frame is 2 wide).
-fn jitter(tok: &mut Tokens, t: f32, amount: f32) {
+/// Sway every vertex on screen by up to `amount` (NDC; the frame is 2 wide) along sine
+/// waves rolling through the world, so neighbouring triangles move together and the
+/// level ripples rather than cracks. `tris` is the scene's raw triangle features.
+fn waves(tok: &mut Tokens, tris: &[f32], t: f32, amount: f32) {
     for (k, &id) in tok.ids.iter().enumerate() {
-        for c in 0..6 {
-            tok.feats[k * TRI_FEATURES + 9 + c] += amount * noise((id * 8 + c) as u64, t * 1.5);
+        for j in 0..3 {
+            let w = &tris[id * RAW + 3 * j..id * RAW + 3 * j + 3]; // world position, in tiles
+            let (x, y, z) = (w[0], w[1], w[2]);
+            let dx = 0.6 * (1.3 * t + 2.1 * x + 1.7 * z).sin() + 0.4 * (0.9 * t - 1.4 * y + 2.6 * x).sin();
+            let dy = 0.6 * (1.1 * t + 1.9 * z - 1.5 * y).sin() + 0.4 * (1.7 * t + 2.3 * y + 1.2 * x).sin();
+            tok.feats[k * TRI_FEATURES + 9 + 2 * j] += amount * dx;
+            tok.feats[k * TRI_FEATURES + 10 + 2 * j] += amount * dy;
         }
     }
 }
 
-/// Disturb the tokens for `effect` at `t` seconds since it was chosen; returns the
-/// network-side disturbance to render with.
-pub fn apply(effect: usize, t: f32, tok: &mut Tokens) -> Dream {
+/// Disturb the tokens (of a scene with raw triangle features `tris`) for `effect` at `t`
+/// seconds since it was chosen; returns the network-side disturbance to render with.
+pub fn apply(effect: usize, t: f32, tok: &mut Tokens, tris: &[f32]) -> Dream {
     let mut dream = Dream::calm();
     match effect {
         1 => texture_morph(&mut dream, t, 8.0),
@@ -103,7 +111,7 @@ pub fn apply(effect: usize, t: f32, tok: &mut Tokens) -> Dream {
             }
         }
         4 => forget(tok, t, -1.0 + 0.9 * swell(t, 12.0)),
-        5 => jitter(tok, t, 0.04),
+        5 => waves(tok, tris, t, 0.05),
         6 => dream.temp = 1.0 + 2.5 * swell(t, 10.0),
         7 => dream.temp = 0.6 - 0.35 * swell(t, 6.0),
         8 => {
@@ -140,7 +148,7 @@ pub fn apply(effect: usize, t: f32, tok: &mut Tokens) -> Dream {
         13 => {
             texture_morph(&mut dream, t, 13.0);
             dream.temp = 1.0 + 1.5 * swell(t, 11.0);
-            jitter(tok, t, 0.015);
+            waves(tok, tris, t, 0.025);
             forget(tok, t, -1.0 + 0.6 * swell(t, 17.0));
         }
         _ => {}
