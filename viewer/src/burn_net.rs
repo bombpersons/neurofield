@@ -45,31 +45,42 @@ impl LayerNorm {
     }
 }
 
-/// nn.MultiheadAttention's weights, split into query, key and value projections.
+/// nn.MultiheadAttention's weights. Query, key and value are projected together in one
+/// matmul: on a GPU each small matmul costs about the same whatever its size.
 struct Attention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
+    /// [d, 3d]: query, key, value.
+    qkv: Linear,
     out: Linear,
     heads: usize,
 }
 
 impl Attention {
-    /// Attention from `x` [L, d] to `mem` [S, d], with `bias` added to the scores
-    /// ([heads or 1, L or 1, S]; -inf masks) and the softmax at temperature `temp`.
-    fn forward(&self, x: Tensor<2>, mem: Tensor<2>, bias: Option<Tensor<3>>, temp: f32) -> Tensor<2> {
-        let [l, d] = x.dims();
-        let s = mem.dims()[0];
+    /// Self-attention over `x` [L, d], with `bias` added to the scores ([1, 1, L]; -inf masks).
+    fn attend_self(&self, x: Tensor<2>, bias: Option<Tensor<3>>) -> Tensor<2> {
+        let d = x.dims()[1];
+        let qkv = self.qkv.forward(x);
+        let (q, k, v) = (qkv.clone().narrow(1, 0, d), qkv.clone().narrow(1, d, d), qkv.narrow(1, 2 * d, d));
+        self.attend(q, k, v, bias, 1.0)
+    }
+
+    /// The query projection alone, for cross-attention (keys and values come from elsewhere).
+    fn query(&self, x: Tensor<2>) -> Tensor<2> {
+        let d = x.dims()[1];
+        x.matmul(self.qkv.w.clone().narrow(1, 0, d)) + self.qkv.b.clone().narrow(1, 0, d)
+    }
+
+    /// Projected queries `q` [L, d] attending to keys `k` and values `v` [S, d], with `bias`
+    /// added to the scores ([heads or 1, L or 1, S]; -inf masks) and the softmax at temperature `temp`.
+    fn attend(&self, q: Tensor<2>, k: Tensor<2>, v: Tensor<2>, bias: Option<Tensor<3>>, temp: f32) -> Tensor<2> {
+        let [l, d] = q.dims();
+        let s = k.dims()[0];
         let dh = d / self.heads;
         let split = |t: Tensor<2>, n: usize| t.reshape([n, self.heads, dh]).swap_dims(0, 1); // [heads, n, dh]
-        let q = split(self.q.forward(x), l);
-        let k = split(self.k.forward(mem.clone()), s);
-        let v = split(self.v.forward(mem), s);
-        let mut scores = q.matmul(k.swap_dims(1, 2)) / ((dh as f32).sqrt() * temp);
+        let mut scores = split(q, l).matmul(split(k, s).swap_dims(1, 2)) / ((dh as f32).sqrt() * temp);
         if let Some(bias) = bias {
             scores = scores + bias;
         }
-        let out = softmax(scores, 2).matmul(v); // [heads, L, dh]
+        let out = softmax(scores, 2).matmul(split(v, s)); // [heads, L, dh]
         self.out.forward(out.swap_dims(0, 1).reshape([l, d]))
     }
 }
@@ -84,12 +95,18 @@ struct Block {
 }
 
 impl Block {
-    /// `pad` biases the self-attention; `mem` is the cross-attention's tokens and bias.
-    fn forward(&self, x: Tensor<2>, pad: Option<Tensor<3>>, mem: Option<(&Tensor<2>, Tensor<3>, f32)>) -> Tensor<2> {
-        let h = self.n1.forward(x.clone());
-        let mut x = x + self.attn.forward(h.clone(), h, pad, 1.0);
-        if let (Some((n2, xattn)), Some((mem, bias, temp))) = (&self.cross, mem) {
-            x = x.clone() + xattn.forward(n2.forward(x), mem.clone(), Some(bias), temp);
+    /// `pad` biases the self-attention; `mem` is the cross-attention's keys, values, score
+    /// bias and temperature.
+    fn forward(
+        &self,
+        x: Tensor<2>,
+        pad: Option<Tensor<3>>,
+        mem: Option<(Tensor<2>, Tensor<2>, Tensor<3>, f32)>,
+    ) -> Tensor<2> {
+        let mut x = x.clone() + self.attn.attend_self(self.n1.forward(x), pad);
+        if let (Some((n2, xattn)), Some((k, v, bias, temp))) = (&self.cross, mem) {
+            let q = xattn.query(n2.forward(x.clone()));
+            x = x + xattn.attend(q, k, v, Some(bias), temp);
         }
         let h = self.mlp.1.forward(gelu(self.mlp.0.forward(self.n3.forward(x.clone()))));
         x + h
@@ -141,14 +158,11 @@ impl Weights {
     }
 
     fn attention(&mut self, p: &str, heads: usize) -> Result<Attention> {
-        let w = self.t2(&format!("{p}.in_proj_weight"))?; // [3d, d]
-        let b = self.t1(&format!("{p}.in_proj_bias"))?;
-        let d = w.dims()[1];
-        let part = |i: usize| Linear {
-            w: w.clone().narrow(0, i * d, d).swap_dims(0, 1),
-            b: b.clone().narrow(0, i * d, d).unsqueeze_dim(0),
+        let qkv = Linear {
+            w: self.t2(&format!("{p}.in_proj_weight"))?.swap_dims(0, 1),
+            b: self.row(&format!("{p}.in_proj_bias"))?,
         };
-        Ok(Attention { q: part(0), k: part(1), v: part(2), out: self.linear(&format!("{p}.out_proj"))?, heads })
+        Ok(Attention { qkv, out: self.linear(&format!("{p}.out_proj"))?, heads })
     }
 
     fn block(&mut self, p: &str, heads: usize, cross: bool) -> Result<Block> {
@@ -208,6 +222,9 @@ pub struct BurnNet {
     cam_in: (Linear, Linear),
     encoder: Vec<Block>,
     decoder: Vec<Block>,
+    /// [d, dec_layers * 2d]: every decoder layer's cross-attention key and value projections,
+    /// side by side, so the triangle tokens are projected for all of them in one matmul.
+    cross_kv: Linear,
     /// The patch queries before the camera and dream noise: q_in(fourier(centres)) + q_pos.
     queries: Tensor<2>,
     centres: Tensor<2>,
@@ -237,7 +254,17 @@ impl BurnNet {
         let tex = w.t2("tex.weight")?;
         let cam_in = w.mlp("cam_in.0", "cam_in.2")?;
         let encoder = (0..enc_layers).map(|i| w.block(&format!("encoder.{i}"), heads, false)).collect::<Result<_>>()?;
-        let decoder = (0..dec_layers).map(|i| w.block(&format!("decoder.{i}"), heads, true)).collect::<Result<_>>()?;
+        let decoder: Vec<Block> =
+            (0..dec_layers).map(|i| w.block(&format!("decoder.{i}"), heads, true)).collect::<Result<_>>()?;
+        let kv = |f: fn(&Linear) -> Tensor<2>| {
+            let parts = decoder.iter().map(|b| {
+                let qkv = &b.cross.as_ref().expect("decoder blocks cross-attend").1.qkv;
+                let d = qkv.w.dims()[0];
+                f(qkv).narrow(1, d, 2 * d)
+            });
+            Tensor::cat(parts.collect(), 1)
+        };
+        let cross_kv = Linear { w: kv(|l| l.w.clone()), b: kv(|l| l.b.clone()) };
         let centres = w.t2("centres")?;
         let q_in = w.mlp("q_in.0", "q_in.2")?;
         let queries = q_in.1.forward(gelu(q_in.0.forward(fourier(centres.clone(), bands)))) + w.t2("q_pos")?;
@@ -263,6 +290,7 @@ impl BurnNet {
             cam_in,
             encoder,
             decoder,
+            cross_kv,
             queries,
             centres,
             cover,
@@ -317,9 +345,12 @@ impl BurnNet {
         let mut q = self.queries.clone() + cam + q_noise.matmul(self.noise_dirs.clone());
         let zero = Tensor::<2>::zeros([PATCHES, 1], dev);
         let dist = Tensor::cat(vec![zero, self.cover_distance(ndc)], 1).reshape([1, PATCHES, n + 1]);
-        for (blk, strength) in self.decoder.iter().zip(&self.cover) {
+        let kv = self.cross_kv.forward(x); // [1 + n, layers * 2d]
+        let d = kv.dims()[1] / (2 * self.decoder.len());
+        for (l, (blk, strength)) in self.decoder.iter().zip(&self.cover).enumerate() {
+            let (k, v) = (kv.clone().narrow(1, 2 * l * d, d), kv.clone().narrow(1, (2 * l + 1) * d, d));
             let bias = -(strength.clone() * dist.clone()) + pad.clone(); // [heads, patches, 1 + n]
-            q = blk.forward(q, None, Some((&x, bias, dream.temp)));
+            q = blk.forward(q, None, Some((k, v, bias, dream.temp)));
         }
         let patches = self.head.forward(self.out_norm.forward(q)); // [patches, 16 * 16 * 3]
         let (gw, gh) = (W as usize / PATCH, H as usize / PATCH);
