@@ -16,59 +16,13 @@
 //!
 //! With the same seed the level and auto-walk match `datagen walk --seed S`.
 
-mod effects;
-mod gpu_net;
-mod net;
-mod tokens;
-
-use gpu_net::GpuNet;
 use datagen::render::{self, H, W};
 use datagen::rng::Rng;
-use datagen::scene::Scene;
-use datagen::walker::{Walker, MAX_PITCH};
-use datagen::{npy, tex, tri_features, view_features, walkable_scene};
+use datagen::walker::MAX_PITCH;
+use datagen::{npy, tex};
 use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
-use net::{Dream, Net};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-
-/// The network, on ONNX Runtime (CPU) or the WGSL shaders (GPU), by the model file's type.
-enum Network {
-    Ort(Net),
-    Gpu(GpuNet),
-}
-
-impl Network {
-    fn load(path: &Path) -> Network {
-        let fail = |e: String| -> ! { panic!("loading {}: {e}", path.display()) };
-        if path.extension().is_some_and(|e| e == "safetensors") {
-            let net = GpuNet::load(path).unwrap_or_else(|e| fail(e));
-            eprintln!("running on {}", net.adapter);
-            Network::Gpu(net)
-        } else {
-            Network::Ort(Net::load(path).unwrap_or_else(|e| fail(e.to_string())))
-        }
-    }
-
-    fn render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Vec<f32> {
-        match self {
-            Network::Ort(net) => net.render(t, dream).expect("inference"),
-            Network::Gpu(net) => net.render(t, dream).expect("inference"),
-        }
-    }
-
-    /// Whether the model takes the dream inputs.
-    fn dreams(&self) -> bool {
-        match self {
-            Network::Ort(net) => net.dreams(),
-            Network::Gpu(_) => true,
-        }
-    }
-}
-
-/// Simulation steps per second: the walker moves a fixed amount per step, as in datagen.
-const TICK: f64 = 30.0;
+use viewer::{effects, to_pixel, tokens, Level, Network, TICK};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -76,33 +30,8 @@ enum Mode {
     Network,
     Both,
 }
-
-struct Level {
-    scene: Scene,
-    walker: Walker,
-    tris: Vec<f32>,
-}
-
-impl Level {
-    fn new(rng: &mut Rng) -> Level {
-        // Same minimum size as `datagen walk`, so seeds line up.
-        let (scene, walker) = walkable_scene(rng, 30);
-        let mut tris = Vec::new();
-        tri_features(&scene, &mut tris);
-        Level { scene, walker, tris }
-    }
-
-    fn tokens(&self) -> tokens::Tokens {
-        let mut v = Vec::new();
-        view_features(0, &self.walker.camera(), &mut v);
-        tokens::tokens(&self.tris, &v)
-    }
-}
-
-fn to_pixel(r: f32, g: f32, b: f32) -> u32 {
-    let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0) as u32;
-    c(r) << 16 | c(g) << 8 | c(b)
-}
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Copy a 320x240 frame into `buf` (`stride` pixels wide) at column `x0`.
 fn blit(buf: &mut [u32], stride: usize, x0: usize, frame: &[u32]) {
@@ -208,7 +137,7 @@ fn main() {
             level = Level::new(&mut rng);
         }
         if pressed(Key::F) || pressed(Key::G) {
-            let n = effects::EFFECTS.len();
+            let n = effects::CHOICES;
             effect = if pressed(Key::F) { (effect + 1) % n } else { (effect + n - 1) % n };
             effect_t = 0.0;
         }
@@ -228,7 +157,8 @@ fn main() {
                 let key = |a: Key, b: Key| (window.is_key_down(a) || window.is_key_down(b)) as i32 as f32;
                 let forward = key(Key::Up, Key::W) - key(Key::Down, Key::S);
                 let strafe = key(Key::E, Key::E) - key(Key::Q, Key::Q);
-                let turn = key(Key::Right, Key::D) - key(Key::Left, Key::A);
+                // Positive turn is to the left.
+                let turn = key(Key::Left, Key::A) - key(Key::Right, Key::D);
                 let look = (key(Key::PageDown, Key::PageDown) - key(Key::PageUp, Key::PageUp)) * MAX_PITCH;
                 let len = (forward * forward + strafe * strafe).sqrt().max(1.0);
                 level.walker.drive(&level.scene, forward / len, strafe / len, turn, look);
@@ -263,9 +193,12 @@ fn main() {
         };
         let how = if driving { "driving" } else { "auto-walk" };
         let pause = if paused { " | paused" } else { "" };
-        let stale =
-            if effects::needs_dream_inputs(effect) && !net.dreams() { " (needs a re-exported model)" } else { "" };
-        let dream = format!("effect {effect}: {}{stale}", effects::EFFECTS[effect]);
+        let stale = if effects::choice_needs_dream_inputs(effect) && !net.dreams() {
+            " (needs a re-exported model)"
+        } else {
+            ""
+        };
+        let dream = format!("effect {effect}: {}{stale}", effects::choice_name(effect));
         window.set_title(&format!(
             "neurofield | {name} | {dream} | {fps:.0} fps | net {net_ms:.0} ms, {tris} tris | {how}{pause} \
              | space: switch  b: both  tab: drive  f/g: effect  n: new level"

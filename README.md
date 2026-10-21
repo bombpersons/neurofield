@@ -114,6 +114,22 @@ seed the level and auto-walk match `datagen walk --seed S`.
 `--check N --out DIR` skips the window and writes the first N frames' tokens
 and network images, to compare against `train/data.py` and PyTorch.
 
+## Game (`game/`)
+
+The start of the game: a first-person walk through a generated level drawn by the
+network on the GPU, in [Bevy](https://bevyengine.org), with an
+[egui](https://github.com/emilk/egui) panel to turn dream effects on in any
+combination:
+
+```bash
+./view.sh --game --seed 7
+```
+
+Mouse to look, WASD to walk and strafe, Tab for the auto-walk, Space to switch to
+the rasteriser, B for both side by side, H to hide the panel, N for a new level.
+Esc frees the mouse to use the panel (click the view to look again; Esc again quits).
+For now the network's frame comes back to the CPU and goes up again as a texture.
+
 The psx crates come from a git submodule pinned to a known commit, so clone with:
 
 ```bash

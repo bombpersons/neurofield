@@ -1,15 +1,16 @@
 //! Dream effects: ways of disturbing the trained network, each drifting slowly
 //! with time so it never quite settles. Some change what the network is told
 //! (triangles, camera), others reach inside it through the model's dream inputs
-//! (texture mixing, attention temperature, pushes on the patch queries).
+//! (texture mixing, attention temperature, pushes on the patch queries). Any set
+//! of them can be on at once: texture mixes multiply, attention temperatures
+//! multiply and query pushes add up.
 
 use crate::net::{Dream, NUM_TEX};
 use crate::tokens::{Tokens, TRI_FEATURES};
 use datagen::TRI_FEATURES as RAW;
 use std::f32::consts::TAU;
 
-pub const EFFECTS: [&str; 14] = [
-    "none",
+pub const EFFECTS: [&str; 12] = [
     "texture morph",
     "texture drift",
     "texture intensity",
@@ -22,12 +23,40 @@ pub const EFFECTS: [&str; 14] = [
     "torch dance",
     "lens breathing",
     "colour drift",
-    "dream (morph + smear + waves + forgetting)",
 ];
 
-/// Whether `effect` reaches inside the network (needs a model exported with the dream inputs).
-pub fn needs_dream_inputs(effect: usize) -> bool {
-    matches!(effect, 1 | 2 | 3 | 6 | 7 | 8 | 13)
+/// The effects in the viewer's "dream" choice: morph, waves, smear and forgetting together.
+pub const DREAM: [usize; 4] = [0, 3, 4, 5];
+
+/// Whether effect `e` reaches inside the network (needs a model exported with the dream inputs).
+pub fn needs_dream_inputs(e: usize) -> bool {
+    matches!(e, 0 | 1 | 2 | 5 | 6 | 7)
+}
+
+/// The viewer's F/G choices: none, each effect alone, then the dream set.
+pub const CHOICES: usize = EFFECTS.len() + 2;
+
+pub fn choice_name(c: usize) -> &'static str {
+    match c {
+        0 => "none",
+        c if c <= EFFECTS.len() => EFFECTS[c - 1],
+        _ => "dream (morph + forgetting + waves + smear)",
+    }
+}
+
+/// The effects on for choice `c`, each at `t` seconds.
+pub fn choice_times(c: usize, t: f32) -> [Option<f32>; EFFECTS.len()] {
+    let mut times = [None; EFFECTS.len()];
+    match c {
+        0 => {}
+        c if c <= EFFECTS.len() => times[c - 1] = Some(t),
+        _ => DREAM.iter().for_each(|&e| times[e] = Some(t)),
+    }
+    times
+}
+
+pub fn choice_needs_dream_inputs(c: usize) -> bool {
+    choice_times(c, 0.0).iter().enumerate().any(|(e, t)| t.is_some() && needs_dream_inputs(e))
 }
 
 /// A hash of (a, b) to -1..1.
@@ -54,14 +83,26 @@ fn swell(t: f32, period: f32) -> f32 {
     0.5 - 0.5 * (TAU * t / period).cos()
 }
 
-/// Each texture swells into another, a different one each cycle, and back.
-fn texture_morph(dream: &mut Dream, t: f32, period: f32) {
+/// Texture mix where each texture swells into another, a different one each cycle, and back.
+fn texture_morph(t: f32, period: f32) -> Vec<f32> {
     let cycle = (t / period).floor() as u64;
     let w = swell(t, period);
+    let mut m = vec![0.0; NUM_TEX * NUM_TEX];
     for i in 0..NUM_TEX {
         let shift = 1 + ((hash(cycle, i as u64) * 0.5 + 0.5) * (NUM_TEX - 1) as f32) as usize % (NUM_TEX - 1);
-        dream.tex_mix[i * NUM_TEX + i] = 1.0 - w;
-        dream.tex_mix[i * NUM_TEX + (i + shift) % NUM_TEX] += w;
+        m[i * NUM_TEX + i] = 1.0 - w;
+        m[i * NUM_TEX + (i + shift) % NUM_TEX] += w;
+    }
+    m
+}
+
+/// Mix the dream's texture mix further: tex_mix = m tex_mix.
+fn mix_textures(dream: &mut Dream, m: &[f32]) {
+    let old = dream.tex_mix.clone();
+    for i in 0..NUM_TEX {
+        for j in 0..NUM_TEX {
+            dream.tex_mix[i * NUM_TEX + j] = (0..NUM_TEX).map(|k| m[i * NUM_TEX + k] * old[k * NUM_TEX + j]).sum();
+        }
     }
 }
 
@@ -86,56 +127,70 @@ fn waves(tok: &mut Tokens, tris: &[f32], t: f32, amount: f32) {
     }
 }
 
-/// Disturb the tokens (of a scene with raw triangle features `tris`) for `effect` at `t`
-/// seconds since it was chosen; returns the network-side disturbance to render with.
-pub fn apply(effect: usize, t: f32, tok: &mut Tokens, tris: &[f32]) -> Dream {
+/// Disturb the tokens (of a scene with raw triangle features `tris`) with every effect that
+/// has a time (seconds since it was turned on); returns the network-side disturbance.
+pub fn apply_set(times: &[Option<f32>; EFFECTS.len()], tok: &mut Tokens, tris: &[f32]) -> Dream {
     let mut dream = Dream::calm();
-    match effect {
-        1 => texture_morph(&mut dream, t, 8.0),
-        2 => {
+    for (e, t) in times.iter().enumerate() {
+        if let Some(t) = *t {
+            apply_one(e, t, tok, tris, &mut dream);
+        }
+    }
+    dream
+}
+
+/// One choice of the viewer's (see `choice_times`) at `t` seconds.
+pub fn apply(choice: usize, t: f32, tok: &mut Tokens, tris: &[f32]) -> Dream {
+    apply_set(&choice_times(choice, t), tok, tris)
+}
+
+fn apply_one(e: usize, t: f32, tok: &mut Tokens, tris: &[f32], dream: &mut Dream) {
+    match e {
+        0 => mix_textures(dream, &texture_morph(t, 8.0)),
+        1 => {
             // Every texture is a drifting blend of several, mostly itself.
+            let mut m = vec![0.0; NUM_TEX * NUM_TEX];
             for i in 0..NUM_TEX {
-                let row = &mut dream.tex_mix[i * NUM_TEX..(i + 1) * NUM_TEX];
-                for (j, m) in row.iter_mut().enumerate() {
+                let row = &mut m[i * NUM_TEX..(i + 1) * NUM_TEX];
+                for (j, v) in row.iter_mut().enumerate() {
                     let own = if i == j { 1.5 } else { 0.0 };
-                    *m = (own + 3.0 * noise((i * NUM_TEX + j) as u64, t * 0.3)).exp();
+                    *v = (own + 3.0 * noise((i * NUM_TEX + j) as u64, t * 0.3)).exp();
                 }
                 let sum: f32 = row.iter().sum();
-                row.iter_mut().for_each(|m| *m /= sum);
+                row.iter_mut().for_each(|v| *v /= sum);
             }
+            mix_textures(dream, &m);
         }
-        3 => {
+        2 => {
             let s = 1.0 + 1.5 * swell(t, 6.0);
-            for i in 0..NUM_TEX {
-                dream.tex_mix[i * NUM_TEX + i] = s;
-            }
+            dream.tex_mix.iter_mut().for_each(|v| *v *= s);
         }
-        4 => forget(tok, t, -1.0 + 0.9 * swell(t, 12.0)),
-        5 => waves(tok, tris, t, 0.05),
-        6 => dream.temp = 1.0 + 2.5 * swell(t, 10.0),
-        7 => dream.temp = 0.6 - 0.35 * swell(t, 6.0),
-        8 => {
+        3 => forget(tok, t, -1.0 + 0.9 * swell(t, 12.0)),
+        4 => waves(tok, tris, t, 0.05),
+        5 => dream.temp *= 1.0 + 2.5 * swell(t, 10.0),
+        6 => dream.temp *= 0.6 - 0.35 * swell(t, 6.0),
+        7 => {
             let amp = 0.35 * swell(t, 8.0);
             for (k, q) in dream.q_noise.iter_mut().enumerate() {
-                *q = amp * noise(k as u64, t * 0.7);
+                *q += amp * noise(k as u64, t * 0.7);
             }
         }
-        9 => {
+        8 => {
             // Fog near and far wander between a third and three times their distance.
             let far = 3f32.powf(noise(1, t * 0.15));
             let near = 3f32.powf(noise(2, t * 0.15));
             tok.cam[2] *= far;
             tok.cam[1] = (tok.cam[1] * near).min(tok.cam[2] * 0.9);
         }
-        10 => {
+        9 => {
             let a = TAU * t / 9.0;
             for c in 0..3 {
                 tok.cam[3 + c] = 1.2 * (0.5 + 0.5 * (a + c as f32 * TAU / 3.0).cos());
             }
             tok.cam[6] *= 1.0 + 1.5 * swell(t, 5.0);
         }
-        11 => tok.cam[0] *= 1.0 + 0.6 * (TAU * t / 7.0).sin(),
-        12 => {
+        10 => tok.cam[0] *= 1.0 + 0.6 * (TAU * t / 7.0).sin(),
+        11 => {
             // Vertex colours (1 = neutral) drift toward their inverse, each channel in its own time.
             for (k, f) in tok.feats.iter_mut().enumerate() {
                 let c = k % TRI_FEATURES;
@@ -145,13 +200,6 @@ pub fn apply(effect: usize, t: f32, tok: &mut Tokens, tris: &[f32]) -> Dream {
                 }
             }
         }
-        13 => {
-            texture_morph(&mut dream, t, 13.0);
-            dream.temp = 1.0 + 1.5 * swell(t, 11.0);
-            waves(tok, tris, t, 0.025);
-            forget(tok, t, -1.0 + 0.6 * swell(t, 17.0));
-        }
         _ => {}
     }
-    dream
 }

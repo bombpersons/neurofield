@@ -192,7 +192,7 @@ impl Walker {
 
     /// One frame of player control instead of `step`: `forward` and `strafe`
     /// in -1..1 of walking speed, `turn` in -1..1 of the turn rate (positive =
-    /// right), `look` the pitch to ease toward. Slides along walls; drops any
+    /// left: yaw grows anticlockwise seen from above), `look` the pitch to ease toward. Slides along walls; drops any
     /// planned walk, so `step` replans from wherever this leaves the body.
     pub fn drive(&mut self, scene: &Scene, forward: f32, strafe: f32, turn: f32, look: f32) {
         self.path.clear();

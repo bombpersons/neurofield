@@ -5,6 +5,7 @@
 #   CKPT=runs/x/ckpt.pt ./view.sh      a particular checkpoint
 #   ./view.sh --gpu [--seed 7]         the network on the GPU (WGSL shaders through wgpu)
 #                                      rather than on the CPU with ONNX Runtime
+#   ./view.sh --game [--seed 7]        the Bevy game (game/): mouse look, effects panel
 #
 # Exports the checkpoint (to model.onnx, or model.safetensors for the GPU) when it or the
 # export code is newer than the export, sets up .venv for the export on first use, and
@@ -14,7 +15,9 @@ cd "$(dirname "$0")"
 
 ckpt=${CKPT:-$(ls -t runs/*/ckpt.pt runs/*/out/ckpt.pt 2>/dev/null | head -n 1)}
 [ -n "$ckpt" ] || { echo "no runs/*/ckpt.pt yet" >&2; exit 1; }
-if [ "${1:-}" = --gpu ]; then
+app=viewer
+if [ "${1:-}" = --gpu ] || [ "${1:-}" = --game ]; then
+    [ "$1" = --game ] && app=game
     shift
     model=$(dirname "$ckpt")/model.safetensors exporter=export_weights.py
 else
@@ -31,5 +34,5 @@ if [ ! -f "$model" ] || [ "$ckpt" -nt "$model" ] || [ "train/$exporter" -nt "$mo
     (cd train && ../.venv/bin/python "$exporter" --ckpt "../$ckpt" --out "../$model" 2>&1 | grep '^wrote')
 fi
 
-cargo build --release --quiet --manifest-path viewer/Cargo.toml
-exec viewer/target/release/viewer --model "$model" "$@"
+cargo build --release --quiet --manifest-path $app/Cargo.toml
+exec $app/target/release/$app --model "$model" "$@"

@@ -10,7 +10,7 @@ use crate::scene::{Camera, Scene, Vert};
 use crate::tex;
 use psx_gpu::ot::OrderingTable;
 use psx_gpu::prim::{Env, Poly, PolyVertex, Prim, Rgb, Texture, Uv, Xy};
-use psx_gpu::Gpu;
+pub use psx_gpu::Gpu;
 use psx_gte::math::{mul_matrix, rot_x, rot_y, rot_z};
 use psx_gte::{Gte, Matrix, Vec3i16, Vec3i32};
 

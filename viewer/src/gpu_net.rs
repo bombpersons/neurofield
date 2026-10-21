@@ -312,20 +312,21 @@ impl GpuNet {
         let d = tri_in.1.out;
         let tex = up.push(&w.take("tex.weight")?.1);
         let cam_in = (w.linear(&mut up, "cam_in.0")?, w.linear(&mut up, "cam_in.2")?);
-        let block = |w: &mut Weights, up: &mut Upload, p: &str, cross: bool| -> Result<(Block, Option<(Vec<f32>, Vec<f32>)>)> {
-            let n1 = w.norm(up, &format!("{p}.n1"))?;
-            let (qkv, out, _, _) = w.attention(up, &format!("{p}.attn"))?;
-            let (cross, kv) = if cross {
-                let n2 = w.norm(up, &format!("{p}.n2"))?;
-                let (xqkv, xout, xw, xb) = w.attention(up, &format!("{p}.xattn"))?;
-                (Some((n2, Linear { out: d, ..xqkv }, xout)), Some((xw, xb)))
-            } else {
-                (None, None)
+        let block =
+            |w: &mut Weights, up: &mut Upload, p: &str, cross: bool| -> Result<(Block, Option<(Vec<f32>, Vec<f32>)>)> {
+                let n1 = w.norm(up, &format!("{p}.n1"))?;
+                let (qkv, out, _, _) = w.attention(up, &format!("{p}.attn"))?;
+                let (cross, kv) = if cross {
+                    let n2 = w.norm(up, &format!("{p}.n2"))?;
+                    let (xqkv, xout, xw, xb) = w.attention(up, &format!("{p}.xattn"))?;
+                    (Some((n2, Linear { out: d, ..xqkv }, xout)), Some((xw, xb)))
+                } else {
+                    (None, None)
+                };
+                let n3 = w.norm(up, &format!("{p}.n3"))?;
+                let mlp = (w.linear(up, &format!("{p}.mlp.0"))?, w.linear(up, &format!("{p}.mlp.2"))?);
+                Ok((Block { n1, qkv, out, cross, n3, mlp }, kv))
             };
-            let n3 = w.norm(up, &format!("{p}.n3"))?;
-            let mlp = (w.linear(up, &format!("{p}.mlp.0"))?, w.linear(up, &format!("{p}.mlp.2"))?);
-            Ok((Block { n1, qkv, out, cross, n3, mlp }, kv))
-        };
         let encoder = (0..enc_layers)
             .map(|i| Ok(block(&mut w, &mut up, &format!("encoder.{i}"), false)?.0))
             .collect::<Result<Vec<_>>>()?;
@@ -562,12 +563,27 @@ impl GpuNet {
         let (d, heads) = (self.d, self.heads);
         // Triangle tokens: MLP over features and their Fourier features, plus texture embeddings.
         if n > 0 {
-            ops.push(Kernel::Prepare, Params { m: n as u32, k: TRI_FEATURES as u32, n: TRI_IN as u32, a_off: s.feats, c_off: s.tri_in, ..Default::default() }, [TRI_IN.div_ceil(64) as u32, n as u32, 1]);
+            ops.push(
+                Kernel::Prepare,
+                Params {
+                    m: n as u32,
+                    k: TRI_FEATURES as u32,
+                    n: TRI_IN as u32,
+                    a_off: s.feats,
+                    c_off: s.tri_in,
+                    ..Default::default()
+                },
+                [TRI_IN.div_ceil(64) as u32, n as u32, 1],
+            );
             ops.linear(s.tri_in, n, self.tri_in.0, s.hidden, GELU);
             ops.linear(s.hidden, n, self.tri_in.1, s.x + d as u32, 0);
             // The texture table, mixed for the dream effects: tex_mix [12, 12] x tex [12, d].
             ops.linear(s.mix, NUM_TEX, Linear { w: self.tex, b: NONE, inp: NUM_TEX, out: d, rs: d }, s.table, 0);
-            ops.push(Kernel::AddTexture, Params { m: n as u32, n: d as u32, a_off: s.tex, b_off: s.table, c_off: s.x, ..Default::default() }, [d.div_ceil(64) as u32, n as u32, 1]);
+            ops.push(
+                Kernel::AddTexture,
+                Params { m: n as u32, n: d as u32, a_off: s.tex, b_off: s.table, c_off: s.x, ..Default::default() },
+                [d.div_ceil(64) as u32, n as u32, 1],
+            );
         }
         ops.linear(s.cams, 1, self.cam_in.0, s.cam_hidden, GELU);
         ops.linear(s.cam_hidden, 1, self.cam_in.1, s.x, 0);
@@ -578,9 +594,26 @@ impl GpuNet {
 
         // Patch queries: the precomputed base + the dream pushes + the camera token (as a bias).
         ops.linear(s.noise, PATCHES, Linear { w: self.noise_dirs, b: s.cam, inp: DREAM_DIRS, out: d, rs: d }, s.q, 0);
-        ops.push(Kernel::Add, Params { m: (PATCHES * d) as u32, a_off: self.queries, c_off: s.q, ..Default::default() }, [(PATCHES * d).div_ceil(64) as u32, 1, 1]);
+        ops.push(
+            Kernel::Add,
+            Params { m: (PATCHES * d) as u32, a_off: self.queries, c_off: s.q, ..Default::default() },
+            [(PATCHES * d).div_ceil(64) as u32, 1, 1],
+        );
         ops.linear(s.x, tokens, self.cross_kv, s.kv, 0);
-        ops.push(Kernel::CoverDistance, Params { m: PATCHES as u32, k: TRI_FEATURES as u32, n: tokens as u32, a_off: s.feats, b_off: self.centres, c_off: s.dist, f0: 2.0 * PATCH as f32 / W as f32, ..Default::default() }, [tokens.div_ceil(64) as u32, PATCHES as u32, 1]);
+        ops.push(
+            Kernel::CoverDistance,
+            Params {
+                m: PATCHES as u32,
+                k: TRI_FEATURES as u32,
+                n: tokens as u32,
+                a_off: s.feats,
+                b_off: self.centres,
+                c_off: s.dist,
+                f0: 2.0 * PATCH as f32 / W as f32,
+                ..Default::default()
+            },
+            [tokens.div_ceil(64) as u32, PATCHES as u32, 1],
+        );
         let kv_rs = self.cross_kv.out;
         for (l, blk) in self.decoder.iter().enumerate() {
             ops.block_self(blk, s, s.q, PATCHES, d, heads);
@@ -590,7 +623,18 @@ impl GpuNet {
             let kv = s.kv + (l * 2 * d) as u32;
             let cover = (self.cover + (l * heads) as u32, s.dist);
             let alpha = 1.0 / ((d / heads) as f32).sqrt() / dream.temp;
-            ops.attention(s, (s.qc, d), (kv, kv_rs), (kv + d as u32, kv_rs), PATCHES, tokens, d, heads, alpha, Some(cover));
+            ops.attention(
+                s,
+                (s.qc, d),
+                (kv, kv_rs),
+                (kv + d as u32, kv_rs),
+                PATCHES,
+                tokens,
+                d,
+                heads,
+                alpha,
+                Some(cover),
+            );
             ops.linear(s.attn, PATCHES, xout, s.q, ACCUMULATE);
             ops.mlp(blk, s, s.q, PATCHES, d);
         }
@@ -599,9 +643,32 @@ impl GpuNet {
         ops.norm(s.q, PATCHES, d, self.out_norm, s.qn);
         ops.linear(s.qn, PATCHES, self.head, s.patches, 0);
         let (w, h) = (W, H);
-        ops.push(Kernel::PatchesToImage, Params { m: h, n: w, a_off: s.patches, c_off: s.image, ..Default::default() }, [w.div_ceil(64), h, 3]);
-        let conv = |ops: &mut Ops, (wt, b): (u32, u32), from: u32, cin: usize, to: u32, cout: usize, flags: u32, last: bool| {
-            let p = Params { m: h, k: cin as u32, n: w, a_off: from, b_off: wt, bias_off: b, c_off: to, x0: cout as u32, flags, x1: if last { s.image } else { NONE }, ..Default::default() };
+        ops.push(
+            Kernel::PatchesToImage,
+            Params { m: h, n: w, a_off: s.patches, c_off: s.image, ..Default::default() },
+            [w.div_ceil(64), h, 3],
+        );
+        let conv = |ops: &mut Ops,
+                    (wt, b): (u32, u32),
+                    from: u32,
+                    cin: usize,
+                    to: u32,
+                    cout: usize,
+                    flags: u32,
+                    last: bool| {
+            let p = Params {
+                m: h,
+                k: cin as u32,
+                n: w,
+                a_off: from,
+                b_off: wt,
+                bias_off: b,
+                c_off: to,
+                x0: cout as u32,
+                flags,
+                x1: if last { s.image } else { NONE },
+                ..Default::default()
+            };
             ops.push(Kernel::Conv3x3, p, [w.div_ceil(16), h.div_ceil(16), cout.div_ceil(8) as u32]);
         };
         conv(&mut ops, self.refine[0], s.image, 3, s.r1, REFINE, GELU, false);
@@ -679,7 +746,17 @@ impl Ops {
     }
 
     fn norm(&mut self, a: u32, rows: usize, d: usize, n: Norm, c: u32) {
-        let p = Params { m: rows as u32, n: d as u32, a_off: a, a_rs: d as u32, b_off: n.g, bias_off: n.b, c_off: c, c_rs: d as u32, ..Default::default() };
+        let p = Params {
+            m: rows as u32,
+            n: d as u32,
+            a_off: a,
+            a_rs: d as u32,
+            b_off: n.g,
+            bias_off: n.b,
+            c_off: c,
+            c_rs: d as u32,
+            ..Default::default()
+        };
         self.push(Kernel::LayerNorm, p, [rows as u32, 1, 1]);
     }
 
@@ -687,7 +764,19 @@ impl Ops {
     /// [s, d] (likewise), the scores scaled by `alpha` and, with `cover` (strengths, distances),
     /// biased toward covering triangles; the heads' outputs side by side in `attn` [l, d].
     #[allow(clippy::too_many_arguments)]
-    fn attention(&mut self, sc: &Scratch, q: (u32, usize), k: (u32, usize), v: (u32, usize), l: usize, s: usize, d: usize, heads: usize, alpha: f32, cover: Option<(u32, u32)>) {
+    fn attention(
+        &mut self,
+        sc: &Scratch,
+        q: (u32, usize),
+        k: (u32, usize),
+        v: (u32, usize),
+        l: usize,
+        s: usize,
+        d: usize,
+        heads: usize,
+        alpha: f32,
+        cover: Option<(u32, u32)>,
+    ) {
         let dh = d / heads;
         let scores = Params {
             m: l as u32,
@@ -710,7 +799,17 @@ impl Ops {
         };
         self.push(Kernel::Matmul, scores, [s.div_ceil(32) as u32, l.div_ceil(32) as u32, heads as u32]);
         let (strength, dist) = cover.unwrap_or((NONE, 0));
-        let soft = Params { m: l as u32, n: s as u32, batch: heads as u32, a_off: sc.scores, b_off: strength, x1: dist, x2: s as u32, f0: alpha, ..Default::default() };
+        let soft = Params {
+            m: l as u32,
+            n: s as u32,
+            batch: heads as u32,
+            a_off: sc.scores,
+            b_off: strength,
+            x1: dist,
+            x2: s as u32,
+            f0: alpha,
+            ..Default::default()
+        };
         self.push(Kernel::Softmax, soft, [l as u32, heads as u32, 1]);
         let mix = Params {
             m: l as u32,
@@ -741,7 +840,18 @@ impl Ops {
         self.linear(s.xn, rows, blk.qkv, s.qkv, 0);
         let rs = 3 * d;
         let alpha = 1.0 / ((d / heads) as f32).sqrt();
-        self.attention(s, (s.qkv, rs), (s.qkv + d as u32, rs), (s.qkv + 2 * d as u32, rs), rows, rows, d, heads, alpha, None);
+        self.attention(
+            s,
+            (s.qkv, rs),
+            (s.qkv + d as u32, rs),
+            (s.qkv + 2 * d as u32, rs),
+            rows,
+            rows,
+            d,
+            heads,
+            alpha,
+            None,
+        );
         self.linear(s.attn, rows, blk.out, x, ACCUMULATE);
         if blk.cross.is_none() {
             self.mlp(blk, s, x, rows, d);
