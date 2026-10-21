@@ -10,6 +10,7 @@ train/colab_sync.sh in case the VM is reclaimed anyway.
 """
 
 import argparse
+import copy
 import itertools
 import json
 import math
@@ -27,7 +28,9 @@ from model import Renderer, loss_fn
 
 
 class Trainer:
-    def __init__(self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1):
+    def __init__(
+        self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1, ema_decay=0.999
+    ):
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,7 +43,9 @@ class Trainer:
         # A perceptual loss on top of L1, against the blur that L1 alone settles for.
         self.lpips_weight = lpips_weight
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(self.device).eval().requires_grad_(False)
-        self.opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
+        main = [p for n, p in self.model.named_parameters() if n != "cover"]
+        self.opt = torch.optim.AdamW(main, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
+        self.opt.add_param_group({"params": [self.model.cover], "weight_decay": 0.0})
         self.lr = lr
         self.amp = self.device == "cuda"
         self.scaler = torch.amp.GradScaler(enabled=self.amp)
@@ -55,10 +60,22 @@ class Trainer:
         ckpt = self.out / "ckpt.pt"
         if ckpt.exists():
             state = torch.load(ckpt, map_location=self.device)
-            self.model.load_state_dict(state["model"])
-            self.opt.load_state_dict(state["opt"])
+            missing = self.model.load_state_dict(state["model"], strict=False).missing_keys
+            assert set(missing) <= {"cover"}, missing
+            if len(state["opt"]["param_groups"]) == len(self.opt.param_groups):
+                self.opt.load_state_dict(state["opt"])
+            else:  # from before the coverage bias: restore the rest, start `cover` fresh
+                cover = self.opt.param_groups.pop()
+                self.opt.load_state_dict(state["opt"])
+                self.opt.add_param_group(cover)
             self.step = state["step"]
-            print(f"resumed at step {self.step}")
+            print(f"resumed at step {self.step}" + (f", new {missing}" if missing else ""))
+        # A slow average of the weights, used for validation, samples and export: steadier than the
+        # weights of any one step.
+        self.ema_decay = ema_decay
+        self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
+        if ckpt.exists() and "ema" in state:
+            self.ema.load_state_dict(state["ema"])
         params = sum(p.numel() for p in self.model.parameters())
         print(f"{params / 1e6:.1f}M params, {len(self.train_set)} train / {len(self.val_set)} val views, {self.device}")
 
@@ -73,10 +90,10 @@ class Trainer:
             lr *= 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
         return lr
 
-    def forward(self, batch):
+    def forward(self, batch, model=None):
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch)
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            pred = self.model(feats, tex, pad, cams)
+            pred = (model or self.model)(feats, tex, pad, cams)
         return pred.float(), images
 
     def losses(self, pred, target):
@@ -106,6 +123,8 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.opt)
             self.scaler.update()
+            with torch.no_grad():
+                torch._foreach_lerp_(list(self.ema.parameters()), list(self.model.parameters()), 1 - self.ema_decay)
             l1s.append(l1.item())
             lps.append(perceptual.item())
             self.step += 1
@@ -122,29 +141,28 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, batches=8):
-        """Mean (L1, LPIPS) over the first validation batches."""
-        self.model.eval()
+        """Mean (L1, LPIPS) of the averaged weights over the first validation batches."""
         loader = DataLoader(self.val_set, batch_size=16, shuffle=False, collate_fn=collate)
-        ls = [[x.item() for x in self.losses(*self.forward(b))[1:]] for b in itertools.islice(loader, batches)]
-        self.model.train()
+        ls = [[x.item() for x in self.losses(*self.forward(b, self.ema))[1:]] for b in itertools.islice(loader, batches)]
         return tuple(float(x) for x in np.mean(ls, 0))
 
     @torch.no_grad()
     def sample(self, path):
-        """Rows of target | prediction for the watched validation views."""
-        self.model.eval()
-        pred, target = self.forward(self.watch)
-        self.model.train()
+        """Rows of target | prediction (averaged weights) for the watched validation views."""
+        pred, target = self.forward(self.watch, self.ema)
         rows = torch.cat([target, pred.clamp(0, 1)], 3)  # side by side
         grid = torch.cat(list(rows), 1)  # stacked vertically
         Image.fromarray((grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)).save(path)
 
     def checkpoint(self):
         val_l1, val_lpips = self.validate()
-        self.log(val_l1=val_l1, val_lpips=val_lpips)
+        self.log(val_l1=val_l1, val_lpips=val_lpips, cover=self.model.cover.abs().mean().item())
         self.sample(self.out / f"sample_{self.step:07d}.png")
         self.sample(self.out / "sample_latest.png")
-        state = {"model": self.model.state_dict(), "opt": self.opt.state_dict(), "step": self.step, "cfg": self.cfg}
+        state = {
+            "model": self.model.state_dict(), "ema": self.ema.state_dict(), "opt": self.opt.state_dict(),
+            "step": self.step, "cfg": self.cfg,
+        }
         torch.save(state, self.out / "ckpt.pt")
 
     def log(self, **kv):

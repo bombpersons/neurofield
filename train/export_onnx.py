@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from data import CAM_FEATURES, TRI_FEATURES, Shards, collate
-from model import Renderer
+from model import load
 
 
 def main():
@@ -23,10 +23,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--walk", default=None)
     a = ap.parse_args()
-    state = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-    m = Renderer(**state.get("cfg", {}))
-    m.load_state_dict(state["model"])
-    m.eval()
+    m, state = load(a.ckpt)
 
     n = 64
     example = (

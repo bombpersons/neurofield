@@ -14,7 +14,7 @@ import torch
 from PIL import Image
 
 from data import Shards, collate
-from model import Renderer
+from model import load
 
 
 @torch.no_grad()
@@ -49,7 +49,5 @@ if __name__ == "__main__":
     ap.add_argument("--every", type=int, default=1)
     a = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    state = torch.load(a.ckpt, map_location=device)
-    m = Renderer(**state.get("cfg", {})).to(device)
-    m.load_state_dict(state["model"])
+    m, _ = load(a.ckpt, device)
     print(render_walk(m, a.walk, a.out, device, every=a.every))
