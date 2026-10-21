@@ -1,7 +1,10 @@
 //! Walk a generated level in real time, drawn by the PS1 rasteriser or by the
 //! trained network.
 //!
-//! `viewer [--model runs/colab2/model.onnx] [--seed 7]`
+//! `viewer [--model runs/colab2/model.onnx] [--seed 7] [--device cpu|gpu]`
+//!     A .onnx model (train/export_onnx.py) runs on ONNX Runtime; a .safetensors
+//!     one (train/export_weights.py) runs on burn, in pure Rust, on the CPU or on
+//!     the GPU through wgpu.
 //!     Space: rasteriser / network   B: side by side   Tab: auto-walk / drive
 //!     Arrows or WASD: walk and turn (driving)   Q/E: strafe   PgUp/PgDn: look
 //!     F / G: next / previous dream effect (slow disturbances of the network)
@@ -13,6 +16,7 @@
 //!
 //! With the same seed the level and auto-walk match `datagen walk --seed S`.
 
+mod burn_net;
 mod effects;
 mod net;
 mod tokens;
@@ -23,10 +27,43 @@ use datagen::scene::Scene;
 use datagen::walker::{Walker, MAX_PITCH};
 use datagen::{npy, tex, tri_features, view_features, walkable_scene};
 use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
-use net::Net;
+use burn_net::BurnNet;
+use net::{Dream, Net};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+/// The network, on ONNX Runtime or on burn, by the model file's type.
+enum Network {
+    Ort(Net),
+    Burn(BurnNet),
+}
+
+impl Network {
+    fn load(path: &Path, device: &str) -> Network {
+        let fail = |e: String| -> ! { panic!("loading {}: {e}", path.display()) };
+        if path.extension().is_some_and(|e| e == "safetensors") {
+            Network::Burn(BurnNet::load(path, device).unwrap_or_else(|e| fail(e)))
+        } else {
+            Network::Ort(Net::load(path).unwrap_or_else(|e| fail(e.to_string())))
+        }
+    }
+
+    fn render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Vec<f32> {
+        match self {
+            Network::Ort(net) => net.render(t, dream).expect("inference"),
+            Network::Burn(net) => net.render(t, dream).expect("inference"),
+        }
+    }
+
+    /// Whether the model takes the dream inputs.
+    fn dreams(&self) -> bool {
+        match self {
+            Network::Ort(net) => net.dreams(),
+            Network::Burn(_) => true,
+        }
+    }
+}
 
 /// Simulation steps per second: the walker moves a fixed amount per step, as in datagen.
 const TICK: f64 = 30.0;
@@ -73,7 +110,7 @@ fn blit(buf: &mut [u32], stride: usize, x0: usize, frame: &[u32]) {
     }
 }
 
-fn check(net: &mut Net, seed: u64, frames: usize, out: &Path, effect: usize) {
+fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize) {
     std::fs::create_dir_all(out).unwrap();
     let mut rng = Rng::new(seed);
     let mut level = Level::new(&mut rng);
@@ -85,7 +122,7 @@ fn check(net: &mut Net, seed: u64, frames: usize, out: &Path, effect: usize) {
         npy::write(&out.join(format!("feats_{f:05}.npy")), &[t.len(), tokens::TRI_FEATURES], &t.feats).unwrap();
         npy::write(&out.join(format!("tex_{f:05}.npy")), &[t.len()], &t.tex).unwrap();
         npy::write(&out.join(format!("cam_{f:05}.npy")), &[tokens::CAM_FEATURES], &t.cam).unwrap();
-        images.extend(net.render(&t, &dream).expect("inference"));
+        images.extend(net.render(&t, &dream));
         counts.push(t.len() as i64);
         level.walker.step(&level.scene, &mut rng);
     }
@@ -107,7 +144,8 @@ fn main() {
     }
     let model = PathBuf::from(opts.get("model").map_or("runs/colab2/model.onnx", String::as_str));
     let seed: u64 = opts.get("seed").map_or(7, |s| s.parse().expect("--seed is a number"));
-    let mut net = Net::load(&model).unwrap_or_else(|e| panic!("loading {}: {e}", model.display()));
+    let device = opts.get("device").map_or("cpu", String::as_str);
+    let mut net = Network::load(&model, device);
     if let Some(n) = opts.get("check") {
         let out = PathBuf::from(opts.get("out").expect("--check needs --out"));
         let effect = opts.get("effect").map_or(0, |e| e.parse().expect("--effect is a number"));
@@ -199,7 +237,7 @@ fn main() {
             let mut t = level.tokens();
             let dream = effects::apply(effect, effect_t, &mut t, &level.tris);
             tris = t.len();
-            let rgb = net.render(&t, &dream).expect("inference");
+            let rgb = net.render(&t, &dream);
             for (px, c) in neural.iter_mut().zip(rgb.chunks_exact(3)) {
                 *px = to_pixel(c[0], c[1], c[2]);
             }

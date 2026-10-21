@@ -89,6 +89,18 @@ By hand: export a checkpoint, using a venv with `onnx`, `onnxscript` and `onnxru
 cd viewer && cargo run --release -- --model ../runs/colab2/model.onnx --seed 7
 ```
 
+The network can also run in pure Rust with [burn](https://burn.dev), on the GPU
+through wgpu (Vulkan, Metal or DX12) or on the CPU, from a `.safetensors` export
+(`train/export_weights.py`); `view.sh` makes it when given `--device`:
+
+```bash
+./view.sh --seed 7 --device gpu
+```
+
+The burn port matches PyTorch to within 3e-6. On the CPU it is about 7x slower
+than ONNX Runtime, which stays the default there. On Linux the GPU needs access
+to `/dev/dri/renderD*`, which a remote-desktop session may not have.
+
 Space switches between rasteriser and network, B shows both side by side, Tab
 switches between the auto-walk and driving yourself (arrows or WASD, Q/E to
 strafe, PgUp/PgDn to look), N makes a new level, P pauses. F and G step
