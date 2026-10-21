@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// The network, on ONNX Runtime or on burn, by the model file's type.
+/// The network, on ONNX Runtime (CPU) or the WGSL shaders (GPU), by the model file's type.
 enum Network {
     Ort(Net),
     Gpu(GpuNet),
