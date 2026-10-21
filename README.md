@@ -73,7 +73,9 @@ Rendering rules worth knowing when reading the data:
 Walks a generated level live, drawn by the PS1 rasteriser or by the trained
 network (on the CPU with ONNX Runtime, about 30 fps on 12 cores, or on the GPU). The
 quick way, which exports the newest `runs/*/ckpt.pt` if needed (setting up
-`.venv` the first time), builds the viewer and opens it:
+`.venv` the first time), builds the viewer and opens it. Without a checkpoint of your
+own, it downloads the trained model from the
+[latest release](https://github.com/bombpersons/neurofield/releases/latest) instead:
 
 ```bash
 ./view.sh --seed 7
