@@ -4,13 +4,16 @@
 //! `viewer [--model runs/colab2/model.onnx] [--seed 7]`
 //!     Space: rasteriser / network   B: side by side   Tab: auto-walk / drive
 //!     Arrows or WASD: walk and turn (driving)   Q/E: strafe   PgUp/PgDn: look
+//!     F / G: next / previous dream effect (slow disturbances of the network)
 //!     N: new level   P: pause   Esc: quit
-//! `viewer --check N --out DIR [--model ...] [--seed 7]`
+//! `viewer --check N --out DIR [--model ...] [--seed 7] [--effect E]`
 //!     No window: the first N frames of the auto-walk, as tokens and network
-//!     images in DIR, for comparison with the Python pipeline.
+//!     images in DIR, for comparison with the Python pipeline (with dream
+//!     effect E at 30 frames a second, if given).
 //!
 //! With the same seed the level and auto-walk match `datagen walk --seed S`.
 
+mod effects;
 mod net;
 mod tokens;
 
@@ -70,18 +73,19 @@ fn blit(buf: &mut [u32], stride: usize, x0: usize, frame: &[u32]) {
     }
 }
 
-fn check(net: &mut Net, seed: u64, frames: usize, out: &Path) {
+fn check(net: &mut Net, seed: u64, frames: usize, out: &Path, effect: usize) {
     std::fs::create_dir_all(out).unwrap();
     let mut rng = Rng::new(seed);
     let mut level = Level::new(&mut rng);
     let mut images = Vec::new();
     let mut counts = Vec::new();
     for f in 0..frames {
-        let t = level.tokens();
+        let mut t = level.tokens();
+        let dream = effects::apply(effect, f as f32 / TICK as f32, &mut t);
         npy::write(&out.join(format!("feats_{f:05}.npy")), &[t.len(), tokens::TRI_FEATURES], &t.feats).unwrap();
         npy::write(&out.join(format!("tex_{f:05}.npy")), &[t.len()], &t.tex).unwrap();
         npy::write(&out.join(format!("cam_{f:05}.npy")), &[tokens::CAM_FEATURES], &t.cam).unwrap();
-        images.extend(net.render(&t).expect("inference"));
+        images.extend(net.render(&t, &dream).expect("inference"));
         counts.push(t.len() as i64);
         level.walker.step(&level.scene, &mut rng);
     }
@@ -106,7 +110,8 @@ fn main() {
     let mut net = Net::load(&model).unwrap_or_else(|e| panic!("loading {}: {e}", model.display()));
     if let Some(n) = opts.get("check") {
         let out = PathBuf::from(opts.get("out").expect("--check needs --out"));
-        check(&mut net, seed, n.parse().expect("--check is a frame count"), &out);
+        let effect = opts.get("effect").map_or(0, |e| e.parse().expect("--effect is a number"));
+        check(&mut net, seed, n.parse().expect("--check is a frame count"), &out, effect);
         return;
     }
 
@@ -126,6 +131,8 @@ fn main() {
     let mut mode = Mode::Network;
     let mut driving = false;
     let mut paused = false;
+    let mut effect = 0;
+    let mut effect_t = 0.0f32;
     let mut last = Instant::now();
     let mut acc = 0.0;
     let (mut fps, mut net_ms, mut tris) = (0.0, 0.0, 0);
@@ -150,6 +157,11 @@ fn main() {
         if pressed(Key::N) {
             level = Level::new(&mut rng);
         }
+        if pressed(Key::F) || pressed(Key::G) {
+            let n = effects::EFFECTS.len();
+            effect = if pressed(Key::F) { (effect + 1) % n } else { (effect + n - 1) % n };
+            effect_t = 0.0;
+        }
 
         // Fixed-rate simulation, catching up (a little) when rendering is slow.
         let now = Instant::now();
@@ -158,6 +170,7 @@ fn main() {
         fps = fps * 0.9 + 0.1 / dt.max(1e-6);
         if !paused {
             acc = (acc + dt * TICK).min(4.0);
+            effect_t += dt as f32;
         }
         while acc >= 1.0 {
             acc -= 1.0;
@@ -183,9 +196,10 @@ fn main() {
         }
         if mode != Mode::Raster {
             let t0 = Instant::now();
-            let t = level.tokens();
+            let mut t = level.tokens();
+            let dream = effects::apply(effect, effect_t, &mut t);
             tris = t.len();
-            let rgb = net.render(&t).expect("inference");
+            let rgb = net.render(&t, &dream).expect("inference");
             for (px, c) in neural.iter_mut().zip(rgb.chunks_exact(3)) {
                 *px = to_pixel(c[0], c[1], c[2]);
             }
@@ -199,9 +213,12 @@ fn main() {
         };
         let how = if driving { "driving" } else { "auto-walk" };
         let pause = if paused { " | paused" } else { "" };
+        let stale =
+            if effects::needs_dream_inputs(effect) && !net.dreams() { " (needs a re-exported model)" } else { "" };
+        let dream = format!("effect {effect}: {}{stale}", effects::EFFECTS[effect]);
         window.set_title(&format!(
-            "neurofield | {name} | {fps:.0} fps | net {net_ms:.0} ms, {tris} tris | {how}{pause} \
-             | space: switch  b: both  tab: drive  n: new level"
+            "neurofield | {name} | {dream} | {fps:.0} fps | net {net_ms:.0} ms, {tris} tris | {how}{pause} \
+             | space: switch  b: both  tab: drive  f/g: effect  n: new level"
         ));
         let shown = match mode {
             Mode::Raster => window.update_with_buffer(&raster, w, h),

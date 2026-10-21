@@ -14,12 +14,29 @@ pub struct Tokens {
     pub feats: Vec<f32>,
     /// [n] texture ids.
     pub tex: Vec<i64>,
+    /// [n] index of each token's triangle in the scene: stable from frame to frame.
+    pub ids: Vec<usize>,
     pub cam: [f32; CAM_FEATURES],
 }
 
 impl Tokens {
     pub fn len(&self) -> usize {
         self.tex.len()
+    }
+
+    /// Keep only the tokens for which `keep(id)` is true.
+    pub fn retain(&mut self, keep: impl Fn(usize) -> bool) {
+        let keep: Vec<bool> = self.ids.iter().map(|&id| keep(id)).collect();
+        let mut i = 0;
+        self.feats.retain(|_| {
+            let k = keep[i / TRI_FEATURES];
+            i += 1;
+            k
+        });
+        let mut it = keep.iter();
+        self.tex.retain(|_| *it.next().unwrap());
+        let mut it = keep.iter();
+        self.ids.retain(|_| *it.next().unwrap());
     }
 }
 
@@ -79,6 +96,7 @@ pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
 
     let mut feats = Vec::with_capacity(kept.len() * TRI_FEATURES);
     let mut tex = Vec::with_capacity(kept.len());
+    let ids = kept.iter().map(|k| k.3).collect();
     for (_, p, n, i) in &kept {
         let t = &tris[i * RAW..(i + 1) * RAW];
         feats.extend(p.iter().flatten().map(|c| c / 8.0));
@@ -95,5 +113,5 @@ pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
         tex.push(t[15] as i64);
     }
     let cam = [h / 160.0, v[14] / 8.0, v[15] / 8.0, v[19], v[20], v[21], v[22] / 4.0];
-    Tokens { feats, tex, cam }
+    Tokens { feats, tex, ids, cam }
 }

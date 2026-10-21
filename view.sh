@@ -4,7 +4,7 @@
 #   ./view.sh [--seed 7]               newest runs/*/ckpt.pt or runs/*/out/ckpt.pt (Kaggle)
 #   CKPT=runs/x/ckpt.pt ./view.sh      a particular checkpoint
 #
-# Exports the checkpoint to ONNX when it is newer than its model.onnx, sets up
+# Exports the checkpoint to ONNX when it (or the export code) is newer than its model.onnx, sets up
 # .venv for the export on first use, and builds the viewer if needed. Extra
 # arguments go to the viewer.
 set -euo pipefail
@@ -19,7 +19,8 @@ if [ ! -x .venv/bin/python ]; then
     python3 -m venv --system-site-packages .venv
     .venv/bin/pip install -q onnx onnxscript onnxruntime
 fi
-if [ ! -f "$onnx" ] || [ "$ckpt" -nt "$onnx" ]; then
+# Re-export when the checkpoint or the exporter (or the model code it traces) is newer.
+if [ ! -f "$onnx" ] || [ "$ckpt" -nt "$onnx" ] || [ train/export_onnx.py -nt "$onnx" ] || [ train/model.py -nt "$onnx" ]; then
     echo "exporting $ckpt"
     (cd train && ../.venv/bin/python export_onnx.py --ckpt "../$ckpt" --out "../$onnx" 2>&1 | grep '^wrote')
 fi

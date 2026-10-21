@@ -91,7 +91,11 @@ cd viewer && cargo run --release -- --model ../runs/colab2/model.onnx --seed 7
 
 Space switches between rasteriser and network, B shows both side by side, Tab
 switches between the auto-walk and driving yourself (arrows or WASD, Q/E to
-strafe, PgUp/PgDn to look), N makes a new level, P pauses. With the same
+strafe, PgUp/PgDn to look), N makes a new level, P pauses. F and G step
+through dream effects that disturb the network and drift slowly with time:
+textures morphing into each other, triangles forgotten and remembered,
+vertices wobbling, the attention smeared or made stark, fog, torch and lens
+wandering, and all at once. With the same
 seed the level and auto-walk match `datagen walk --seed S`.
 `--check N --out DIR` skips the window and writes the first N frames' tokens
 and network images, to compare against `train/data.py` and PyTorch.
