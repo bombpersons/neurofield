@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const PATCH: usize = 16;
+/// Triangle tokens are padded to a multiple of this.
+const PAD_TO: usize = 64;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -286,8 +288,9 @@ impl BurnNet {
     /// The network's frame for these tokens: [H * W * 3] floats, roughly 0..1, row-major RGB.
     pub fn render(&mut self, t: &Tokens, dream: &Dream) -> Result<Vec<f32>> {
         let dev = &self.device;
-        // An empty view still needs one (masked) token, as in data.py `collate`.
-        let n = t.len().max(1);
+        // Pad to a multiple of PAD_TO masked tokens (an empty view still needs some, as in data.py
+        // `collate`): the GPU backend compiles and tunes kernels per shape, so few shapes keep it fast.
+        let n = t.len().max(1).div_ceil(PAD_TO) * PAD_TO;
         let mut feats = t.feats.clone();
         feats.resize(n * TRI_FEATURES, 0.0);
         let mut tex = t.tex.clone();
@@ -320,7 +323,8 @@ impl BurnNet {
         }
         let patches = self.head.forward(self.out_norm.forward(q)); // [patches, 16 * 16 * 3]
         let (gw, gh) = (W as usize / PATCH, H as usize / PATCH);
-        let img = patches.reshape([gh, gw, 3, PATCH, PATCH]).permute([2, 0, 3, 1, 4]).reshape([1, 3, H as usize, W as usize]);
+        let img =
+            patches.reshape([gh, gw, 3, PATCH, PATCH]).permute([2, 0, 3, 1, 4]).reshape([1, 3, H as usize, W as usize]);
         let mut r = img.clone();
         for (i, (w, b)) in self.refine.iter().enumerate() {
             r = conv2d(r, w.clone(), Some(b.clone()), ConvOptions::new([1, 1], [1, 1], [1, 1], 1));

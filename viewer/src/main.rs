@@ -21,13 +21,13 @@ mod effects;
 mod net;
 mod tokens;
 
+use burn_net::BurnNet;
 use datagen::render::{self, H, W};
 use datagen::rng::Rng;
 use datagen::scene::Scene;
 use datagen::walker::{Walker, MAX_PITCH};
 use datagen::{npy, tex, tri_features, view_features, walkable_scene};
 use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
-use burn_net::BurnNet;
 use net::{Dream, Net};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -116,19 +116,30 @@ fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize)
     let mut level = Level::new(&mut rng);
     let mut images = Vec::new();
     let mut counts = Vec::new();
+    let mut times = Vec::new();
     for f in 0..frames {
         let mut t = level.tokens();
         let dream = effects::apply(effect, f as f32 / TICK as f32, &mut t, &level.tris);
         npy::write(&out.join(format!("feats_{f:05}.npy")), &[t.len(), tokens::TRI_FEATURES], &t.feats).unwrap();
         npy::write(&out.join(format!("tex_{f:05}.npy")), &[t.len()], &t.tex).unwrap();
         npy::write(&out.join(format!("cam_{f:05}.npy")), &[tokens::CAM_FEATURES], &t.cam).unwrap();
+        let t0 = Instant::now();
         images.extend(net.render(&t, &dream));
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
         counts.push(t.len() as i64);
         level.walker.step(&level.scene, &mut rng);
     }
     npy::write(&out.join("images.npy"), &[frames, H as usize, W as usize, 3], &images).unwrap();
     npy::write(&out.join("counts.npy"), &[frames], &counts).unwrap();
     println!("wrote {frames} frames to {}", out.display());
+    let (first, rest) = times.split_at_mut(frames.min(1));
+    rest.sort_by(f64::total_cmp);
+    if let (Some(first), Some(median)) = (first.first(), rest.get(rest.len() / 2)) {
+        println!(
+            "network: first frame {first:.0} ms, then median {median:.1} ms, slowest {:.0} ms",
+            rest[rest.len() - 1]
+        );
+    }
 }
 
 fn main() {
