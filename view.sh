@@ -3,10 +3,10 @@
 #
 #   ./view.sh [--seed 7]               newest runs/*/ckpt.pt or runs/*/out/ckpt.pt (Kaggle)
 #   CKPT=runs/x/ckpt.pt ./view.sh      a particular checkpoint
-#   ./view.sh --device gpu             the pure-Rust (burn) network on the GPU; --device cpu
-#                                      runs it on the CPU (slow: ONNX Runtime is the CPU default)
+#   ./view.sh --gpu [--seed 7]         the network on the GPU (WGSL shaders through wgpu)
+#                                      rather than on the CPU with ONNX Runtime
 #
-# Exports the checkpoint (to model.onnx, or model.safetensors for burn) when it or the
+# Exports the checkpoint (to model.onnx, or model.safetensors for the GPU) when it or the
 # export code is newer than the export, sets up .venv for the export on first use, and
 # builds the viewer if needed. Extra arguments go to the viewer.
 set -euo pipefail
@@ -14,7 +14,8 @@ cd "$(dirname "$0")"
 
 ckpt=${CKPT:-$(ls -t runs/*/ckpt.pt runs/*/out/ckpt.pt 2>/dev/null | head -n 1)}
 [ -n "$ckpt" ] || { echo "no runs/*/ckpt.pt yet" >&2; exit 1; }
-if [[ " $* " == *" --device "* ]]; then
+if [ "${1:-}" = --gpu ]; then
+    shift
     model=$(dirname "$ckpt")/model.safetensors exporter=export_weights.py
 else
     model=$(dirname "$ckpt")/model.onnx exporter=export_onnx.py

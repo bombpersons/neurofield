@@ -8,5 +8,7 @@ description = "Walk a generated level in real time, rendered by the PS1 rasteris
 datagen = { path = "../datagen" }
 minifb = { version = "0.29.0", default-features = false, features = ["x11"] }
 ort = "2.0.0-rc.15"
-burn = { version = "0.22.1", default-features = false, features = ["std", "wgpu", "flex", "fusion", "autotune"] }
 safetensors = "0.8.0"
+wgpu = "30.0.1"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }

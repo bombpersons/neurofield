@@ -71,7 +71,7 @@ Rendering rules worth knowing when reading the data:
 ## Realtime viewer (`viewer/`)
 
 Walks a generated level live, drawn by the PS1 rasteriser or by the trained
-network (run on the CPU with ONNX Runtime, about 30 fps on 12 cores). The
+network (on the CPU with ONNX Runtime, about 30 fps on 12 cores, or on the GPU). The
 quick way, which exports the newest `runs/*/ckpt.pt` if needed (setting up
 `.venv` the first time), builds the viewer and opens it:
 
@@ -89,17 +89,19 @@ By hand: export a checkpoint, using a venv with `onnx`, `onnxscript` and `onnxru
 cd viewer && cargo run --release -- --model ../runs/colab2/model.onnx --seed 7
 ```
 
-The network can also run in pure Rust with [burn](https://burn.dev), on the GPU
-through wgpu (Vulkan, Metal or DX12) or on the CPU, from a `.safetensors` export
-(`train/export_weights.py`); `view.sh` makes it when given `--device`:
+The network can also run on the GPU, as hand-written WGSL compute shaders
+(`viewer/src/gpu_net.wgsl`) through [wgpu](https://wgpu.rs): Vulkan, Metal or DX12,
+in pure Rust. It reads a `.safetensors` export (`train/export_weights.py`), which
+`view.sh` makes when given `--gpu`:
 
 ```bash
-./view.sh --seed 7 --device gpu
+./view.sh --gpu --seed 7
 ```
 
-The burn port matches PyTorch to within 3e-6. On the CPU it is about 7x slower
-than ONNX Runtime, which stays the default there. On Linux the GPU needs access
-to `/dev/dri/renderD*`, which a remote-desktop session may not have.
+The whole frame is one submission of about 140 small kernels over one buffer, with
+no per-shape compiling. On an RX 580 it takes about 10 ms a frame against 28 ms for
+ONNX Runtime on a Ryzen 5 3600, and matches PyTorch to within 4e-6. On Linux the
+GPU needs access to `/dev/dri/renderD*`, which a remote-desktop session may not have.
 
 Space switches between rasteriser and network, B shows both side by side, Tab
 switches between the auto-walk and driving yourself (arrows or WASD, Q/E to

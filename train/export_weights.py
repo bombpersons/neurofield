@@ -1,10 +1,10 @@
-"""Export a checkpoint's weights for the viewer's pure-Rust (burn) renderer.
+"""Export a checkpoint's weights for the viewer's GPU renderer (viewer/src/gpu_net.rs).
 
     .venv/bin/python train/export_weights.py --ckpt runs/x/ckpt.pt --out runs/x/model.safetensors
 
 Writes the averaged weights when the checkpoint has them, plus the fixed buffers
 the forward pass needs (patch centres, dream noise directions), as float32
-safetensors with the model config in the metadata. viewer/src/burn_net.rs reads it.
+safetensors with the model config in the metadata.
 """
 
 import argparse

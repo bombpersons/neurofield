@@ -1,10 +1,10 @@
 //! Walk a generated level in real time, drawn by the PS1 rasteriser or by the
 //! trained network.
 //!
-//! `viewer [--model runs/colab2/model.onnx] [--seed 7] [--device cpu|gpu]`
-//!     A .onnx model (train/export_onnx.py) runs on ONNX Runtime; a .safetensors
-//!     one (train/export_weights.py) runs on burn, in pure Rust, on the CPU or on
-//!     the GPU through wgpu.
+//! `viewer [--model runs/colab2/model.onnx] [--seed 7]`
+//!     A .onnx model (train/export_onnx.py) runs on the CPU with ONNX Runtime; a
+//!     .safetensors one (train/export_weights.py) on the GPU, as the WGSL compute
+//!     shaders in gpu_net.wgsl through wgpu (Vulkan, Metal or DX12).
 //!     Space: rasteriser / network   B: side by side   Tab: auto-walk / drive
 //!     Arrows or WASD: walk and turn (driving)   Q/E: strafe   PgUp/PgDn: look
 //!     F / G: next / previous dream effect (slow disturbances of the network)
@@ -16,12 +16,12 @@
 //!
 //! With the same seed the level and auto-walk match `datagen walk --seed S`.
 
-mod burn_net;
 mod effects;
+mod gpu_net;
 mod net;
 mod tokens;
 
-use burn_net::BurnNet;
+use gpu_net::GpuNet;
 use datagen::render::{self, H, W};
 use datagen::rng::Rng;
 use datagen::scene::Scene;
@@ -36,14 +36,16 @@ use std::time::Instant;
 /// The network, on ONNX Runtime or on burn, by the model file's type.
 enum Network {
     Ort(Net),
-    Burn(BurnNet),
+    Gpu(GpuNet),
 }
 
 impl Network {
-    fn load(path: &Path, device: &str) -> Network {
+    fn load(path: &Path) -> Network {
         let fail = |e: String| -> ! { panic!("loading {}: {e}", path.display()) };
         if path.extension().is_some_and(|e| e == "safetensors") {
-            Network::Burn(BurnNet::load(path, device).unwrap_or_else(|e| fail(e)))
+            let net = GpuNet::load(path).unwrap_or_else(|e| fail(e));
+            eprintln!("running on {}", net.adapter);
+            Network::Gpu(net)
         } else {
             Network::Ort(Net::load(path).unwrap_or_else(|e| fail(e.to_string())))
         }
@@ -52,7 +54,7 @@ impl Network {
     fn render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Vec<f32> {
         match self {
             Network::Ort(net) => net.render(t, dream).expect("inference"),
-            Network::Burn(net) => net.render(t, dream).expect("inference"),
+            Network::Gpu(net) => net.render(t, dream).expect("inference"),
         }
     }
 
@@ -60,7 +62,7 @@ impl Network {
     fn dreams(&self) -> bool {
         match self {
             Network::Ort(net) => net.dreams(),
-            Network::Burn(_) => true,
+            Network::Gpu(_) => true,
         }
     }
 }
@@ -155,8 +157,7 @@ fn main() {
     }
     let model = PathBuf::from(opts.get("model").map_or("runs/colab2/model.onnx", String::as_str));
     let seed: u64 = opts.get("seed").map_or(7, |s| s.parse().expect("--seed is a number"));
-    let device = opts.get("device").map_or("cpu", String::as_str);
-    let mut net = Network::load(&model, device);
+    let mut net = Network::load(&model);
     if let Some(n) = opts.get("check") {
         let out = PathBuf::from(opts.get("out").expect("--check needs --out"));
         let effect = opts.get("effect").map_or(0, |e| e.parse().expect("--effect is a number"));
