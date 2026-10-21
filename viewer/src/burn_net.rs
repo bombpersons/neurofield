@@ -4,7 +4,7 @@
 //! from train/export_weights.py.
 
 use crate::net::{Dream, DREAM_DIRS, NUM_TEX, PATCHES};
-use crate::tokens::{Tokens, CAM_FEATURES, TRI_FEATURES};
+use crate::tokens::{Tokens, CAM_FEATURES, MAX_TRIS, TRI_FEATURES};
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::module::conv2d;
 use burn::tensor::ops::ConvOptions;
@@ -237,8 +237,11 @@ pub struct BurnNet {
 }
 
 impl BurnNet {
-    /// Load weights written by train/export_weights.py onto the "cpu" or the "gpu".
+    /// Load weights written by train/export_weights.py onto the "cpu" or the "gpu". On the
+    /// GPU, renders once at every padded token count first, so that compiling and tuning
+    /// kernels happens here rather than as stutters later.
     pub fn load(path: &Path, device: &str) -> Result<BurnNet> {
+        let gpu = device == "gpu";
         let device = match device {
             "cpu" => Device::flex(),
             "gpu" => Device::wgpu(DeviceKind::DefaultDevice),
@@ -282,7 +285,7 @@ impl BurnNet {
             left.sort();
             return Err(format!("unused weights (is the port behind model.py?): {left:?}"));
         }
-        Ok(BurnNet {
+        let mut net = BurnNet {
             device,
             bands,
             tri_in,
@@ -298,7 +301,21 @@ impl BurnNet {
             out_norm,
             head,
             refine,
-        })
+        };
+        if gpu {
+            let start = std::time::Instant::now();
+            for n in (PAD_TO..=MAX_TRIS.div_ceil(PAD_TO) * PAD_TO).step_by(PAD_TO) {
+                let warm = Tokens {
+                    feats: vec![0.0; n * TRI_FEATURES],
+                    tex: vec![0; n],
+                    ids: vec![0; n],
+                    cam: [0.0; CAM_FEATURES],
+                };
+                net.render(&warm, &Dream::calm())?;
+            }
+            eprintln!("GPU kernels ready in {:.1} s", start.elapsed().as_secs_f64());
+        }
+        Ok(net)
     }
 
     /// Distance in patch widths from each patch centre to each triangle's screen bounding
