@@ -51,7 +51,7 @@ def main():
     if a.walk:
         import onnxruntime as ort
 
-        feats, tex, pad, cams, _ = collate([Shards(a.walk)[0]])
+        feats, tex, pad, cams, *_ = collate([Shards(a.walk)[0]])
         with torch.no_grad():
             want = m(feats, tex, pad, cams).numpy()
         sess = ort.InferenceSession(a.out, providers=["CPUExecutionProvider"])

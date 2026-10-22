@@ -131,6 +131,46 @@ impl Walker {
         }
     }
 
+    /// A camera like this walker's, standing on open floor 0.6-2.2 tiles from `target`
+    /// with nothing solid between, looking at it (give or take a little).
+    pub fn view_of(&self, scene: &Scene, target: [f32; 3], rng: &mut Rng) -> Option<Camera> {
+        let cells = scene.floor_cells();
+        for _ in 0..30 {
+            let (cx, cz) = cells[rng.next() as usize % cells.len()];
+            if scene.blocked[(cz * scene.w + cx) as usize] {
+                continue;
+            }
+            let (x, z) = centre((cx, cz));
+            let (x, z) = (x + rng.fr(-0.3, 0.3) * TF, z + rng.fr(-0.3, 0.3) * TF);
+            let (dx, dz) = (target[0] - x, target[2] - z);
+            let dist = dx.hypot(dz);
+            if !(0.6 * TF..2.2 * TF).contains(&dist) {
+                continue;
+            }
+            let Some(fy) = scene.walkable_y(x, z) else { continue };
+            let y = fy - EYE;
+            // Nothing solid along the line of sight, skipping the target's own cell.
+            let n = (dist / 32.0).ceil() as i32;
+            let clear = (1..n).all(|i| {
+                let t = i as f32 / n as f32;
+                let (px, pz) = (x + dx * t, z + dz * t);
+                let own = (px / TF).floor() == (target[0] / TF).floor() && (pz / TF).floor() == (target[2] / TF).floor();
+                own || scene.floor_y(px, pz).is_some_and(|f| f > y + (target[1] - y) * t)
+            });
+            if !clear {
+                continue;
+            }
+            let pitch = (target[1] - y).atan2(dist) / std::f32::consts::TAU * 4096.0;
+            return Some(Camera {
+                pos: [x as i32, y as i32, z as i32],
+                yaw: (yaw_towards(dx, dz) + rng.fr(-120.0, 120.0)).round() as i32,
+                pitch: (pitch + rng.fr(-60.0, 60.0)).clamp(-MAX_PITCH, MAX_PITCH).round() as i32,
+                ..self.camera()
+            });
+        }
+        None
+    }
+
     pub fn step(&mut self, scene: &Scene, rng: &mut Rng) {
         // Gaze: usually level, sometimes a glance up or down.
         if rng.chance(0.012) {

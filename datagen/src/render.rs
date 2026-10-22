@@ -51,6 +51,8 @@ struct Frame<'a> {
     gte: Gte,
     ot: OrderingTable,
     cam: &'a Camera,
+    /// Mask pass: draw untextured, white if `Some(true)` and black if `Some(false)`.
+    ink: Option<bool>,
 }
 
 impl Frame<'_> {
@@ -98,6 +100,14 @@ impl Frame<'_> {
         let cr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
         let len = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt().max(1e-6);
         let n = cr.map(|c| c / len);
+        if let Some(white) = self.ink {
+            let c = if white { 255 } else { 0 };
+            let verts = (0..3)
+                .map(|i| PolyVertex { xy: Xy(r.sxy[i].x, r.sxy[i].y), color: Rgb(c, c, c), uv: Uv(0, 0) })
+                .collect();
+            self.ot.add(otz as i32, &Prim::Poly(Poly { verts, gouraud: false, texture: None, semi: false }));
+            return;
+        }
         let verts = (0..3)
             .map(|i| {
                 let f = self.fog(r.sz[i]);
@@ -110,13 +120,32 @@ impl Frame<'_> {
                 }
             })
             .collect();
-        let texture = Some(Texture { page: tex::page(), clut: tex::clut(tex), raw: false });
+        let texture = Some(Texture { page: tex::page_of(tex), clut: tex::clut(tex), raw: false });
         self.ot.add(otz as i32, &Prim::Poly(Poly { verts, gouraud: true, texture, semi: false }));
     }
 }
 
 /// Draw one view and return the 320x240 frame as RGB8.
 pub fn render(gpu: &mut Gpu, scene: &Scene, cam: &Camera) -> Vec<u8> {
+    if !scene.skins.is_empty() {
+        let mut words = Vec::new();
+        for p in tex::skin_uploads(&scene.skins) {
+            p.encode(&mut words);
+        }
+        gpu.gp0_all(&words);
+    }
+    draw(gpu, scene, cam, false);
+    gpu.vram.rgba15(0, 0, W, H).chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+}
+
+/// Which pixels of `render`'s frame show a creature (1) rather than the level or nothing (0),
+/// sorted the same way so creatures hidden behind walls stay hidden.
+pub fn creature_mask(gpu: &mut Gpu, scene: &Scene, cam: &Camera) -> Vec<u8> {
+    draw(gpu, scene, cam, true);
+    gpu.vram.rgba15(0, 0, W, H).chunks(4).map(|p| (p[0] > 127) as u8).collect()
+}
+
+fn draw(gpu: &mut Gpu, scene: &Scene, cam: &Camera, mask: bool) {
     let rt = view_matrix(cam);
     let mut gte = Gte::new();
     gte.set_rotation(&rt);
@@ -127,14 +156,18 @@ pub fn render(gpu: &mut Gpu, scene: &Scene, cam: &Camera) -> Vec<u8> {
     // OTZ = mean SZ / 4, so the 2048-entry table covers depths up to 8192.
     gte.set_z_scale(0x1000 / 3 / 4, 0x1000 / 4 / 4);
 
-    let mut frame = Frame { gte, ot: OrderingTable::new(OT_LEN), cam };
+    let mut frame = Frame { gte, ot: OrderingTable::new(OT_LEN), cam, ink: mask.then_some(false) };
     for t in &scene.tris {
+        frame.tri(t.v, t.tex, 0);
+    }
+    frame.ink = mask.then_some(true);
+    for t in &scene.creature_tris {
         frame.tri(t.v, t.tex, 0);
     }
 
     let mut words = Vec::new();
     for env in [
-        Env::TexPage { page: tex::page(), dither: true, draw_to_display: true },
+        Env::TexPage { page: tex::page(), dither: !mask, draw_to_display: true },
         Env::DrawArea { x1: 0, y1: 0, x2: W as u16 - 1, y2: H as u16 - 1 },
         Env::DrawOffset { x: 0, y: 0 },
         Env::Fill { x: 0, y: 0, w: W as u16, h: H as u16, color: Rgb(0, 0, 0) },
@@ -143,5 +176,4 @@ pub fn render(gpu: &mut Gpu, scene: &Scene, cam: &Camera) -> Vec<u8> {
     }
     gpu.gp0_all(&words);
     frame.ot.draw(gpu);
-    gpu.vram.rgba15(0, 0, W, H).chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
 }

@@ -91,7 +91,7 @@ class Trainer:
         return lr
 
     def forward(self, batch, model=None):
-        feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch)
+        feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch[:5])
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
             pred = (model or self.model)(feats, tex, pad, cams)
         return pred.float(), images

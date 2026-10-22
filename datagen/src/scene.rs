@@ -7,7 +7,7 @@
 //! floor is y = 0, everything above it is negative y), as on the PS1.
 
 use crate::rng::{hash, Rng};
-use crate::tex;
+use crate::{creature, skin, tex};
 
 pub const T: i32 = 256;
 const TF: f32 = T as f32;
@@ -85,7 +85,14 @@ pub struct Scene {
     pub cells: Vec<Cell>,
     pub rooms: Vec<Room>,
     pub outdoor: bool,
+    /// The level and its props; creatures are kept apart in `creature_tris`.
     pub tris: Vec<Tri>,
+    pub creatures: Vec<creature::Creature>,
+    /// Dense creature meshes, drawn with the level but never given to the network.
+    pub creature_tris: Vec<Tri>,
+    /// Creature skins made for this scene, texture ids from `tex::SKIN_BASE`.
+    pub skins: Vec<tex::Texture>,
+    pub(crate) skin_kinds: Vec<(skin::Motif, f32)>,
     /// Cells holding a prop or creature, which the walker treats as solid.
     pub blocked: Vec<bool>,
     /// Cells kept clear of props and creatures (beside doors).
@@ -336,6 +343,10 @@ impl Scene {
             rooms,
             outdoor,
             tris: Vec::new(),
+            creatures: Vec::new(),
+            creature_tris: Vec::new(),
+            skins: Vec::new(),
+            skin_kinds: Vec::new(),
             blocked: vec![false; (w * d) as usize],
             reserved: vec![false; (w * d) as usize],
             sun_dir: norm([rng.fr(-1.0, 1.0), rng.fr(0.6, 1.5), rng.fr(-1.0, 1.0)]),
@@ -421,7 +432,7 @@ impl Scene {
 
     /// Baked vertex colour: ambient + sun + point lights, times tint, with a
     /// small per-position wobble so shared vertices stay consistent.
-    fn shade(&self, p: [i32; 3], n: [f32; 3], tint: [f32; 3]) -> [u8; 3] {
+    pub(crate) fn shade(&self, p: [i32; 3], n: [f32; 3], tint: [f32; 3]) -> [u8; 3] {
         let pf = p.map(|c| c as f32);
         let lambert = dot(n, [-self.sun_dir[0], -self.sun_dir[1], -self.sun_dir[2]]).max(0.0);
         let mut light = [0, 1, 2].map(|c| self.ambient[c] + self.sun_col[c] * lambert);

@@ -27,7 +27,7 @@ def render_walk(model, walk_dir, out_dir, device, batch=16, every=1, gif_scale=1
     idx = list(range(0, len(ds), every))
     for i in range(0, len(idx), batch):
         items = [ds[j] for j in idx[i : i + batch]]
-        feats, tex, pad, cams, images = (x.to(device) for x in collate(items))
+        feats, tex, pad, cams, images = (x.to(device) for x in collate(items)[:5])
         with torch.autocast(device, dtype=torch.float16, enabled=device == "cuda"):
             pred = model(feats, tex, pad, cams).float().clamp(0, 1)
         pair = torch.cat([images, pred], 3).permute(0, 2, 3, 1).cpu().numpy()

@@ -1,6 +1,7 @@
 //! Twelve fixed 64x64 4-bit CLUT textures, generated procedurally and packed
 //! into one VRAM texture page (4 across, 3 down) at x=640: eight for the
-//! level, three for creatures and one for doors.
+//! level, three for props and one for doors. Texture ids from `SKIN_BASE` on
+//! are per-scene creature skins (see `skin`), on two more pages at x=704 and 768.
 
 use crate::rng::hash;
 use psx_gpu::prim::{Blend, Clut, Env, Prim, TexDepth, TexPage};
@@ -16,6 +17,11 @@ const ROWS: usize = N.div_ceil(4);
 pub const SIZE: usize = 64;
 const PAGE_X: u16 = 640;
 const CLUT_Y: u16 = 480;
+/// First texture id of the per-scene creature skins.
+pub const SKIN_BASE: u8 = 16;
+/// Skins one scene can hold: two pages of 16.
+pub const SKIN_SLOTS: usize = 32;
+const SKIN_PAGE_X: u16 = 704;
 
 /// Dark and light ends of each texture's 16-step palette.
 const PALETTES: [([u8; 3], [u8; 3]); N] = [
@@ -43,17 +49,33 @@ pub fn page() -> TexPage {
     TexPage::at(PAGE_X, 0, TexDepth::Clut4, Blend::Half)
 }
 
-pub fn clut(t: u8) -> Clut {
-    Clut::at(0, CLUT_Y + t as u16)
+/// The texture page holding texture `t`.
+pub fn page_of(t: u8) -> TexPage {
+    if t < SKIN_BASE {
+        page()
+    } else {
+        TexPage::at(SKIN_PAGE_X + 64 * ((t - SKIN_BASE) as u16 / 16), 0, TexDepth::Clut4, Blend::Half)
+    }
 }
 
-/// Top-left texel of texture `t` inside the page.
+pub fn clut(t: u8) -> Clut {
+    if t < SKIN_BASE {
+        Clut::at(0, CLUT_Y + t as u16)
+    } else {
+        // Skin CLUTs sit beside the level's, 16 to a row.
+        let s = (t - SKIN_BASE) as u16;
+        Clut::at(16 * (1 + s % 16), CLUT_Y + s / 16)
+    }
+}
+
+/// Top-left texel of texture `t` inside its page.
 pub fn uv_origin(t: u8) -> (u8, u8) {
-    ((t as usize % 4 * SIZE) as u8, (t as usize / 4 * SIZE) as u8)
+    let s = if t < SKIN_BASE { t as usize } else { (t - SKIN_BASE) as usize % 16 };
+    ((s % 4 * SIZE) as u8, (s / 4 * SIZE) as u8)
 }
 
 /// Tileable value noise over a `period`-cell lattice, 0..1.
-fn value_noise(x: f32, y: f32, period: i32, seed: u64) -> f32 {
+pub(crate) fn value_noise(x: f32, y: f32, period: i32, seed: u64) -> f32 {
     let (x0, y0) = (x.floor() as i32, y.floor() as i32);
     let (fx, fy) = (x - x0 as f32, y - y0 as f32);
     let corner = |i: i32, j: i32| {
@@ -68,7 +90,7 @@ fn value_noise(x: f32, y: f32, period: i32, seed: u64) -> f32 {
 }
 
 /// Fractal noise that tiles over the 64-texel texture.
-fn fbm(x: usize, y: usize, base: i32, octaves: u32, seed: u64) -> f32 {
+pub(crate) fn fbm(x: usize, y: usize, base: i32, octaves: u32, seed: u64) -> f32 {
     let (mut sum, mut amp, mut norm, mut period) = (0.0, 1.0, 0.0, base);
     for o in 0..octaves {
         let scale = period as f32 / SIZE as f32;
@@ -213,8 +235,27 @@ pub fn make_all() -> Vec<Texture> {
 
 /// GP0 uploads for the texture page and the CLUTs.
 pub fn uploads(texs: &[Texture]) -> Vec<Prim> {
+    let mut out = vec![page_upload(texs, PAGE_X)];
+    for (t, tex) in texs.iter().enumerate() {
+        out.push(clut_upload(tex, t as u8));
+    }
+    out
+}
+
+/// GP0 uploads for a scene's creature skins (at most `SKIN_SLOTS`).
+pub fn skin_uploads(skins: &[Texture]) -> Vec<Prim> {
+    let mut out: Vec<Prim> =
+        skins.chunks(16).enumerate().map(|(p, page)| page_upload(page, SKIN_PAGE_X + 64 * p as u16)).collect();
+    for (s, tex) in skins.iter().enumerate() {
+        out.push(clut_upload(tex, SKIN_BASE + s as u8));
+    }
+    out
+}
+
+/// Up to 16 textures packed 4 across into one 4-bit page at VRAM x.
+fn page_upload(texs: &[Texture], x: u16) -> Prim {
     // The page region is 256 texels wide = 64 halfwords (4 texels each).
-    let (w, h) = (64usize, ROWS * SIZE);
+    let (w, h) = (64usize, texs.len().div_ceil(4) * SIZE);
     let mut page = vec![0u16; w * h];
     for (t, tex) in texs.iter().enumerate() {
         let (u0, v0) = uv_origin(t as u8);
@@ -225,13 +266,14 @@ pub fn uploads(texs: &[Texture]) -> Vec<Prim> {
             }
         }
     }
-    let mut out = vec![Prim::Env(Env::Upload { x: PAGE_X, y: 0, w: w as u16, h: h as u16, data: page })];
-    for (t, tex) in texs.iter().enumerate() {
-        // 0x0000 is transparent on the PS1, so nudge pure black off it.
-        let data = tex.pal.iter().map(|&[r, g, b]| rgb8_to_rgb15(r, g, b).max(0x0421)).collect();
-        out.push(Prim::Env(Env::Upload { x: 0, y: CLUT_Y + t as u16, w: 16, h: 1, data }));
-    }
-    out
+    Prim::Env(Env::Upload { x, y: 0, w: w as u16, h: h as u16, data: page })
+}
+
+fn clut_upload(tex: &Texture, t: u8) -> Prim {
+    // 0x0000 is transparent on the PS1, so nudge pure black off it.
+    let data = tex.pal.iter().map(|&[r, g, b]| rgb8_to_rgb15(r, g, b).max(0x0421)).collect();
+    let c = clut(t).0;
+    Prim::Env(Env::Upload { x: (c & 0x3F) * 16, y: c >> 6, w: 16, h: 1, data })
 }
 
 /// RGB8 atlas of all textures (256 wide), laid out as in VRAM.
