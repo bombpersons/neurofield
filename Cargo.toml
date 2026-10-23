@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["psx-bevy"]
+# The psx submodule is a workspace of its own; the rest are still standalone crates.
+exclude = ["external", "datagen", "viewer", "game"]
+
+# psx-bevy (the psx template's crate, see docs/template.md) inherits these.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+# Shared by every crate that uses them, so they build once with one feature set.
+[workspace.dependencies]
+psx-bevy = { path = "psx-bevy" }
+bevy = { version = "=0.20.0", default-features = false, features = [
+  "std", "async_executor", "multi_threaded", "bevy_asset", "bevy_log", "bevy_winit",
+  "bevy_core_pipeline", "bevy_pbr", "bevy_sprite_render", "bevy_gltf", "bevy_gilrs",
+  "png", "x11", "wayland", "bevy_ui_render", "default_font", "bevy_gizmos_render",
+  "reflect_auto_register",
+] }
+# Bevy 0.20 exposes native GLES on its renderer crate, not the facade features.
+bevy_render = { version = "=0.20.0", default-features = false, features = ["gles"] }
+bevy_input = { version = "=0.20.0", features = ["serialize"] }
+bevy_egui = "0.43.1"
+rmcp = { version = "=3.5.1", features = ["transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-std"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["alloc"] }
+ron = "0.12"
+# Feature alignment from the template: keeps shared crates' features the same
+# with and without psx-bevy's `dev-mcp`, so switching doesn't rebuild Bevy.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+futures-sink = "0.3"
+base64 = "0.23"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Iteration builds: our code at opt-level 1, dependencies (Bevy) at 3, so
+# `cargo run` plays at close to release speed.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
