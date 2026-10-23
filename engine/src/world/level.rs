@@ -9,7 +9,7 @@
 
 use crate::world::creature::Kind;
 use crate::world::rng::Rng;
-use crate::world::scene::{Light, Room, Rock, Scene, Slope, Span, Strange, STEP, T};
+use crate::world::scene::{Light, Room, Rock, Scene, Slope, Span, Strange, StrangeArea, STEP, T};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -122,6 +122,18 @@ pub struct Area {
     pub surface: Option<Surface>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Adds to or pins strangeness inside the area.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strangeness: Option<AreaStrange>,
+}
+
+/// What an area does to strangeness inside it (fading out over a tile outside).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AreaStrange {
+    /// Adds this much to it.
+    Add(f32),
+    /// Holds it at this value.
+    Pin(f32),
 }
 
 impl Area {
@@ -161,6 +173,35 @@ pub struct Strangeness {
     pub ambient: [f32; 3],
     pub sun: [f32; 3],
     pub seed: u64,
+    /// Strangeness where the textures start and finish morphing.
+    #[serde(default = "default_morph")]
+    pub morph: (f32, f32),
+    /// Where lights, ambient and sun start and finish turning to their strange colours.
+    #[serde(default = "default_lurid")]
+    pub lurid: (f32, f32),
+    /// Where the fog starts and finishes taking on its strange colour.
+    #[serde(default = "default_fog_ramp")]
+    pub fog_ramp: (f32, f32),
+    /// The hues (in turns, 0..1 round the colour wheel, `to` may pass 1) that lights
+    /// without a strange colour of their own drift toward.
+    #[serde(default = "default_light_hues")]
+    pub light_hues: (f32, f32),
+}
+
+fn default_morph() -> (f32, f32) {
+    crate::world::scene::MORPH
+}
+
+fn default_lurid() -> (f32, f32) {
+    crate::world::scene::LURID
+}
+
+fn default_fog_ramp() -> (f32, f32) {
+    crate::world::scene::FOG_RAMP
+}
+
+fn default_light_hues() -> (f32, f32) {
+    (0.0, 1.0)
 }
 
 impl Default for Strangeness {
@@ -172,6 +213,10 @@ impl Default for Strangeness {
             ambient: [0.5, 0.15, 0.45],
             sun: [0.2, 0.9, 0.6],
             seed: 1,
+            morph: default_morph(),
+            lurid: default_lurid(),
+            fog_ramp: default_fog_ramp(),
+            light_hues: default_light_hues(),
         }
     }
 }
@@ -472,6 +517,21 @@ impl Level {
             fog: s.fog,
             ambient: s.ambient,
             sun: s.sun,
+            morph: s.morph,
+            lurid: s.lurid,
+            fog_ramp: s.fog_ramp,
+            areas: self
+                .areas
+                .iter()
+                .filter_map(|a| Some((a, a.strangeness?)))
+                .flat_map(|(a, mode)| {
+                    a.boxes.iter().map(move |&(lo, hi)| StrangeArea {
+                        lo: [lo[0] as f32 * TF, -hi[1] as f32 * STEP as f32, lo[2] as f32 * TF],
+                        hi: [hi[0] as f32 * TF, -lo[1] as f32 * STEP as f32, hi[2] as f32 * TF],
+                        mode,
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -521,7 +581,10 @@ impl Level {
             .map(|l| Light {
                 pos: l.pos,
                 col: l.colour,
-                weird: l.strange.unwrap_or_else(|| crate::world::scene::hue(rng.f(), rng.fr(0.75, 1.0), rng.fr(0.8, 1.5))),
+                weird: l.strange.unwrap_or_else(|| {
+                    let (from, to) = self.strangeness.light_hues;
+                    crate::world::scene::hue(from + (to - from) * rng.f(), rng.fr(0.75, 1.0), rng.fr(0.8, 1.5))
+                }),
                 radius: l.radius,
             })
             .collect();
@@ -668,6 +731,53 @@ mod tests {
         let l = Level::demo();
         let back = Level::parse(&l.to_ron()).unwrap();
         assert_eq!(l, back);
+    }
+
+    /// Levels saved before the look settings get the ramps generated levels use.
+    #[test]
+    fn old_strangeness_loads() {
+        let old = "(depth: [(0.0, 0.2)], noise: (0.12, 0.8), fog: (0.4, 0.0, 0.6), ambient: (0.5, 0.1, 0.4), sun: (0.2, 0.9, 0.6), seed: 3)";
+        let s: Strangeness = ron::from_str(old).unwrap();
+        let d = Strangeness::default();
+        assert_eq!((s.morph, s.lurid, s.fog_ramp, s.light_hues), (d.morph, d.lurid, d.fog_ramp, d.light_hues));
+    }
+
+    /// An area pins strangeness inside it, fading out over a tile outside, and
+    /// another adds to the depth curve.
+    #[test]
+    fn areas_pin_and_add() {
+        let mut l = Level::new("t");
+        for x in 0..12 {
+            l.open(x, 0, 0, 12);
+        }
+        l.strangeness.noise.0 = 0.0;
+        l.strangeness.depth = vec![(0.0, 0.1)];
+        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [3, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Pin(0.8)) });
+        l.areas.push(Area { name: "b".into(), label: "room".into(), boxes: vec![([8, 0, 0], [10, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Add(0.3)) });
+        let scene = l.to_scene();
+        let at = |x: f32| scene.strangeness([x * TF, -STEP as f32, 0.5 * TF]);
+        assert!((at(1.5) - 0.8).abs() < 1e-4, "pinned inside: {}", at(1.5));
+        assert!((at(3.0) - 0.8).abs() < 1e-4, "pinned on its wall: {}", at(3.0));
+        assert!(at(3.5) < 0.8 && at(3.5) > 0.1, "fading outside: {}", at(3.5));
+        assert!((at(5.5) - 0.1).abs() < 1e-4, "the depth curve beyond: {}", at(5.5));
+        assert!((at(9.0) - 0.4).abs() < 1e-4, "added inside: {}", at(9.0));
+    }
+
+    /// The textures morph only across the level's morph range.
+    #[test]
+    fn morph_range() {
+        let mut l = Level::new("t");
+        l.open(0, 0, 0, 12);
+        l.strangeness.noise.0 = 0.0;
+        l.strangeness.depth = vec![(0.0, 0.5)];
+        let p = [0.5 * TF, -STEP as f32, 0.5 * TF];
+        assert!((l.to_scene().morph(p) - 0.5).abs() < 1e-4);
+        l.strangeness.morph = (0.4, 0.6);
+        assert!((l.to_scene().morph(p) - 0.5).abs() < 1e-4);
+        l.strangeness.morph = (0.6, 0.9);
+        assert_eq!(l.to_scene().morph(p), 0.0);
+        l.strangeness.morph = (0.1, 0.3);
+        assert_eq!(l.to_scene().morph(p), 1.0);
     }
 
     /// The walker can get from the lower hall to the upper room by the stairs,

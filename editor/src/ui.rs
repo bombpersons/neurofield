@@ -945,7 +945,7 @@ impl Viewer<'_> {
             if let Some(b) = crate::tools::cells_box(&self.doc.level, faces) {
                 let l = &mut self.doc.level;
                 let name = format!("area {}", l.areas.len() + 1);
-                l.areas.push(engine::world::level::Area { name, label: "room".into(), boxes: vec![b], surface: None, notes: String::new() });
+                l.areas.push(engine::world::level::Area { name, label: "room".into(), boxes: vec![b], surface: None, notes: String::new(), strangeness: None });
                 self.s.sel = Sel::Area(l.areas.len() - 1);
             }
         }

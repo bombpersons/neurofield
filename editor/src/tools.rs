@@ -332,6 +332,7 @@ impl Tools {
                             boxes: vec![(lo, hi)],
                             surface: None,
                             notes: String::new(),
+                            strangeness: None,
                         });
                     }
                     self.swallow = true;
@@ -757,7 +758,7 @@ impl Tools {
                     doc.level.set_box(lo, hi, true);
                     if mods.ctrl {
                         let name = format!("room {}", doc.level.areas.len() + 1);
-                        doc.level.areas.push(Area { name, label: "room".into(), boxes: vec![(lo, hi)], surface: None, notes: String::new() });
+                        doc.level.areas.push(Area { name, label: "room".into(), boxes: vec![(lo, hi)], surface: None, notes: String::new(), strangeness: None });
                     }
                     *message = format!("opened {} x {} tiles", (end.0 - start.0).abs() + 1, (end.1 - start.1).abs() + 1);
                     return None;
@@ -1371,7 +1372,7 @@ mod tests {
         assert!(l.paint.is_empty());
         // An area's surface is the default inside it.
         let s = Surface { floor: 5, ..Surface::default() };
-        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [2, 12, 2])], surface: Some(s), notes: String::new() });
+        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [2, 12, 2])], surface: Some(s), notes: String::new(), strangeness: None });
         assert_eq!(face_tex(&l, [1, 0, 1], Face::Floor), 5);
         assert_eq!(face_tex(&l, [3, 0, 1], Face::Floor), floor);
         // A wall fill covers the wall's plane, all layers.

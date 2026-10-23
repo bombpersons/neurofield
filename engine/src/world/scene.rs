@@ -147,7 +147,41 @@ pub struct Strange {
     pub(crate) fog: [f32; 3],
     pub(crate) ambient: [f32; 3],
     pub(crate) sun: [f32; 3],
+    /// Strangeness where the textures start and finish morphing.
+    pub(crate) morph: (f32, f32),
+    /// Where the lights, ambient and sun start and finish turning lurid.
+    pub(crate) lurid: (f32, f32),
+    /// Where the fog starts and finishes taking on `fog`.
+    pub(crate) fog_ramp: (f32, f32),
+    /// Hand-built levels: areas that add to or pin strangeness inside them.
+    pub(crate) areas: Vec<StrangeArea>,
 }
+
+/// An area's say in strangeness: its box in world units (y down, so `lo` is the
+/// top), fading out over a tile outside it.
+#[derive(Clone, Debug)]
+pub(crate) struct StrangeArea {
+    pub(crate) lo: [f32; 3],
+    pub(crate) hi: [f32; 3],
+    pub(crate) mode: crate::world::level::AreaStrange,
+}
+
+impl StrangeArea {
+    /// 1 inside the box and on its faces, falling to 0 a tile outside.
+    fn weight(&self, p: [f32; 3]) -> f32 {
+        (0..3)
+            .map(|a| {
+                let out = (self.lo[a] - p[a]).max(p[a] - self.hi[a]).max(0.0);
+                1.0 - smoothstep(0.0, TF, out)
+            })
+            .product()
+    }
+}
+
+/// Defaults of the look ramps, as generated levels have always used them.
+pub(crate) const MORPH: (f32, f32) = (0.0, 1.0);
+pub(crate) const LURID: (f32, f32) = (0.15, 0.85);
+pub(crate) const FOG_RAMP: (f32, f32) = (0.2, 0.9);
 
 /// Strangeness base forced on every scene generated from now on (the game's depth), as f32 bits; NaN = none.
 static FORCE_STRANGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x7FC0_0000);
@@ -155,6 +189,14 @@ static FORCE_STRANGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// Make every scene generated from now on this strange at its base (None: random, for training).
 pub fn force_strangeness(base: Option<f32>) {
     FORCE_STRANGE.store(base.unwrap_or(f32::NAN).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Smoothstep over a (start, end) range, or a step where the two meet.
+fn ramp((a, b): (f32, f32), x: f32) -> f32 {
+    if b - a < 1e-3 {
+        return if x >= a { 1.0 } else { 0.0 };
+    }
+    smoothstep(a, b, x)
 }
 
 pub(crate) fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
@@ -206,6 +248,10 @@ impl Strange {
             fog: hue(rng.f(), rng.fr(0.7, 1.0), rng.fr(0.35, 0.75)).map(|c| c.min(1.0)),
             ambient: hue(rng.f(), rng.fr(0.6, 0.9), light(ambient).max(0.15) * rng.fr(1.1, 1.6)),
             sun: hue(rng.f(), rng.fr(0.6, 0.9), light(sun) * 1.2),
+            morph: MORPH,
+            lurid: LURID,
+            fog_ramp: FOG_RAMP,
+            areas: Vec::new(),
         }
     }
 
@@ -223,6 +269,17 @@ impl Strange {
         }
         if !self.points.is_empty() {
             s += self.lattice([x / TF, -p[1] / TF, z / TF]);
+        }
+        use crate::world::level::AreaStrange;
+        for a in &self.areas {
+            if let AreaStrange::Add(v) = a.mode {
+                s += v * a.weight(p);
+            }
+        }
+        for a in &self.areas {
+            if let AreaStrange::Pin(v) = a.mode {
+                s += (v - s) * a.weight(p);
+            }
         }
         s.clamp(0.0, 1.0)
     }
@@ -683,7 +740,7 @@ impl Scene {
     pub(crate) fn shade(&self, p: [i32; 3], n: [f32; 3], tint: [f32; 3]) -> [u8; 3] {
         let pf = p.map(|c| c as f32);
         // Colours turn lurid with strangeness.
-        let w = smoothstep(0.15, 0.85, self.strange.at(pf));
+        let w = ramp(self.strange.lurid, self.strange.at(pf));
         let mix = |a: [f32; 3], b: [f32; 3]| [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * w);
         let (ambient, sun) = (mix(self.ambient, self.strange.ambient), mix(self.sun_col, self.strange.sun));
         let lambert = dot(n, [-self.sun_dir[0], -self.sun_dir[1], -self.sun_dir[2]]).max(0.0);
@@ -733,10 +790,20 @@ impl Scene {
         self.strange.at(p)
     }
 
+    /// How far the textures have morphed at a world point, 0..1 (strangeness
+    /// through the level's morph range).
+    pub fn morph(&self, p: [f32; 3]) -> f32 {
+        let (a, b) = self.strange.morph;
+        if (a, b) == MORPH {
+            return self.strange.at(p);
+        }
+        ((self.strange.at(p) - a) / (b - a).max(1e-3)).clamp(0.0, 1.0)
+    }
+
     /// What fog fades to for a camera at `pos`, RGB 0..1: black while grounded,
     /// the level's lurid fog colour where it is strange.
     pub fn fog_colour(&self, pos: [i32; 3]) -> [f32; 3] {
-        let w = smoothstep(0.2, 0.9, self.strange.at(pos.map(|c| c as f32)));
+        let w = ramp(self.strange.fog_ramp, self.strange.at(pos.map(|c| c as f32)));
         self.strange.fog.map(|c| c * w)
     }
 
@@ -880,6 +947,10 @@ impl Scene {
                 fog: [0.0; 3],
                 ambient: [0.2; 3],
                 sun: [0.0; 3],
+                morph: MORPH,
+                lurid: LURID,
+                fog_ramp: FOG_RAMP,
+                areas: Vec::new(),
             },
             paint: Default::default(),
             things: Default::default(),

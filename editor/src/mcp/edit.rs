@@ -8,7 +8,7 @@ use crate::doc::Doc;
 use crate::tools::{add_entity, entity_kinds, fill, has_face, make_link, paint, place_at, stairs, Link, Sel};
 use crate::ui::Ui;
 use crate::view3d::EditorCam;
-use engine::world::level::{Area, CeilingKind, Dir, EntityKind, Level, PointLight, SlopeDef, SlopeKind, Strangeness, Sun, Surface};
+use engine::world::level::{Area, AreaStrange, CeilingKind, Dir, EntityKind, Level, PointLight, SlopeDef, SlopeKind, Strangeness, Sun, Surface};
 use engine::world::scene::{STEP, T};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -208,6 +208,7 @@ pub struct AreaArgs {
     surface: Option<Surface>,
     #[serde(default)]
     notes: String,
+    strangeness: Option<AreaStrange>,
 }
 
 #[derive(Deserialize)]
@@ -497,7 +498,7 @@ fn change(edit: Edit, ui: &mut Ui, l: &mut Level) -> Result<(String, Value), Str
             if a.boxes.iter().any(|(lo, hi)| (0..3).any(|i| hi[i] <= lo[i])) {
                 return Err("each box is [min, max] with max beyond min (exclusive)".into());
             }
-            l.areas.push(Area { name: a.name.clone(), label: a.label, boxes: a.boxes, surface: a.surface, notes: a.notes });
+            l.areas.push(Area { name: a.name.clone(), label: a.label, boxes: a.boxes, surface: a.surface, notes: a.notes, strangeness: a.strangeness });
             let index = l.areas.len() - 1;
             ui.sel = Sel::Area(index);
             (format!("added area {}", a.name), json!({"index": index}))
@@ -608,8 +609,8 @@ pub fn tools() -> Vec<(&'static str, &'static str, Value)> {
         ("level_add_light", "Add a point light at pos (world units), with a colour (0..1 each) and radius (world units, default 768: three tiles). Returns its index.", json!({"type": "object", "properties": {"pos": point, "colour": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "radius": {"type": "number"}}, "required": ["pos"], "additionalProperties": false})),
         ("level_edit_light", "Change a light by index: set merges into it (pos, colour, radius, strange).", index_set.clone()),
         ("level_delete_light", "Delete a light by index; later lights move down one.", index.clone()),
-        ("level_add_area", "Add a named area (a room, a corridor...) made of boxes [[min], [max]] of cells, max exclusive, with a label (e.g. \"crypt\"), optional surface {floor, wall, ceiling: slots, tint: [r, g, b]} for its default paint, and notes.", json!({"type": "object", "properties": {"name": {"type": "string"}, "label": {"type": "string"}, "boxes": {"type": "array", "items": {"type": "array", "items": cell, "minItems": 2, "maxItems": 2}, "minItems": 1}, "surface": {"type": "object"}, "notes": {"type": "string"}}, "required": ["name", "boxes"], "additionalProperties": false})),
-        ("level_edit_area", "Change an area by index: set merges into it (name, label, boxes, surface, notes).", index_set),
+        ("level_add_area", "Add a named area (a room, a corridor...) made of boxes [[min], [max]] of cells, max exclusive, with a label (e.g. \"crypt\"), optional surface {floor, wall, ceiling: slots, tint: [r, g, b]} for its default paint, notes, and strangeness {\"Add\": v} (added inside it) or {\"Pin\": v} (held at v inside it), fading out over a tile outside.", json!({"type": "object", "properties": {"name": {"type": "string"}, "label": {"type": "string"}, "boxes": {"type": "array", "items": {"type": "array", "items": cell, "minItems": 2, "maxItems": 2}, "minItems": 1}, "surface": {"type": "object"}, "notes": {"type": "string"}, "strangeness": {"type": "object"}}, "required": ["name", "boxes"], "additionalProperties": false})),
+        ("level_edit_area", "Change an area by index: set merges into it (name, label, boxes, surface, notes, strangeness: {\"Add\": v}, {\"Pin\": v} or null).", index_set),
         ("level_delete_area", "Delete an area by index; later areas move down one.", index),
         ("level_settings", "Change the level's settings: set merges into name, textures (grounded, mid, deep or strange), ambient, fog [near, far] in tiles, sun {dir, colour} or null, surface (default paint and tint), strangeness. editor_level part settings shows them.", json!({"type": "object", "properties": {"set": set}, "required": ["set"], "additionalProperties": false})),
         ("editor_undo", "Undo (or with redo: true, redo) steps of the editor's history, the person's edits and agents' alike.", json!({"type": "object", "properties": {"redo": {"type": "boolean", "default": false}, "steps": {"type": "integer", "minimum": 1, "maximum": 200, "default": 1}}, "additionalProperties": false})),

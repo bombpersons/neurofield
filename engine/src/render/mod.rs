@@ -278,7 +278,7 @@ pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usi
     let mut groups: HashMap<u8, Vec<&Tri>> = HashMap::new();
     for t in &scene.things.parts[i].tris {
         let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
-        groups.entry(tex::strange_variant(t.tex, scene.strangeness(centre)).0).or_default().push(t);
+        groups.entry(tex::strange_variant(t.tex, scene.morph(centre)).0).or_default().push(t);
     }
     let mut out = Vec::new();
     for (id, tris) in groups {
@@ -306,7 +306,7 @@ fn spawn_psx(
     let mut groups: HashMap<u8, Vec<&Tri>> = HashMap::new();
     for t in &scene.tris {
         let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
-        let (id, _) = tex::strange_variant(t.tex, scene.strangeness(centre));
+        let (id, _) = tex::strange_variant(t.tex, scene.morph(centre));
         groups.entry(id).or_default().push(t);
     }
     let (mut out, mut level) = (Vec::new(), Vec::new());
