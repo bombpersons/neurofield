@@ -12,6 +12,7 @@ use engine::world::scene::{Camera as PsxCamera, Scene, STEP};
 use engine::world::tex;
 pub use engine::render::{dir_to_world, to_view, to_world, TF};
 use psx_bevy::psx::{PsxLook, PsxScreen};
+use std::collections::HashSet;
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -94,8 +95,16 @@ pub struct Built {
     pub slice: i32,
     pub show_grid: bool,
     pub show_entities: bool,
+    /// Creatures in full colour once sculpted (see `crate::flesh`), else as PS1 meshes.
+    pub full_colour: bool,
+    /// `Creature::shape_hash` of each of the scene's creatures.
+    pub shapes: Vec<u64>,
+    /// When the level last changed (`Time::elapsed_secs_f64`).
+    pub changed_at: f64,
     /// The level's mesh entities.
     pub parts: Vec<Entity>,
+    /// Shapes of the creatures left out of `parts` because they are shown in full colour.
+    pub hidden: Vec<u64>,
 }
 
 /// The level texture atlas, for the Textures panel.
@@ -120,23 +129,58 @@ pub fn atlas_image(textures: &[tex::Texture]) -> Image {
     image
 }
 
-/// Rebuild the scene and its meshes when the level changes.
+/// Rebuild the scene when the level changes, and its meshes when it or the set of
+/// creatures shown in full colour does.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild(
     mut commands: Commands,
     doc: Res<crate::Document>,
+    time: Res<Time>,
     mut built: ResMut<Built>,
+    mut sculpts: ResMut<crate::flesh::Sculpts>,
     mut gfx: engine::render::Gfx,
 ) {
-    if built.version == doc.0.version && built.version != 0 {
+    let changed = built.version != doc.0.version || built.version == 0;
+    if changed {
+        built.version = doc.0.version.max(1);
+        built.scene = doc.0.level.to_scene();
+        built.shapes = built.scene.creatures.iter().map(|c| c.shape_hash()).collect();
+        built.changed_at = time.elapsed_secs_f64();
+    }
+    let ready: Vec<u64> = if built.full_colour {
+        built.shapes.iter().copied().filter(|&s| sculpts.is_done(s)).collect()
+    } else {
+        Vec::new()
+    };
+    if !changed && ready == built.hidden {
         return;
     }
-    built.version = doc.0.version.max(1);
-    built.scene = doc.0.level.to_scene();
-    for e in built.parts.drain(..) {
+    let b = &mut *built;
+    for e in b.parts.drain(..) {
         commands.entity(e).despawn();
     }
-    built.parts = engine::render::spawn(&mut commands, &mut gfx, &built.scene);
+    // The level without the PS1 meshes of creatures drawn in full colour.
+    let all = if ready.is_empty() {
+        None
+    } else {
+        let hide: HashSet<u64> = ready.iter().copied().collect();
+        let kept = b
+            .scene
+            .creature_spans
+            .iter()
+            .zip(&b.shapes)
+            .filter(|(_, s)| !hide.contains(s))
+            .flat_map(|(span, _)| b.scene.creature_tris[span.clone()].iter().copied())
+            .collect();
+        Some(std::mem::replace(&mut b.scene.creature_tris, kept))
+    };
+    b.parts = engine::render::spawn(&mut commands, &mut gfx, &b.scene);
+    if let Some(all) = all {
+        b.scene.creature_tris = all;
+    }
+    let shown = if b.full_colour { &b.shapes[..] } else { &[] };
+    sculpts.show(&mut commands, &mut gfx, &b.scene, shown);
+    b.hidden = ready;
 }
 
 /// Fly with the right mouse button held (WASD, Q/E down/up, Shift faster), orbit

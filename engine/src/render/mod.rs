@@ -243,6 +243,14 @@ pub struct Gfx<'w> {
     view: Res<'w, View>,
 }
 
+impl Gfx<'_> {
+    /// Creatures for the flesh pass apart from a scene's own (the editor sculpts
+    /// them in the background): `flesh` as one mesh, or nothing when it is empty.
+    pub fn spawn_flesh(&mut self, commands: &mut Commands, flesh: &crate::world::flesh::Flesh) -> Option<Entity> {
+        flesh::spawn_flesh(commands, &mut self.meshes, &mut self.images, &mut self.flesh, flesh, &self.view)
+    }
+}
+
 /// Spawn `scene` as meshes: the level and any PS1-pipeline creatures one mesh
 /// per texture, each texture chosen at the strangeness where the triangle is,
 /// and full-colour creatures for the flesh pass. Returns the entities, to

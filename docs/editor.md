@@ -341,6 +341,14 @@ The layout is saved between sessions.
 - **Neural:** the trained network. It's slow on the laptop, so it's for
   checking things, not for editing.
 
+In every mode creatures are drawn in full colour as the game draws them (the
+**Flesh** toggle, also in the View menu). Sculpting one takes 30–400 ms, so each
+is sculpted in the background once the level has been still for a moment, and
+kept by its shape: until then it is drawn through the PS1 pipeline like the
+level. Moving a light only bakes a kept sculpt's light again; moving, resizing
+or re-rolling a creature sculpts it afresh. The status bar counts sculpts in
+progress.
+
 ### Camera
 
 - **Fly:** hold the right mouse button and use WASD, Q/E for down and up, and

@@ -14,11 +14,13 @@ pub struct Settings {
     pub recent: Vec<PathBuf>,
     pub dock: DockState<Tab>,
     pub mode: ViewMode,
+    /// Creatures in full colour, as the game draws them.
+    pub full_colour: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), dock: crate::ui::default_dock(), mode: ViewMode::Plain }
+        Settings { recent: Vec::new(), dock: crate::ui::default_dock(), mode: ViewMode::Plain, full_colour: true }
     }
 }
 

@@ -8,6 +8,7 @@
 //! Wheel: dolly   F: frame the selection   PgUp/PgDn: move the height slice
 
 mod doc;
+mod flesh;
 mod settings;
 mod ui;
 mod view3d;
@@ -42,7 +43,8 @@ fn main() {
     }
     let config = Config::load();
     config.load_textures(&opts);
-    // Creatures through the PS1 pipeline: much quicker to build than sculpted flesh.
+    // Scenes get creatures through the PS1 pipeline, which is quick to build; the
+    // full-colour ones are sculpted in the background (see `flesh`).
     engine::world::flesh::set_psx(true);
     let textures = engine::world::tex::make_all();
 
@@ -85,8 +87,13 @@ fn main() {
         slice: 0,
         show_grid: true,
         show_entities: true,
+        full_colour: true,
+        shapes: Vec::new(),
+        changed_at: 0.0,
         parts: Vec::new(),
+        hidden: Vec::new(),
     })
+    .insert_resource(flesh::Sculpts::default())
     .add_systems(Startup, setup)
     .add_systems(Update, egui_on_display)
     .add_systems(EguiPrimaryContextPass, ui::draw)
@@ -95,6 +102,7 @@ fn main() {
         (
             auto_screenshot,
             close_requested,
+            flesh::sculpt,
             view3d::rebuild,
             view3d::camera_control,
             view3d::apply_camera,

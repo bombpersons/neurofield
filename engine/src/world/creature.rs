@@ -236,6 +236,7 @@ pub enum Kind {
     Mass = 13,
 }
 
+#[derive(Clone)]
 pub struct Creature {
     /// Floor point under the creature.
     pub base: [f32; 3],
@@ -263,6 +264,25 @@ impl Placed {
 }
 
 impl Creature {
+    /// The creature on its own for the full-colour pass, meshed as its scene would
+    /// mesh it. Slow (a sculpt), so worth doing off the main thread. Its lights are
+    /// neutral: bake them with `Scene::light_sh` at `Flesh::light_at`.
+    pub fn sculpt(&self) -> crate::world::flesh::Flesh {
+        let mut scene = Scene::empty(0, 0, Vec::new(), Vec::new(), crate::world::scene::Rock { height: 0, tex: 0 });
+        let placed = self.pose();
+        let neutral = vec![[[1.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]]; placed.len()];
+        scene.mesh_flesh(self, &placed, &neutral);
+        scene.flesh
+    }
+
+    /// A hash of everything that shapes the creature's meshes (not its texture slots).
+    pub fn shape_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?} {:?} {:?} {:?}", self.base, self.yaw, self.skins, self.parts).hash(&mut h);
+        h.finish()
+    }
+
     /// Every part placed in the world: forward kinematics down the tree.
     pub fn pose(&self) -> Vec<Placed> {
         let frame = rot_y(self.yaw);
@@ -782,7 +802,9 @@ impl Scene {
         c.fit(floor, floor - clearance, 0.95 * TF * scale.max(1.0), grounded);
         // The full-colour pass has skins of its own; PS1 ones are only for the PS1 pass.
         c.slots = if crate::world::flesh::enabled() { vec![0; c.skins.len()] } else { c.skins.iter().map(|s| self.skin_slot(s)).collect() };
+        let start = self.creature_tris.len();
         self.mesh_creature(&c);
+        self.creature_spans.push(start..self.creature_tris.len());
         self.creatures.push(c);
     }
 
@@ -809,6 +831,12 @@ impl Scene {
             }
             return;
         }
+        let lights: Vec<_> = placed.iter().map(|at| self.light_sh(at.centre)).collect();
+        self.mesh_flesh(c, &placed, &lights);
+    }
+
+    /// The creature for the full-colour pass, `lights` being each part's baked light.
+    fn mesh_flesh(&mut self, c: &Creature, placed: &[Placed], part_lights: &[[[f32; 3]; 4]]) {
         let base = self.flesh.skins.len();
         for s in &c.skins {
             self.flesh.skins.push(crate::world::flesh::Skin::make(s.motif, s.density, s.seed, s.tint));
@@ -816,13 +844,14 @@ impl Scene {
         let skins: Vec<u16> = c.parts.iter().map(|p| (base + p.skin) as u16).collect();
         let lights: Vec<u16> = placed
             .iter()
-            .map(|at| {
-                self.flesh.lights.push(self.light_sh(at.centre));
+            .zip(part_lights)
+            .map(|(at, &light)| {
+                self.flesh.lights.push(light);
                 self.flesh.light_at.push(at.centre);
                 (self.flesh.lights.len() - 1) as u16
             })
             .collect();
-        let (tris, thin) = crate::world::sculpt::mesh(c, &placed, &skins, &lights);
+        let (tris, thin) = crate::world::sculpt::mesh(c, placed, &skins, &lights);
         self.flesh.tris.extend(tris);
         for i in thin {
             let p = &c.parts[i];

@@ -231,6 +231,7 @@ pub fn draw(
     time: Res<Time>,
     mut window: Query<&mut Window>,
     atlas: Res<crate::view3d::Atlas>,
+    sculpts: Res<crate::flesh::Sculpts>,
     mut exit: MessageWriter<AppExit>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?.clone();
@@ -239,6 +240,7 @@ pub fn draw(
     if !s.styled {
         compact(&ctx);
         built.mode = s.settings.mode;
+        built.full_colour = s.settings.full_colour;
         s.styled = true;
     }
     if s.plan_for != Some(doc.0.path.clone()) {
@@ -259,7 +261,7 @@ pub fn draw(
         egui::UiBuilder::new().layer_id(egui::LayerId::background()).max_rect(ctx.viewport_rect()),
     );
     egui::Panel::top("menu").show(&mut root, |ui| menu_bar(ui, s, doc, &mut built, &mut input, &cam));
-    egui::Panel::bottom("status").show(&mut root, |ui| status_bar(ui, s, doc, &built, &cam));
+    egui::Panel::bottom("status").show(&mut root, |ui| status_bar(ui, s, doc, &built, &cam, sculpts.pending()));
 
     let mut dock = std::mem::replace(&mut s.settings.dock, DockState::new(Vec::new()));
     let mut style = egui_dock::Style::from_egui(root.style());
@@ -595,6 +597,8 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             s.settings.mode = built.mode;
             ui.checkbox(&mut built.show_grid, "Grid");
             ui.checkbox(&mut built.show_entities, "Entity markers");
+            ui.checkbox(&mut built.full_colour, "Full-colour creatures");
+            s.settings.full_colour = built.full_colour;
             ui.separator();
             if ui.add(egui::Button::new("Frame selection").shortcut_text("F")).clicked() {
                 input.frame_request = Some(frame_target(s, doc));
@@ -634,7 +638,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
     });
 }
 
-fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorCam) {
+fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorCam, sculpting: usize) {
     ui.horizontal(|ui| {
         let hint = match s.tool.coming() {
             None => format!("{}: {}", s.tool.name(), s.tool.hint()),
@@ -646,6 +650,10 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
             ui.separator();
             ui.label(format!("{} tris", built.scene.tris.len()));
             ui.separator();
+            if sculpting > 0 {
+                ui.label(format!("sculpting {sculpting} creature{}", if sculpting == 1 { "" } else { "s" }));
+                ui.separator();
+            }
             let w = to_world(cam.pos);
             ui.label(format!(
                 "camera ({}, {}, {})  slice {}",
@@ -729,6 +737,9 @@ impl Viewer<'_> {
             ui.separator();
             ui.toggle_value(&mut b.show_grid, "Grid");
             ui.toggle_value(&mut b.show_entities, "Markers");
+            ui.toggle_value(&mut b.full_colour, "Flesh")
+                .on_hover_text("Creatures in full colour, as the game draws them (sculpted in the background)");
+            self.s.settings.full_colour = b.full_colour;
         });
     }
 

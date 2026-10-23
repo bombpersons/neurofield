@@ -259,6 +259,8 @@ pub struct Scene {
     pub creatures: Vec<creature::Creature>,
     /// Dense creature meshes, drawn with the level but never given to the network.
     pub creature_tris: Vec<Tri>,
+    /// Each creature's share of `creature_tris`.
+    pub creature_spans: Vec<std::ops::Range<usize>>,
     /// Creature skins made for this scene, texture ids from `tex::SKIN_BASE`.
     pub skins: Vec<tex::Texture>,
     pub(crate) skin_kinds: Vec<(skin::Motif, f32)>,
@@ -579,6 +581,7 @@ impl Scene {
             tris: Vec::new(),
             creatures: Vec::new(),
             creature_tris: Vec::new(),
+            creature_spans: Vec::new(),
             skins: Vec::new(),
             skin_kinds: Vec::new(),
             flesh: Default::default(),
@@ -837,6 +840,7 @@ impl Scene {
             tris: Vec::new(),
             creatures: Vec::new(),
             creature_tris: Vec::new(),
+            creature_spans: Vec::new(),
             skins: Vec::new(),
             skin_kinds: Vec::new(),
             flesh: Default::default(),

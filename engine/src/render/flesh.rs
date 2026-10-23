@@ -25,6 +25,7 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::{Shader, ShaderImport, ShaderRef};
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dPlugin};
+use crate::world::flesh::Flesh;
 use crate::world::scene::Scene;
 use psx_bevy::psx::{PsxScreen, PsxView, DISPLAY_LAYER};
 
@@ -426,8 +427,8 @@ fn update_uniforms(view: Res<View>, mut materials: ResMut<Assets<FleshMaterial>>
     }
 }
 
-/// The scene's creatures as one mesh with its skins' material (none without
-/// creatures), and the level's parts again as depth for the flesh camera.
+/// The level's parts again as depth for the flesh camera, and the scene's
+/// creatures as one mesh with its skins' material (none without creatures).
 pub(crate) fn spawn(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -442,22 +443,29 @@ pub(crate) fn spawn(
         .iter()
         .map(|m| commands.spawn((Mesh3d(m.clone()), MeshMaterial3d(occluder.clone()), RenderLayers::layer(FLESH_LAYER))).id())
         .collect();
-    let fl = &scene.flesh;
-    if fl.tris.is_empty() || fl.skins.is_empty() {
-        return out;
-    }
-    let (colour, normal) = skin_arrays(&fl.skins);
-    let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal) };
-    out.push(
-        commands
-            .spawn((Mesh3d(meshes.add(mesh(scene))), MeshMaterial3d(materials.add(material)), RenderLayers::layer(FLESH_LAYER)))
-            .id(),
-    );
+    out.extend(spawn_flesh(commands, meshes, images, materials, &scene.flesh, view));
     out
 }
 
-fn mesh(scene: &Scene) -> Mesh {
-    let fl = &scene.flesh;
+/// `fl` as one mesh with its skins' material, or nothing when it is empty.
+pub(crate) fn spawn_flesh(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<FleshMaterial>,
+    fl: &Flesh,
+    view: &View,
+) -> Option<Entity> {
+    if fl.tris.is_empty() || fl.skins.is_empty() {
+        return None;
+    }
+    let (colour, normal) = skin_arrays(&fl.skins);
+    let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal) };
+    let mesh = meshes.add(mesh(fl));
+    Some(commands.spawn((Mesh3d(mesh), MeshMaterial3d(materials.add(material)), RenderLayers::layer(FLESH_LAYER))).id())
+}
+
+fn mesh(fl: &Flesh) -> Mesh {
     let n = fl.tris.len() * 3;
     let mut pos = Vec::with_capacity(n);
     let mut nw = Vec::with_capacity(n);
