@@ -7,9 +7,15 @@
 //! Right mouse: fly (WASD, Q/E down/up, Shift faster)   Middle mouse or Alt+left: orbit
 //! Wheel: dolly   F: frame the selection   PgUp/PgDn: move the height slice
 //! Tools (V R P C S): see `tools`; Esc or the right button cancels a drag.
+//!
+//! `--mcp` (with `--features dev-mcp`) serves the editor's developer MCP on stdio
+//! (see `mcp`), `--headless` runs it without an OS window (`--size 1280x800`), and
+//! `--software` picks a software renderer.
 
 mod doc;
 mod flesh;
+#[cfg(feature = "dev-mcp")]
+mod mcp;
 mod pick;
 mod settings;
 mod tools;
@@ -32,7 +38,18 @@ use view3d::{Atlas, Built, EditorCam, ViewInput, ViewMode};
 pub struct Document(pub doc::Doc);
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Flags without values, for the developer MCP.
+    let mut flag = |name: &str| {
+        let had = args.iter().any(|a| a == name);
+        args.retain(|a| a != name);
+        had
+    };
+    let (mcp, headless, software) = (flag("--mcp"), flag("--headless"), flag("--software"));
+    if mcp && !cfg!(feature = "dev-mcp") {
+        eprintln!("--mcp needs a developer build: cargo run -p editor --features dev-mcp -- --mcp");
+        std::process::exit(2);
+    }
     let mut opts = HashMap::new();
     let mut file = None;
     let mut it = args.iter();
@@ -51,7 +68,7 @@ fn main() {
     engine::world::flesh::set_psx(true);
     let textures = engine::world::tex::make_all();
 
-    let settings = settings::Settings::load();
+    let settings = if mcp { settings::Settings { persist: false, ..default() } } else { settings::Settings::load() };
     let file = file.or_else(|| settings.recent.first().cloned().filter(|p| p.is_file()));
     let doc = match &file {
         Some(f) => doc::Doc::open(f).unwrap_or_else(|e| {
@@ -64,17 +81,36 @@ fn main() {
     let mut cam = EditorCam { pos: Vec3::ZERO, yaw: -0.7, pitch: -0.75, focus: 9.0 };
     cam.frame(ui::level_centre(&doc.level), 9.0);
 
+    let size = opts.get("size").map_or((1400, 900), |s| {
+        let (w, h) = s.split_once('x').expect("--size WIDTHxHEIGHT");
+        (w.parse().expect("--size WIDTHxHEIGHT"), h.parse().expect("--size WIDTHxHEIGHT"))
+    });
+    let mut resolution = bevy::window::WindowResolution::new(size.0, size.1);
+    if headless {
+        // No OS window: the window is only a size, drawn into an image (see `mcp`).
+        resolution = resolution.with_scale_factor_override(1.0);
+    }
+
     let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window { title: "neurofield editor".into(), resolution: (1400, 900).into(), ..default() }),
-                // Closing asks first when there are unsaved changes.
-                close_when_requested: false,
-                ..default()
-            })
-            .set(ImagePlugin::default_nearest()),
-    )
+    let mut plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(Window { title: "neurofield editor".into(), resolution, ..default() }),
+            // Closing asks first when there are unsaved changes.
+            close_when_requested: false,
+            exit_condition: if headless { bevy::window::ExitCondition::DontExit } else { bevy::window::ExitCondition::OnAllClosed },
+            ..default()
+        })
+        .set(ImagePlugin::default_nearest())
+        .set(bevy::render::RenderPlugin {
+            render_creation: bevy::render::settings::WgpuSettings { force_fallback_adapter: software, ..default() }.into(),
+            synchronous_pipeline_compilation: headless,
+            ..default()
+        });
+    if headless {
+        plugins = plugins.disable::<bevy::winit::WinitPlugin>();
+        app.add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(std::time::Duration::from_secs_f64(1.0 / 60.0)));
+    }
+    app.add_plugins(plugins)
     .add_plugins(PsxPlugin { screen: PsxScreen::default() })
     .insert_resource(PsxAspect::Window)
     .add_plugins(engine::render::LevelGfxPlugin)
@@ -120,6 +156,10 @@ fn main() {
     );
     // egui draws on the window at full resolution, not into the PS1 screen.
     app.world_mut().resource_mut::<EguiGlobalSettings>().auto_create_primary_context = false;
+    #[cfg(feature = "dev-mcp")]
+    if mcp {
+        app.add_plugins(mcp::EditorMcpPlugin { headless });
+    }
     let atlas = view3d::atlas_image(&textures);
     let atlas = app.world_mut().resource_mut::<Assets<Image>>().add(atlas);
     app.insert_resource(Atlas(atlas));

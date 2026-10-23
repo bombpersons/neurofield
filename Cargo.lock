@@ -2353,14 +2353,19 @@ dependencies = [
 name = "editor"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bevy",
  "bevy_egui",
  "egui_dock",
  "engine",
+ "image",
  "psx-bevy",
  "rfd",
+ "rmcp",
  "ron",
  "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

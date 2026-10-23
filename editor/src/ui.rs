@@ -37,7 +37,7 @@ impl Tab {
     /// Every panel but the viewport, which never closes.
     const PANELS: [Tab; 7] = [Tab::Plan, Tab::Tools, Tab::Properties, Tab::Entities, Tab::Textures, Tab::Areas, Tab::Issues];
 
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Tab::Viewport => "Viewport",
             Tab::Plan => "Plan",
@@ -75,9 +75,9 @@ pub struct Ui {
     pub settings: Settings,
     pub config: Config,
     pub quit_requested: bool,
-    tools: Tools,
-    sel: Sel,
-    message: String,
+    pub(crate) tools: Tools,
+    pub(crate) sel: Sel,
+    pub(crate) message: String,
     /// The unsaved-changes question, and what to do once it is answered.
     confirm: Option<After>,
     /// An answered (or unasked) New / Open / Quit, to carry out this frame.
@@ -91,15 +91,21 @@ pub struct Ui {
     /// The file the plan view was last centred for.
     plan_for: Option<Option<PathBuf>>,
     fps: f32,
-    plan: PlanView,
+    pub(crate) plan: PlanView,
     /// The Entities outliner's filter.
     filter: String,
+    /// Where each shown panel was drawn this frame (for the developer MCP).
+    pub(crate) panels: Vec<(Tab, egui::Rect)>,
+    /// The whole window in egui points, which the 3D view fills.
+    pub(crate) screen: Option<egui::Rect>,
 }
 
-struct PlanView {
+pub(crate) struct PlanView {
     /// Tile coordinates at the panel's centre, and pixels per tile.
-    centre: egui::Vec2,
-    zoom: f32,
+    pub centre: egui::Vec2,
+    pub zoom: f32,
+    /// The map's own rectangle, when the Plan panel was drawn this frame.
+    pub rect: Option<egui::Rect>,
 }
 
 impl Ui {
@@ -120,9 +126,20 @@ impl Ui {
             styled: false,
             plan_for: None,
             fps: 60.0,
-            plan: PlanView { centre: egui::vec2(8.0, 8.0), zoom: 18.0 },
+            plan: PlanView { centre: egui::vec2(8.0, 8.0), zoom: 18.0, rect: None },
             filter: String::new(),
+            panels: Vec::new(),
+            screen: None,
         }
+    }
+
+    /// Forget the tool, selection and plan position, as for a newly opened level.
+    #[cfg_attr(not(feature = "dev-mcp"), allow(dead_code))]
+    pub(crate) fn reset(&mut self) {
+        self.tools = Tools::default();
+        self.sel = Sel::None;
+        self.message.clear();
+        self.plan_for = None;
     }
 
     fn levels_dir(&self) -> PathBuf {
@@ -184,6 +201,9 @@ pub fn draw(
     }
     s.fps = s.fps * 0.95 + 0.05 / time.delta_secs().max(1e-4);
     let doc = &mut doc.0;
+    s.panels.clear();
+    s.plan.rect = None;
+    s.screen = Some(ctx.viewport_rect());
 
     shortcuts(&ctx, s, doc, &mut built, &mut input, &cam);
     poll_dialogs(s, doc);
@@ -284,6 +304,11 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
     }
     if pressed(Key::Home) {
         input.frame_request = Some(level_centre(&doc.level));
+    }
+    // Tab is the editor's own key here, not egui's focus to the next widget (which
+    // would take the next Tab into the Entity tool's facing, say).
+    if pressed(Key::Tab) {
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
     }
     if pressed(Key::Tab) && s.tools.tool == Tool::Place {
         let quarter = std::f32::consts::FRAC_PI_2;
@@ -690,6 +715,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        self.s.panels.push((*tab, ui.max_rect()));
         match tab {
             Tab::Viewport => self.viewport(ui),
             Tab::Plan => self.plan(ui),
@@ -826,7 +852,7 @@ impl Viewer<'_> {
             .lights
             .iter()
             .enumerate()
-            .map(|(i, l)| format!("light {i} ({:.1}, {:.1}, {:.1})", l.pos[0] / TF, -l.pos[1] / TF, l.pos[2] / TF))
+            .map(|(i, l)| format!("light {i} ({:.1}, {:.1}, {:.1})", l.pos[0] / TF, up(l.pos[1]), l.pos[2] / TF))
             .filter(|label| shown(label))
             .collect();
         if !lights.is_empty() {
@@ -924,6 +950,7 @@ impl Viewer<'_> {
         });
         let (rect, r) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let pv = &mut self.s.plan;
+        pv.rect = Some(rect);
         let edits = matches!(self.s.tools.tool, Tool::Room | Tool::Carve | Tool::Slope | Tool::Place);
         if r.dragged_by(egui::PointerButton::Secondary)
             || r.dragged_by(egui::PointerButton::Middle)
@@ -1059,8 +1086,13 @@ fn kind_name(k: &EntityKind) -> &'static str {
     }
 }
 
+/// Height in tiles, up from world y (which points down), without a "-0".
+fn up(y: f32) -> f32 {
+    -y / TF + 0.0
+}
+
 fn entity_label(e: &LevelEntity) -> String {
-    let at = format!("({:.1}, {:.1}, {:.1})", e.pos[0] / TF, -e.pos[1] / TF, e.pos[2] / TF);
+    let at = format!("({:.1}, {:.1}, {:.1})", e.pos[0] / TF, up(e.pos[1]), e.pos[2] / TF);
     match &e.kind {
         EntityKind::Creature { kind, .. } => format!("#{} {kind:?} {at}", e.id),
         EntityKind::Key { name } => format!("#{} {name} {at}", e.id),
@@ -1127,13 +1159,19 @@ fn key_edit(ui: &mut egui::Ui, me: u32, key: &mut Option<u32>, keys: &[(u32, Str
         None => "no key".to_string(),
         Some(k) => keys.iter().find(|x| x.0 == *k).map_or(format!("#{k} (missing)"), |x| x.1.clone()),
     };
-    egui::ComboBox::from_id_salt("key").selected_text(shown).show_ui(ui, |ui| {
-        ui.selectable_value(key, None, "no key");
-        for (id, name) in keys {
-            ui.selectable_value(key, Some(*id), name);
-        }
+    // The pick button first, from the right, so a narrow panel shortens the combo
+    // rather than pushing the button out of sight.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        pick_button(ui, pending, Link::Key(me));
+        // The width is the text's; the arrow and padding come on top.
+        let width = (ui.available_width() - 30.0).max(40.0);
+        egui::ComboBox::from_id_salt("key").selected_text(shown).width(width).truncate().show_ui(ui, |ui| {
+            ui.selectable_value(key, None, "no key");
+            for (id, name) in keys {
+                ui.selectable_value(key, Some(*id), name);
+            }
+        });
     });
-    pick_button(ui, pending, Link::Key(me));
 }
 
 fn entity_properties(
@@ -1156,7 +1194,7 @@ fn entity_properties(
     egui::Grid::new("entity").num_columns(2).show(ui, |ui| {
         ui.label("position (tiles)");
         ui.horizontal(|ui| {
-            let mut t = [e.pos[0] / TF, -e.pos[1] / TF, e.pos[2] / TF];
+            let mut t = [e.pos[0] / TF, up(e.pos[1]), e.pos[2] / TF];
             let mut changed = false;
             for (v, n) in t.iter_mut().zip(["x", "up", "z"]) {
                 changed |= ui.add(egui::DragValue::new(v).speed(0.02).prefix(format!("{n} ")).max_decimals(2)).changed();
@@ -1280,7 +1318,7 @@ fn light_properties(ui: &mut egui::Ui, i: usize, light: &mut engine::world::leve
     egui::Grid::new("light").num_columns(2).show(ui, |ui| {
         ui.label("position (tiles)");
         ui.horizontal(|ui| {
-            let mut t = [light.pos[0] / TF, -light.pos[1] / TF, light.pos[2] / TF];
+            let mut t = [light.pos[0] / TF, up(light.pos[1]), light.pos[2] / TF];
             let mut changed = false;
             for (v, n) in t.iter_mut().zip(["x", "up", "z"]) {
                 changed |= ui.add(egui::DragValue::new(v).speed(0.02).prefix(format!("{n} ")).max_decimals(2)).changed();

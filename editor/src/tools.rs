@@ -105,6 +105,11 @@ pub enum Link {
     Target(u32),
 }
 
+/// Where an entity at `pos` (world) is clicked in the 3D view (view space).
+pub fn marker(pos: [f32; 3]) -> Vec3 {
+    crate::view3d::to_view(pos) + Vec3::Y * 0.15
+}
+
 /// The kinds the Entity tool places, with their names.
 pub fn entity_kinds() -> Vec<(&'static str, EntityKind)> {
     vec![
@@ -136,6 +141,24 @@ pub enum Op {
     Light { index: usize, origin: Vec3, normal: Vec3 },
     /// Moving entity `id` over the floors, once the pointer has left `from` (screen).
     Move { id: u32, from: egui::Pos2, moving: bool },
+}
+
+impl Op {
+    #[cfg_attr(not(feature = "dev-mcp"), allow(dead_code))]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::Idle => "idle",
+            Op::RoomRect { .. } => "room rectangle",
+            Op::RoomHeight { .. } => "room height",
+            Op::Push { .. } => "push",
+            Op::Carve { .. } => "carve",
+            Op::Slope { .. } => "slope",
+            Op::Boxes { .. } => "box select",
+            Op::Paint { .. } => "paint",
+            Op::Light { .. } => "light",
+            Op::Move { .. } => "move",
+        }
+    }
 }
 
 pub struct Tools {
@@ -436,9 +459,8 @@ impl Tools {
         let p = ctx.pointer_latest_pos().unwrap_or_default();
         // The entity or light marker near the pointer.
         let near = {
-            let to_view = crate::view3d::to_view;
-            let entities = doc.level.entities.iter().map(|e| (Sel::Entity(e.id), to_view(e.pos) + Vec3::Y * 0.15));
-            let lights = doc.level.lights.iter().enumerate().map(|(i, l)| (Sel::Light(i), to_view(l.pos)));
+            let entities = doc.level.entities.iter().map(|e| (Sel::Entity(e.id), marker(e.pos)));
+            let lights = doc.level.lights.iter().enumerate().map(|(i, l)| (Sel::Light(i), crate::view3d::to_view(l.pos)));
             entities
                 .chain(lights)
                 .filter_map(|(s, v)| Some((s, (pick::project(cam, screen, v)? - p).length())))

@@ -153,6 +153,10 @@ levels look like. See [docs/editor.md](docs/editor.md) for the design.
 cargo run -p editor -- levels/demo.ron
 ```
 
+A developer build (`--features dev-mcp`) has its own MCP for driving the editor's
+mouse and keyboard from scripts, with or without a window: `--mcp --headless`
+(see docs/editor.md, Developer MCP).
+
 The psx crates come from a git submodule pinned to a known commit, so clone with:
 
 ```bash

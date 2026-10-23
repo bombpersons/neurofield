@@ -80,6 +80,11 @@ impl Doc {
         !self.redo.is_empty()
     }
 
+    /// How many steps undo and redo can take.
+    pub fn history(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
+    }
+
     pub fn undo(&mut self) {
         // An edit still under way is undone first.
         self.settle(true);

@@ -16,11 +16,15 @@ pub struct Settings {
     pub mode: ViewMode,
     /// Creatures in full colour, as the game draws them.
     pub full_colour: bool,
+    /// Whether `save` writes them; not for runs driven by the developer MCP, which
+    /// start from the defaults and leave the user's settings alone.
+    #[serde(skip)]
+    pub persist: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), dock: crate::ui::default_dock(), mode: ViewMode::Plain, full_colour: true }
+        Settings { recent: Vec::new(), dock: crate::ui::default_dock(), mode: ViewMode::Plain, full_colour: true, persist: true }
     }
 }
 
@@ -40,7 +44,7 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        let Some(p) = path() else { return };
+        let Some(p) = path().filter(|_| self.persist) else { return };
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -56,5 +60,17 @@ impl Settings {
         self.recent.insert(0, p);
         self.recent.truncate(10);
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loaded_settings_are_saved_again() {
+        let text = ron::ser::to_string(&Settings { persist: false, ..Settings::default() }).unwrap();
+        let back: Settings = ron::from_str(&text).unwrap();
+        assert!(back.persist);
     }
 }
