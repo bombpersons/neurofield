@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 
 const MAX_UNDO: usize = 200;
 
+/// Versions are counted across every document, so a newly opened one never
+/// looks like the one the view was built from. The view starts at 0, meaning
+/// nothing built yet.
+fn next_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Doc {
     pub level: Level,
     pub path: Option<PathBuf>,
@@ -18,7 +26,7 @@ pub struct Doc {
     settled: Level,
     undo: Vec<Level>,
     redo: Vec<Level>,
-    /// Bumped on every change, so views know to rebuild.
+    /// New on every change, so views know to rebuild.
     pub version: u64,
     seen: Level,
 }
@@ -33,7 +41,7 @@ impl Doc {
             path,
             undo: Vec::new(),
             redo: Vec::new(),
-            version: 0,
+            version: next_version(),
         }
     }
 
@@ -61,7 +69,7 @@ impl Doc {
     pub fn settle(&mut self, idle: bool) {
         if self.level != self.seen {
             self.seen = self.level.clone();
-            self.version += 1;
+            self.version = next_version();
         }
         if idle && self.level != self.settled {
             self.undo.push(std::mem::replace(&mut self.settled, self.level.clone()));

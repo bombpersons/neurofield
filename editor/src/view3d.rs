@@ -219,7 +219,7 @@ pub fn rebuild(
     let tinted = built.overlay_on();
     let changed = built.version != doc.0.version || built.version == 0 || built.cut_at != cut_at || built.tinted != tinted;
     if changed {
-        built.version = doc.0.version.max(1);
+        built.version = doc.0.version;
         built.cut_at = cut_at;
         built.tinted = tinted;
         match cut_at {
