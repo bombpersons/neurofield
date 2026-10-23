@@ -8,7 +8,7 @@ use crate::pick::{self, Hit, Ray, LAYER};
 use crate::view3d::{Built, EditorCam, ViewInput};
 use bevy::prelude::*;
 use bevy_egui::egui;
-use engine::world::level::{Area, CeilingKind, Dir, Face, Level, SlopeDef, SlopeKind};
+use engine::world::level::{Area, CeilingKind, Dir, Face, Level, PointLight, SlopeDef, SlopeKind, Surface};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,18 +64,17 @@ impl Tool {
             Tool::PushPull => "drag a face (or the selected faces) in or out",
             Tool::Carve => "click or drag to carve a cell, shift to fill one",
             Tool::Slope => "click near a floor's edge to climb away from it, drag for a flight; wheel: rise, Tab: ramp or stairs",
-            Tool::Paint => "click faces to paint, shift-click to fill, alt-click to pick",
+            Tool::Paint => "click or drag to paint faces (the selection, if you click in it), shift-click fills the plane, ctrl-click picks up a face's texture",
             Tool::Strange => "brush strangeness on, shift to take it off, ctrl to smooth",
             Tool::Place => "click to place the chosen entity",
-            Tool::Light => "click a face to put a light on it",
+            Tool::Light => "click a face to put a light by it, drag to lift it off",
         }
     }
 
     /// The milestone that brings it (docs/editor.md), for tools not built yet.
     pub fn coming(self) -> Option<u32> {
         match self {
-            Tool::Select | Tool::Room | Tool::PushPull | Tool::Carve | Tool::Slope => None,
-            Tool::Paint | Tool::Light => Some(4),
+            Tool::Select | Tool::Room | Tool::PushPull | Tool::Carve | Tool::Slope | Tool::Paint | Tool::Light => None,
             Tool::Place => Some(5),
             Tool::Strange => Some(6),
         }
@@ -83,6 +82,17 @@ impl Tool {
 }
 
 pub type FaceRef = ([i32; 3], Face);
+
+/// The thing the Properties window shows (faces are selected separately).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sel {
+    #[default]
+    None,
+    Entity(u32),
+    /// Lights and areas by their index in the level.
+    Light(usize),
+    Area(usize),
+}
 
 /// A drag or click under way.
 pub enum Op {
@@ -96,6 +106,10 @@ pub enum Op {
     Slope { cell: [i32; 3], dir: Dir, n: i32, before: Level },
     /// Select: a box of faces on the plane of `face` at `cell`.
     Boxes { cell: [i32; 3], face: Face, end: [i32; 3] },
+    /// Paint: a stroke along the plane of `face` at `cell`.
+    Paint { cell: [i32; 3], face: Face },
+    /// Light: lifting light `index` off the face at `origin` along `normal`.
+    Light { index: usize, origin: Vec3, normal: Vec3 },
 }
 
 pub struct Tools {
@@ -109,6 +123,8 @@ pub struct Tools {
     pub rise: i32,
     pub kind: SlopeKind,
     pub ceiling: CeilingKind,
+    /// The texture slot Paint puts on.
+    pub slot: u8,
     /// Something finished on a press: wait for the button to come up.
     swallow: bool,
     /// The plan's Room rectangle, from its first corner.
@@ -126,6 +142,7 @@ impl Default for Tools {
             rise: 4,
             kind: SlopeKind::Stairs,
             ceiling: CeilingKind::Follow,
+            slot: 0,
             swallow: false,
             plan_start: None,
         }
@@ -147,6 +164,8 @@ impl Tools {
         match std::mem::replace(&mut self.op, Op::Idle) {
             Op::Idle => return false,
             Op::RoomHeight { before, .. } | Op::Push { before, .. } | Op::Slope { before, .. } => doc.level = before,
+            // A light being placed goes again.
+            Op::Light { index, .. } if index < doc.level.lights.len() => _ = doc.level.lights.remove(index),
             _ => {}
         }
         true
@@ -154,7 +173,15 @@ impl Tools {
 
     /// Forget everything about the level before (a new one was opened).
     pub fn reset(&mut self) {
-        *self = Tools { tool: self.tool, height: self.height, rise: self.rise, kind: self.kind, ceiling: self.ceiling, ..Tools::default() };
+        *self = Tools {
+            tool: self.tool,
+            height: self.height,
+            rise: self.rise,
+            kind: self.kind,
+            ceiling: self.ceiling,
+            slot: self.slot,
+            ..Tools::default()
+        };
     }
 
     pub fn set_tool(&mut self, t: Tool, doc: &mut Doc) {
@@ -175,7 +202,7 @@ impl Tools {
         doc: &mut Doc,
         built: &mut Built,
         cam: &EditorCam,
-        selected: &mut Option<u32>,
+        sel: &mut Sel,
         message: &mut String,
         input: &mut ViewInput,
     ) {
@@ -215,7 +242,7 @@ impl Tools {
         }
         let op = std::mem::replace(&mut self.op, Op::Idle);
         self.op = match (op, ray) {
-            (Op::Idle, _) if start => self.begin(ray, mods, doc, built, cam, screen, ctx, selected, message),
+            (Op::Idle, _) if start => self.begin(ray, mods, doc, built, cam, screen, ctx, sel, message),
             (Op::RoomRect { base, start, end }, Some(r)) => {
                 let end = floor_cell(r, base).unwrap_or(end);
                 if up {
@@ -317,9 +344,27 @@ impl Tools {
                     Op::Boxes { cell, face, end }
                 }
             }
+            (Op::Paint { cell, face }, Some(r)) => {
+                if let Some(c) = pick::cell_on_plane(r, cell, face) {
+                    if has_face(&doc.level, c, face) && face_tex(&doc.level, c, face) != self.slot {
+                        let faces = unit(&doc.level, c, face);
+                        paint(&mut doc.level, &faces, self.slot);
+                    }
+                }
+                if up { Op::Idle } else { Op::Paint { cell, face } }
+            }
+            (Op::Light { index, origin, normal }, Some(r)) => {
+                if let (Some(s), Some(l)) = (pick::along_line(r, origin, normal), doc.level.lights.get_mut(index)) {
+                    let pos = crate::view3d::to_world(origin + normal * s.clamp(LIFT, 12.0));
+                    if pos != l.pos {
+                        l.pos = pos;
+                    }
+                }
+                if up { Op::Idle } else { Op::Light { index, origin, normal } }
+            }
             (op, _) => op,
         };
-        self.outlines(doc, built, ray);
+        self.outlines(doc, built, ray, *sel);
     }
 
     /// A press on the view starting the current tool's operation.
@@ -333,27 +378,28 @@ impl Tools {
         cam: &EditorCam,
         screen: egui::Rect,
         ctx: &egui::Context,
-        selected: &mut Option<u32>,
+        sel: &mut Sel,
         message: &mut String,
     ) -> Op {
         let Some(r) = ray else { return Op::Idle };
         match self.tool {
             Tool::Select => {
-                // An entity marker near the pointer first.
+                // An entity or light marker near the pointer first.
                 let p = ctx.pointer_latest_pos().unwrap_or_default();
-                let near = doc
-                    .level
-                    .entities
-                    .iter()
-                    .filter_map(|e| Some((e.id, (pick::project(cam, screen, crate::view3d::to_view(e.pos) + Vec3::Y * 0.15)? - p).length())))
+                let to_view = crate::view3d::to_view;
+                let entities = doc.level.entities.iter().map(|e| (Sel::Entity(e.id), to_view(e.pos) + Vec3::Y * 0.15));
+                let lights = doc.level.lights.iter().enumerate().map(|(i, l)| (Sel::Light(i), to_view(l.pos)));
+                let near = entities
+                    .chain(lights)
+                    .filter_map(|(s, v)| Some((s, (pick::project(cam, screen, v)? - p).length())))
                     .filter(|&(_, d)| d < 10.0)
                     .min_by(|a, b| a.1.total_cmp(&b.1));
-                if let Some((id, _)) = near {
-                    *selected = Some(id);
+                if let Some((s, _)) = near {
+                    *sel = s;
                     self.faces.clear();
                     return Op::Idle;
                 }
-                *selected = None;
+                *sel = Sel::None;
                 if !mods.shift {
                     self.faces.clear();
                 }
@@ -409,6 +455,42 @@ impl Tools {
                     }
                 }
             }
+            Tool::Paint => {
+                let Some(h) = self.hover else { return Op::Idle };
+                if mods.ctrl {
+                    self.slot = face_tex(&doc.level, h.cell, h.face);
+                    *message = format!("picked texture {}", self.slot);
+                    self.swallow = true;
+                    return Op::Idle;
+                }
+                if mods.shift {
+                    let n = fill(&mut doc.level, h.cell, h.face, self.slot);
+                    *message = format!("filled {n} face{}", if n == 1 { "" } else { "s" });
+                    self.swallow = true;
+                    return Op::Idle;
+                }
+                let faces = if self.faces.contains(&(h.cell, h.face)) {
+                    self.faces.iter().copied().collect()
+                } else {
+                    unit(&doc.level, h.cell, h.face)
+                };
+                paint(&mut doc.level, &faces, self.slot);
+                Op::Paint { cell: h.cell, face: h.face }
+            }
+            Tool::Light => {
+                let Some(h) = self.hover else { return Op::Idle };
+                let (_, normal) = pick::plane(h.cell, h.face);
+                let tf = crate::view3d::TF;
+                doc.level.lights.push(PointLight {
+                    pos: crate::view3d::to_world(h.point + normal * LIFT),
+                    colour: [1.0, 0.8, 0.6],
+                    radius: 3.0 * tf,
+                    strange: None,
+                });
+                let index = doc.level.lights.len() - 1;
+                *sel = Sel::Light(index);
+                Op::Light { index, origin: h.point, normal }
+            }
             _ => Op::Idle,
         }
     }
@@ -418,11 +500,49 @@ impl Tools {
     }
 
     /// Outlines for the selection, what the pointer is over and what is being drawn.
-    fn outlines(&self, doc: &Doc, built: &mut Built, ray: Option<Ray>) {
+    fn outlines(&self, doc: &Doc, built: &mut Built, ray: Option<Ray>, sel: Sel) {
         let l = &doc.level;
         let lines = &mut built.lines;
         for &(c, f) in &self.faces {
             outline(lines, pick::quad(l, c, f), SELECTED);
+        }
+        match sel {
+            Sel::Area(i) => {
+                for &(lo, hi) in l.areas.get(i).map_or(&[][..], |a| &a.boxes) {
+                    cuboid(lines, lo, hi, SELECTED);
+                }
+            }
+            Sel::Light(i) => {
+                if let Some(light) = l.lights.get(i) {
+                    let p = crate::view3d::to_view(light.pos);
+                    let lo = p - Vec3::splat(0.2);
+                    let hi = p + Vec3::splat(0.2);
+                    let c = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+                    for (a, b) in [
+                        (c(lo.x, lo.y, lo.z), c(hi.x, lo.y, lo.z)),
+                        (c(lo.x, hi.y, lo.z), c(hi.x, hi.y, lo.z)),
+                        (c(lo.x, lo.y, hi.z), c(hi.x, lo.y, hi.z)),
+                        (c(lo.x, hi.y, hi.z), c(hi.x, hi.y, hi.z)),
+                        (c(lo.x, lo.y, lo.z), c(lo.x, hi.y, lo.z)),
+                        (c(hi.x, lo.y, lo.z), c(hi.x, hi.y, lo.z)),
+                        (c(lo.x, lo.y, hi.z), c(lo.x, hi.y, hi.z)),
+                        (c(hi.x, lo.y, hi.z), c(hi.x, hi.y, hi.z)),
+                        (c(lo.x, lo.y, lo.z), c(lo.x, lo.y, hi.z)),
+                        (c(hi.x, lo.y, lo.z), c(hi.x, lo.y, hi.z)),
+                        (c(lo.x, hi.y, lo.z), c(lo.x, hi.y, hi.z)),
+                        (c(hi.x, hi.y, lo.z), c(hi.x, hi.y, hi.z)),
+                    ] {
+                        lines.push((a, b, SELECTED));
+                    }
+                    // A drop line to the floor below, to see where it hangs.
+                    let floor = built.scene.floor_y(light.pos[0], light.pos[1], light.pos[2]);
+                    if let Some(f) = floor {
+                        let below = crate::view3d::to_view([light.pos[0], f, light.pos[2]]);
+                        lines.push((p, below, SELECTED));
+                    }
+                }
+            }
+            _ => {}
         }
         match &self.op {
             Op::RoomRect { base, start, end } => {
@@ -455,12 +575,20 @@ impl Tools {
                     return;
                 };
                 match self.tool {
-                    Tool::Select | Tool::PushPull => {
+                    Tool::Select | Tool::PushPull | Tool::Paint => {
                         for (c, f) in unit(l, h.cell, h.face) {
                             outline(lines, pick::quad(l, c, f), HOVER);
                         }
                     }
                     Tool::Carve => outline(lines, pick::quad(l, h.cell, h.face), HOVER),
+                    Tool::Light => {
+                        let (_, n) = pick::plane(h.cell, h.face);
+                        let p = h.point + n * LIFT;
+                        lines.push((h.point, p, HOVER));
+                        for a in [Vec3::X, Vec3::Y, Vec3::Z] {
+                            lines.push((p - a * 0.1, p + a * 0.1, HOVER));
+                        }
+                    }
                     Tool::Room => {
                         let base = match h.face {
                             Face::Floor => h.cell[1],
@@ -580,6 +708,14 @@ impl Tools {
                     ui.selectable_value(&mut self.ceiling, CeilingKind::Flat, "Flat");
                 });
             }
+            Tool::Paint => {
+                ui.horizontal(|ui| {
+                    ui.label("texture");
+                    ui.add(egui::DragValue::new(&mut self.slot).range(0..=7));
+                })
+                .response
+                .on_hover_text("Pick one in the Textures window, or ctrl-click a face");
+            }
             Tool::Select | Tool::PushPull if !self.faces.is_empty() => {
                 ui.horizontal(|ui| {
                     ui.label(format!("{} face{} selected", self.faces.len(), if self.faces.len() == 1 { "" } else { "s" }));
@@ -646,6 +782,86 @@ fn cuboid(lines: &mut Vec<(Vec3, Vec3, Color)>, lo: [i32; 3], hi: [i32; 3], c: C
             lines.push((bottom[i], top[i], c));
         }
     }
+}
+
+/// How far off a face a new light starts, in tiles.
+const LIFT: f32 = 0.25;
+
+/// The surface paint a cell takes when its faces aren't painted: its area's, or the level's.
+pub fn surface_at(l: &Level, c: [i32; 3]) -> &Surface {
+    // As `Level::to_scene` does: the first area holding the floor of the cell's run.
+    let from = l.run_at(c[0], c[1], c[2]).map_or(c[1], |r| r.from);
+    l.areas.iter().find(|a| a.contains([c[0], from, c[2]])).and_then(|a| a.surface.as_ref()).unwrap_or(&l.surface)
+}
+
+/// The texture slot a face is drawn with.
+pub fn face_tex(l: &Level, c: [i32; 3], face: Face) -> u8 {
+    l.paint.get(&((c[0], c[1], c[2]), face)).copied().unwrap_or_else(|| {
+        let s = surface_at(l, c);
+        match face {
+            Face::Floor => s.floor,
+            Face::Ceiling => s.ceiling,
+            Face::Wall(_) => s.wall,
+        }
+    })
+}
+
+/// Paint faces with `slot`, leaving those where it is the default unpainted.
+pub fn paint(l: &mut Level, faces: &[FaceRef], slot: u8) {
+    for &(c, face) in faces {
+        let key = ((c[0], c[1], c[2]), face);
+        l.paint.remove(&key);
+        if face_tex(l, c, face) != slot {
+            l.paint.insert(key, slot);
+        }
+    }
+}
+
+/// Paint the faces joined to this one on its plane that share its texture.
+/// Returns how many.
+pub fn fill(l: &mut Level, c: [i32; 3], face: Face, slot: u8) -> usize {
+    let was = face_tex(l, c, face);
+    let steps: [[i32; 3]; 4] = match face {
+        Face::Floor | Face::Ceiling => [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]],
+        Face::Wall(Dir::E | Dir::W) => [[0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+        Face::Wall(Dir::N | Dir::S) => [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]],
+    };
+    let mut seen = std::collections::HashSet::from([c]);
+    let mut todo = vec![c];
+    let mut found = Vec::new();
+    // Big enough for any floor or wall of a sane room.
+    while let Some(at) = todo.pop() {
+        if found.len() >= 4096 {
+            break;
+        }
+        if !has_face(l, at, face) || face_tex(l, at, face) != was {
+            continue;
+        }
+        found.push((at, face));
+        for s in steps {
+            let next = [at[0] + s[0], at[1] + s[1], at[2] + s[2]];
+            if seen.insert(next) {
+                todo.push(next);
+            }
+        }
+    }
+    paint(l, &found, slot);
+    found.len()
+}
+
+/// The box (min, max exclusive) around the cells of `faces`, each from its run's
+/// floor to its ceiling.
+pub fn cells_box(l: &Level, faces: &BTreeSet<FaceRef>) -> Option<([i32; 3], [i32; 3])> {
+    let mut b: Option<([i32; 3], [i32; 3])> = None;
+    for &(c, _) in faces {
+        let (from, to) = l.run_at(c[0], c[1], c[2]).map_or((c[1], c[1] + 1), |r| (r.from, r.to));
+        let (lo, hi) = ([c[0], from, c[2]], [c[0] + 1, to, c[2] + 1]);
+        b = Some(match b {
+            None => (lo, hi),
+            Some((a, z)) => ([0, 1, 2].map(|i| a[i].min(lo[i])), [0, 1, 2].map(|i| z[i].max(hi[i]))),
+        });
+    }
+    b
 }
 
 /// The rock cell on the other side of a face.
@@ -874,6 +1090,28 @@ mod tests {
         let mut low = Level::new("t");
         low.open(0, 0, 0, 3);
         assert!(stairs(&mut low, [0, 0, 0], Dir::E, 1, s).is_err());
+    }
+
+    #[test]
+    fn paint_fills_planes_and_stays_sparse() {
+        let mut l = room();
+        let floor = Surface::default().floor;
+        l.close(2, 2, 0, 3);
+        // The floor at layer 0 is 15 tiles; the raised one is on its own plane.
+        assert_eq!(fill(&mut l, [0, 0, 0], Face::Floor, 6), 15);
+        assert_eq!(face_tex(&l, [3, 0, 3], Face::Floor), 6);
+        assert_eq!(face_tex(&l, [2, 3, 2], Face::Floor), floor);
+        // Painting back to the default leaves nothing stored.
+        let all: Vec<_> = l.paint.keys().map(|&((x, y, z), f)| ([x, y, z], f)).collect();
+        paint(&mut l, &all, floor);
+        assert!(l.paint.is_empty());
+        // An area's surface is the default inside it.
+        let s = Surface { floor: 5, ..Surface::default() };
+        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [2, 12, 2])], surface: Some(s), notes: String::new() });
+        assert_eq!(face_tex(&l, [1, 0, 1], Face::Floor), 5);
+        assert_eq!(face_tex(&l, [3, 0, 1], Face::Floor), floor);
+        // A wall fill covers the wall's plane, all layers.
+        assert_eq!(fill(&mut l, [0, 0, 0], Face::Wall(Dir::W), 2), 4 * 12);
     }
 
     #[test]

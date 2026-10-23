@@ -4,7 +4,7 @@
 
 use crate::doc::Doc;
 use crate::settings::Settings;
-use crate::tools::{Tool, Tools};
+use crate::tools::{Sel, Tool, Tools};
 use crate::view3d::{entity_colour, to_view, to_world, Built, EditorCam, ViewInput, ViewMode};
 use crate::Document;
 use bevy::prelude::*;
@@ -76,7 +76,7 @@ pub struct Ui {
     pub config: Config,
     pub quit_requested: bool,
     tools: Tools,
-    selected: Option<u32>,
+    sel: Sel,
     message: String,
     /// The unsaved-changes question, and what to do once it is answered.
     confirm: Option<After>,
@@ -107,7 +107,7 @@ impl Ui {
             config,
             quit_requested: false,
             tools: Tools::default(),
-            selected: None,
+            sel: Sel::None,
             message: String::new(),
             confirm: None,
             confirm_done: None,
@@ -273,7 +273,7 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
         delete_selected(s, doc);
     }
     if pressed(Key::Escape) && !s.tools.cancel(doc) {
-        s.selected = None;
+        s.sel = Sel::None;
         s.tools.faces.clear();
     }
     if pressed(Key::F) {
@@ -304,15 +304,26 @@ pub fn level_centre(l: &Level) -> Vec3 {
 }
 
 fn frame_target(s: &Ui, doc: &Doc) -> Vec3 {
-    s.selected
-        .and_then(|id| doc.level.entities.iter().find(|e| e.id == id))
-        .map(|e| to_view(e.pos) + Vec3::Y * 0.5)
-        .unwrap_or_else(|| level_centre(&doc.level))
+    let l = &doc.level;
+    let at = match s.sel {
+        Sel::Entity(id) => l.entities.iter().find(|e| e.id == id).map(|e| to_view(e.pos) + Vec3::Y * 0.5),
+        Sel::Light(i) => l.lights.get(i).map(|light| to_view(light.pos)),
+        Sel::Area(i) => l.areas.get(i).and_then(|a| a.boxes.first()).map(|(lo, hi)| {
+            let mid = |i: usize| (lo[i] + hi[i]) as f32 / 2.0;
+            Vec3::new(mid(0), lo[1] as f32 * STEP as f32 / TF + 0.5, -mid(2))
+        }),
+        Sel::None => None,
+    };
+    at.unwrap_or_else(|| level_centre(l))
 }
 
 fn delete_selected(s: &mut Ui, doc: &mut Doc) {
-    if let Some(id) = s.selected.take() {
-        doc.level.entities.retain(|e| e.id != id);
+    let l = &mut doc.level;
+    match std::mem::take(&mut s.sel) {
+        Sel::Entity(id) => l.entities.retain(|e| e.id != id),
+        Sel::Light(i) if i < l.lights.len() => _ = l.lights.remove(i),
+        Sel::Area(i) if i < l.areas.len() => _ = l.areas.remove(i),
+        _ => {}
     }
 }
 
@@ -398,14 +409,14 @@ fn poll_dialogs(s: &mut Ui, doc: &mut Doc) {
     match s.confirm_done.take() {
         Some(After::New) => {
             *doc = Doc::new(Level::new("untitled"), None);
-            s.selected = None;
+            s.sel = Sel::None;
             s.tools.reset();
             s.message = "new level".into();
         }
         Some(After::Open(Some(p))) => match Doc::open(&p) {
             Ok(d) => {
                 *doc = d;
-                s.selected = None;
+                s.sel = Sel::None;
                 s.tools.reset();
                 s.settings.opened(&p);
                 s.message = format!("opened {}", p.display());
@@ -510,11 +521,11 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
                 doc.redo();
             }
             ui.separator();
-            if ui.add_enabled(s.selected.is_some(), egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+            if ui.add_enabled(s.sel != Sel::None, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
                 delete_selected(s, doc);
             }
             if ui.add(egui::Button::new("Select none").shortcut_text("Esc")).clicked() {
-                s.selected = None;
+                s.sel = Sel::None;
                 s.tools.faces.clear();
             }
         });
@@ -607,7 +618,8 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
                     engine::world::level::Face::Wall(d) => format!("{d:?} wall"),
                     f => format!("{f:?}").to_lowercase(),
                 };
-                ui.label(format!("cell ({x}, {l}, {z}) {face}"));
+                let tex = crate::tools::face_tex(&doc.level, h.cell, h.face);
+                ui.label(format!("cell ({x}, {l}, {z}) {face}, texture {tex}"));
                 ui.separator();
             }
             if sculpting > 0 {
@@ -710,7 +722,7 @@ impl Viewer<'_> {
                 !toggles.response.rect.contains(p) && !ctx.layer_id_at(p).is_some_and(|l| l.order != egui::Order::Background)
             });
         let s = &mut *self.s;
-        s.tools.viewport(&ctx, ctx.viewport_rect(), over, self.doc, self.built, self.cam, &mut s.selected, &mut s.message, self.input);
+        s.tools.viewport(&ctx, ctx.viewport_rect(), over, self.doc, self.built, self.cam, &mut s.sel, &mut s.message, self.input);
     }
 
     fn tools(&mut self, ui: &mut egui::Ui) {
@@ -730,16 +742,23 @@ impl Viewer<'_> {
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
-        let id = self.s.selected;
-        if let Some(e) = id.and_then(|id| self.doc.level.entities.iter_mut().find(|e| e.id == id)) {
-            let mut delete = false;
-            entity_properties(ui, e, &mut delete);
-            if delete {
-                delete_selected(self.s, self.doc);
+        let l = &mut self.doc.level;
+        let mut delete = false;
+        match self.s.sel {
+            Sel::Entity(id) if l.entities.iter().any(|e| e.id == id) => {
+                let e = l.entities.iter_mut().find(|e| e.id == id).unwrap();
+                entity_properties(ui, e, &mut delete);
             }
-            return;
+            Sel::Light(i) if i < l.lights.len() => light_properties(ui, i, &mut l.lights[i], &mut delete),
+            Sel::Area(i) if i < l.areas.len() => {
+                let default = l.surface;
+                area_properties(ui, &mut l.areas[i], default, &mut delete);
+            }
+            _ => level_properties(ui, l),
         }
-        level_properties(ui, &mut self.doc.level);
+        if delete {
+            delete_selected(self.s, self.doc);
+        }
     }
 
     fn entities(&mut self, ui: &mut egui::Ui) {
@@ -750,7 +769,7 @@ impl Viewer<'_> {
                         let at = self.focus_on_floor();
                         let id = self.doc.level.next_id();
                         self.doc.level.entities.push(LevelEntity { id, kind, pos: at, yaw: 0.0 });
-                        self.s.selected = Some(id);
+                        self.s.sel = Sel::Entity(id);
                         ui.close();
                     }
                 }
@@ -774,12 +793,33 @@ impl Viewer<'_> {
             }
             egui::CollapsingHeader::new(format!("{k} ({})", items.len())).default_open(true).show(ui, |ui| {
                 for (id, label, colour) in items {
-                    let r = ui.selectable_label(self.s.selected == Some(id), RichText::new(label).color(colour));
+                    let r = ui.selectable_label(self.s.sel == Sel::Entity(id), RichText::new(label).color(colour));
                     if r.clicked() {
-                        self.s.selected = Some(id);
+                        self.s.sel = Sel::Entity(id);
                     }
                     if r.double_clicked() {
-                        self.s.selected = Some(id);
+                        self.s.sel = Sel::Entity(id);
+                        self.input.frame_request = Some(frame_target(self.s, self.doc));
+                    }
+                }
+            });
+        }
+        let lights: Vec<String> = self
+            .doc
+            .level
+            .lights
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("light {i} ({:.1}, {:.1}, {:.1})", l.pos[0] / TF, -l.pos[1] / TF, l.pos[2] / TF))
+            .collect();
+        if !lights.is_empty() {
+            egui::CollapsingHeader::new(format!("Light ({})", lights.len())).default_open(true).show(ui, |ui| {
+                for (i, label) in lights.into_iter().enumerate() {
+                    let r = ui.selectable_label(self.s.sel == Sel::Light(i), label);
+                    if r.clicked() || r.double_clicked() {
+                        self.s.sel = Sel::Light(i);
+                    }
+                    if r.double_clicked() {
                         self.input.frame_request = Some(frame_target(self.s, self.doc));
                     }
                 }
@@ -803,29 +843,46 @@ impl Viewer<'_> {
                 let (w, h) = (256.0, 64.0 * 4.0);
                 let uv = egui::Rect::from_min_size(egui::pos2(u0 as f32 / w, v0 as f32 / h), egui::vec2(64.0 / w, 64.0 / h));
                 ui.vertical(|ui| {
-                    ui.add(egui::Image::new(egui::load::SizedTexture::new(atlas, egui::vec2(56.0, 56.0))).uv(uv));
-                    ui.label(format!("{slot}"));
+                    let on = self.s.tools.slot == slot;
+                    let image = egui::Image::new(egui::load::SizedTexture::new(atlas, egui::vec2(56.0, 56.0))).uv(uv);
+                    let r = ui.add(egui::Button::image(image).selected(on)).on_hover_text("Paint with this (B)");
+                    if r.clicked() {
+                        self.s.tools.slot = slot;
+                        self.s.tools.set_tool(Tool::Paint, self.doc);
+                    }
+                    ui.label(RichText::new(format!("{slot}")).strong().color(if on { Color32::WHITE } else { Color32::GRAY }));
                 });
             }
         });
     }
 
     fn areas(&mut self, ui: &mut egui::Ui) {
+        let faces = &self.s.tools.faces;
+        let r = ui
+            .add_enabled(!faces.is_empty(), egui::Button::new("New area from the selected faces"))
+            .on_hover_text("The box around the selected faces' cells, floor to ceiling")
+            .on_disabled_hover_text("Select faces first (Select tool), or ctrl-click to finish a Room");
+        if r.clicked() {
+            if let Some(b) = crate::tools::cells_box(&self.doc.level, faces) {
+                let l = &mut self.doc.level;
+                let name = format!("area {}", l.areas.len() + 1);
+                l.areas.push(engine::world::level::Area { name, label: "room".into(), boxes: vec![b], surface: None, notes: String::new() });
+                self.s.sel = Sel::Area(l.areas.len() - 1);
+            }
+        }
+        ui.separator();
         if self.doc.level.areas.is_empty() {
-            ui.label("No areas yet. The Room tool (milestone 3) makes them.");
+            ui.label(RichText::new("No areas yet. Ctrl-click to finish a Room, or select faces and make one.").weak());
         }
-        let mut remove = None;
-        for (i, a) in self.doc.level.areas.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut a.name);
-                ui.add(egui::TextEdit::singleline(&mut a.label).desired_width(70.0));
-                if ui.small_button("x").clicked() {
-                    remove = Some(i);
-                }
-            });
-        }
-        if let Some(i) = remove {
-            self.doc.level.areas.remove(i);
+        for (i, a) in self.doc.level.areas.iter().enumerate() {
+            let text = format!("{}  ·  {}", a.name, a.label);
+            let r = ui.selectable_label(self.s.sel == Sel::Area(i), text);
+            if r.clicked() || r.double_clicked() {
+                self.s.sel = Sel::Area(i);
+            }
+            if r.double_clicked() {
+                self.input.frame_request = Some(frame_target(self.s, self.doc));
+            }
         }
     }
 
@@ -892,10 +949,25 @@ impl Viewer<'_> {
         for e in &self.doc.level.entities {
             let p = to_screen(e.pos[0] / TF, e.pos[2] / TF);
             let c = egui_colour(entity_colour(&e.kind));
-            let rad = if self.s.selected == Some(e.id) { 5.0 } else { 3.5 };
+            let rad = if self.s.sel == Sel::Entity(e.id) { 5.0 } else { 3.5 };
             painter.circle_filled(p, rad, c);
-            if self.s.selected == Some(e.id) {
+            if self.s.sel == Sel::Entity(e.id) {
                 painter.circle_stroke(p, rad + 2.0, egui::Stroke::new(1.0, Color32::WHITE));
+            }
+        }
+        for (i, l) in self.doc.level.lights.iter().enumerate() {
+            let p = to_screen(l.pos[0] / TF, l.pos[2] / TF);
+            let c = Color32::from_rgb((l.colour[0].min(1.0) * 255.0) as u8, (l.colour[1].min(1.0) * 255.0) as u8, (l.colour[2].min(1.0) * 255.0) as u8);
+            painter.circle_stroke(p, l.radius / TF * pv.zoom, egui::Stroke::new(1.0, c.gamma_multiply(0.35)));
+            painter.circle_filled(p, 3.0, c);
+            if self.s.sel == Sel::Light(i) {
+                painter.circle_stroke(p, 5.0, egui::Stroke::new(1.0, Color32::WHITE));
+            }
+        }
+        if let Sel::Area(i) = self.s.sel {
+            for (lo, hi) in self.doc.level.areas.get(i).map_or(&[][..], |a| &a.boxes) {
+                let r = egui::Rect::from_min_max(to_screen(lo[0] as f32, lo[2] as f32), to_screen(hi[0] as f32, hi[2] as f32));
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(80, 215, 255)), egui::StrokeKind::Middle);
             }
         }
         // The tool, at the tile under the pointer.
@@ -919,15 +991,16 @@ impl Viewer<'_> {
             let tile = (pos - rect.center()) / pv.zoom + pv.centre;
             if r.clicked() && !edits {
                 // Pick the nearest entity within a few pixels.
-                self.s.selected = self
-                    .doc
-                    .level
-                    .entities
-                    .iter()
-                    .map(|e| (e.id, (to_screen(e.pos[0] / TF, e.pos[2] / TF) - pos).length()))
+                // The nearest entity or light within a few pixels.
+                let l = &self.doc.level;
+                let entities = l.entities.iter().map(|e| (Sel::Entity(e.id), e.pos));
+                let lights = l.lights.iter().enumerate().map(|(i, light)| (Sel::Light(i), light.pos));
+                self.s.sel = entities
+                    .chain(lights)
+                    .map(|(s, p)| (s, (to_screen(p[0] / TF, p[2] / TF) - pos).length()))
                     .filter(|&(_, d)| d < 8.0)
                     .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(id, _)| id);
+                    .map_or(Sel::None, |(s, _)| s);
             }
             if r.double_clicked() {
                 let y = slice as f32 * STEP as f32 / TF + 0.6;
@@ -1129,6 +1202,117 @@ fn entity_properties(ui: &mut egui::Ui, e: &mut LevelEntity, delete: &mut bool) 
             }
         }
     });
+}
+
+fn light_properties(ui: &mut egui::Ui, i: usize, light: &mut engine::world::level::PointLight, delete: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.heading(format!("Light {i}"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Delete").clicked() {
+                *delete = true;
+            }
+        });
+    });
+    egui::Grid::new("light").num_columns(2).show(ui, |ui| {
+        ui.label("position (tiles)");
+        ui.horizontal(|ui| {
+            let mut t = [light.pos[0] / TF, -light.pos[1] / TF, light.pos[2] / TF];
+            let mut changed = false;
+            for (v, n) in t.iter_mut().zip(["x", "up", "z"]) {
+                changed |= ui.add(egui::DragValue::new(v).speed(0.02).prefix(format!("{n} ")).max_decimals(2)).changed();
+            }
+            if changed {
+                light.pos = [t[0] * TF, -t[1] * TF, t[2] * TF];
+            }
+        });
+        ui.end_row();
+        ui.label("colour");
+        ui.horizontal(|ui| colour_edit(ui, &mut light.colour));
+        ui.end_row();
+        ui.label("radius (tiles)");
+        let mut r = light.radius / TF;
+        if ui.add(egui::DragValue::new(&mut r).speed(0.02).range(0.25..=16.0).max_decimals(2)).changed() {
+            light.radius = r * TF;
+        }
+        ui.end_row();
+        ui.label("when strange");
+        ui.horizontal(|ui| {
+            let mut own = light.strange.is_some();
+            ui.checkbox(&mut own, "own colour").on_hover_text("Otherwise the level's seed picks one");
+            if own != light.strange.is_some() {
+                light.strange = own.then_some([0.6, 0.2, 0.9]);
+            }
+            if let Some(c) = &mut light.strange {
+                colour_edit(ui, c);
+            }
+        });
+        ui.end_row();
+    });
+}
+
+fn area_properties(ui: &mut egui::Ui, a: &mut engine::world::level::Area, default: engine::world::level::Surface, delete: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.heading("Area");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Delete").clicked() {
+                *delete = true;
+            }
+        });
+    });
+    egui::Grid::new("area").num_columns(2).show(ui, |ui| {
+        ui.label("name");
+        ui.text_edit_singleline(&mut a.name);
+        ui.end_row();
+        ui.label("label");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut a.label).desired_width(90.0));
+            egui::ComboBox::from_id_salt("labels").selected_text("").width(18.0).show_ui(ui, |ui| {
+                for l in ["room", "corridor", "shrine", "stairwell", "outdoors"] {
+                    if ui.selectable_label(a.label == l, l).clicked() {
+                        a.label = l.into();
+                    }
+                }
+            });
+        });
+        ui.end_row();
+        ui.label("boxes");
+        ui.vertical(|ui| {
+            let mut remove = None;
+            for (i, (lo, hi)) in a.boxes.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("({}, {}, {}) to ({}, {}, {})", lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]));
+                    if a.boxes.len() > 1 && ui.small_button("x").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                a.boxes.remove(i);
+            }
+        });
+        ui.end_row();
+    });
+    ui.separator();
+    let mut own = a.surface.is_some();
+    ui.checkbox(&mut own, "Its own surfaces").on_hover_text("Floor, wall and ceiling textures and tint for unpainted faces inside it");
+    if own != a.surface.is_some() {
+        a.surface = own.then_some(default);
+    }
+    if let Some(s) = &mut a.surface {
+        egui::Grid::new("area surface").num_columns(2).show(ui, |ui| {
+            for (name, v) in [("floor", &mut s.floor), ("wall", &mut s.wall), ("ceiling", &mut s.ceiling)] {
+                ui.label(name);
+                ui.add(egui::DragValue::new(v).range(0..=7));
+                ui.end_row();
+            }
+            ui.label("tint");
+            ui.horizontal(|ui| colour_edit(ui, &mut s.tint));
+            ui.end_row();
+        });
+    }
+    ui.separator();
+    ui.label("notes");
+    ui.add(egui::TextEdit::multiline(&mut a.notes).desired_rows(3).desired_width(f32::INFINITY));
 }
 
 fn level_properties(ui: &mut egui::Ui, l: &mut Level) {

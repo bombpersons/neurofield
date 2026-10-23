@@ -125,7 +125,8 @@ An area is a named, labelled box of cells (or several boxes). It holds:
 - a label: `room`, `corridor`, `shrine`, `stairwell`, `outdoors`, or anything
   else you type;
 - default floor, wall and ceiling paint;
-- a colour tint, ambient light and fog (near, far);
+- a colour tint (with the paint, as its **surface**);
+- ambient light and fog (near, far): not in the file format yet;
 - notes.
 
 Areas are mostly for the analysis afterwards. They tell the future generator
@@ -324,10 +325,10 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 | Viewport | The see-through hole onto the 3D view, with view toggles in its corner |
 | Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. Room, Carve and Slope work in it too: Room and Carve open (or with Shift fill) the **plan height** layers above the slice, set in the Tools window. Pan with the right or middle button. |
 | Tools | The tool palette |
-| Properties | Whatever is selected: an entity, area, light, faces or cells. Multi-select edits shared fields. |
+| Properties | Whatever is selected: an entity, an area (name, label, its own surfaces, notes) or a light (position, colour, radius, strange colour); otherwise the level. |
 | Entities | An outliner grouped by kind, with a filter box. Click to select, double-click to frame it. |
-| Textures | The slot palette with previews for the level's texture set. Click to pick a texture for painting. |
-| Areas | A list of areas. Select one to highlight it. |
+| Textures | The slot palette with previews for the level's texture set. Click one to paint with it (this switches to the Paint tool). |
+| Areas | A list of areas. Select one to highlight it in both views, double-click to frame it. *New area from the selected faces* makes one boxing the selected faces' cells, floor to ceiling. |
 | Issues | Validation results. Click one to jump to it. |
 
 The layout is saved between sessions.
@@ -370,10 +371,10 @@ progress.
 | Push/Pull | P | Drag a face, or the selected faces, along its normal. Floors and ceilings move by layers, walls by tiles. Pushing into rock opens it, pulling closes it. This is how you raise the ground or dig a pit. A floor keeps its slope as it moves. |
 | Carve / Fill | C | A single-cell brush. Click to open the cell behind a face, Shift-click to fill the cell in front of it. A drag stays on the plane it started on, so it can't dig away under itself. |
 | Slope | S | Click near a floor's edge to make a ramp or stairs climbing away from it. Dragging on across the floor makes a flight: each column rises by the rise from the last, keeping the first one's headroom, carving through rock and raising floors in the way. Shift-click takes a slope off. The scroll wheel sets the rise, Tab switches between ramp and stairs. |
-| Paint | B | Click faces to paint them. Drag paints along a surface. Shift-click fills connected faces on the same plane. Alt-click picks up a face's paint. `[` and `]` rotate the texture. |
+| Paint | B | Click faces to paint them (a wall's whole height in that column, or the whole selection if you click in it). Drag paints along the surface. Shift-click fills the joined faces on the same plane that share a texture. Ctrl-click picks up a face's texture (Alt is taken by orbiting). Painting a face its default leaves it unpainted in the file. Rotating the texture (`[` and `]`) waits on paint gaining a rotation in the format. |
 | Strangeness | X | A brush over the lattice, with a radius (in tiles), a strength and a falloff. Click adds, Shift-click removes, Ctrl-click smooths. The overlay tints the view by strangeness while this tool is active. |
 | Entity | E | Pick a kind in the Properties window, then click to place it. Placement snaps to cell centres, or to cell edges for doors. R rotates. |
-| Light | L | Click to place a point light on a face. Drag up to lift it off the face. |
+| Light | L | Click to place a point light just off a face. Drag to lift it further off. Select picks lights by their markers, in the 3D view or the plan, where their radius shows as a circle. |
 
 Picking uses the triangles as drawn: the nearest one facing the camera under the
 pointer, turned into the open cell it bounds and which face of that cell it is. A
