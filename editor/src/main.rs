@@ -6,10 +6,13 @@
 //! over it. Data paths (textures, skins, levels) come from `neurofield.ron`.
 //! Right mouse: fly (WASD, Q/E down/up, Shift faster)   Middle mouse or Alt+left: orbit
 //! Wheel: dolly   F: frame the selection   PgUp/PgDn: move the height slice
+//! Tools (V R P C S): see `tools`; Esc or the right button cancels a drag.
 
 mod doc;
 mod flesh;
+mod pick;
 mod settings;
+mod tools;
 mod ui;
 mod view3d;
 
@@ -82,9 +85,12 @@ fn main() {
     .insert_resource(cam)
     .insert_resource(Built {
         scene: Level::new("").to_scene(),
+        full: None,
         version: 0,
         mode: ViewMode::Plain,
         slice: 0,
+        cut: false,
+        cut_at: None,
         show_grid: true,
         show_entities: true,
         full_colour: true,
@@ -92,6 +98,7 @@ fn main() {
         changed_at: 0.0,
         parts: Vec::new(),
         hidden: Vec::new(),
+        lines: Vec::new(),
     })
     .insert_resource(flesh::Sculpts::default())
     .add_systems(Startup, setup)

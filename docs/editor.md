@@ -322,7 +322,7 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 | Window | What it does |
 |---|---|
 | Viewport | The see-through hole onto the 3D view, with view toggles in its corner |
-| Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. You can edit in it with the same tools. |
+| Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. Room, Carve and Slope work in it too: Room and Carve open (or with Shift fill) the **plan height** layers above the slice, set in the Tools window. Pan with the right or middle button. |
 | Tools | The tool palette |
 | Properties | Whatever is selected: an entity, area, light, faces or cells. Multi-select edits shared fields. |
 | Entities | An outliner grouped by kind, with a filter box. Click to select, double-click to frame it. |
@@ -355,22 +355,31 @@ progress.
   Shift to go faster.
 - **Orbit:** Alt + drag or the middle mouse button. The scroll wheel zooms.
 - **F** frames the selection.
-- **Height slice:** PgUp and PgDn move a cut plane. Everything above it is
-  hidden in both views, so you can work on the lower floors.
+- **Height slice:** PgUp and PgDn move the slice, the layer the grid and the
+  Plan view show. With **Cut** on (a viewport toggle, also in the View menu),
+  everything more than a tile above the slice is hidden, so you can work on the
+  lower floors. The cut is made by filling the rock in above it, so the tops of
+  the walls show open from above, and picking sees the level as it is drawn.
 
 ### Tools
 
 | Tool | Key | What it does |
 |---|---|---|
-| Select | V | Click a cell face, entity or light. Shift adds to the selection, drag selects a box. Delete removes. |
-| Room | R | SketchUp-style. Drag a rectangle on the floor (or any horizontal face), then move the mouse up to extrude it in layers, and click. That opens the box. Ctrl while extruding makes it an area too. |
-| Push/Pull | P | Drag selected faces along their normal. Floors move by layers; walls and ceilings move by tiles for walls and layers for ceilings. Pushing into rock opens it, pulling closes it. This is how you raise the ground or dig a pit. |
-| Carve / Fill | C | A single-cell brush. Click to open, Shift-click to close. |
-| Slope | S | Click a floor edge to make a ramp or stairs climbing away from it. The scroll wheel sets the rise, Tab switches between ramp and stairs. |
+| Select | V | Click a cell face or entity. Shift adds to the selection, drag selects a box of faces on the plane where the drag started. Delete removes an entity. |
+| Room | R | SketchUp-style. Drag a rectangle on the floor (or any horizontal face, or the grid at the slice where there is none), then move the mouse up to extrude it in layers, and click. That opens the box. Moving down instead digs it below the floor. Ctrl while clicking makes it an area too. |
+| Push/Pull | P | Drag a face, or the selected faces, along its normal. Floors and ceilings move by layers, walls by tiles. Pushing into rock opens it, pulling closes it. This is how you raise the ground or dig a pit. A floor keeps its slope as it moves. |
+| Carve / Fill | C | A single-cell brush. Click to open the cell behind a face, Shift-click to fill the cell in front of it. A drag stays on the plane it started on, so it can't dig away under itself. |
+| Slope | S | Click near a floor's edge to make a ramp or stairs climbing away from it. Dragging on across the floor makes a flight: each column rises by the rise from the last, keeping the first one's headroom, carving through rock and raising floors in the way. Shift-click takes a slope off. The scroll wheel sets the rise, Tab switches between ramp and stairs. |
 | Paint | B | Click faces to paint them. Drag paints along a surface. Shift-click fills connected faces on the same plane. Alt-click picks up a face's paint. `[` and `]` rotate the texture. |
 | Strangeness | X | A brush over the lattice, with a radius (in tiles), a strength and a falloff. Click adds, Shift-click removes, Ctrl-click smooths. The overlay tints the view by strangeness while this tool is active. |
 | Entity | E | Pick a kind in the Properties window, then click to place it. Placement snaps to cell centres, or to cell edges for doors. R rotates. |
 | Light | L | Click to place a point light on a face. Drag up to lift it off the face. |
+
+Picking uses the triangles as drawn: the nearest one facing the camera under the
+pointer, turned into the open cell it bounds and which face of that cell it is. A
+click on a wall takes its whole height in that column; a floor or ceiling, one tile.
+Drags change the level as they go, so the view shows the result live; Esc or the
+right button puts it back, and the whole drag is one undo step.
 
 ### Undo
 

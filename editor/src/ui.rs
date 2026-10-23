@@ -4,6 +4,7 @@
 
 use crate::doc::Doc;
 use crate::settings::Settings;
+use crate::tools::{Tool, Tools};
 use crate::view3d::{entity_colour, to_view, to_world, Built, EditorCam, ViewInput, ViewMode};
 use crate::Document;
 use bevy::prelude::*;
@@ -11,7 +12,7 @@ use bevy::tasks::{block_on, futures_lite::future::poll_once, AsyncComputeTaskPoo
 use bevy_egui::{egui, EguiContexts};
 use engine::world::config::Config;
 use engine::world::creature::Kind;
-use engine::world::level::{Entity as LevelEntity, EntityKind, Hinge, Level, PropShape, Sun};
+use engine::world::level::{Entity as LevelEntity, EntityKind, Hinge, Level, PropShape, SlopeKind, Sun};
 use engine::world::scene::{STEP, T};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
@@ -61,77 +62,6 @@ pub fn default_dock() -> DockState<Tab> {
     d
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tool {
-    Select,
-    Room,
-    PushPull,
-    Carve,
-    Slope,
-    Paint,
-    Strange,
-    Place,
-    Light,
-}
-
-impl Tool {
-    const ALL: [Tool; 9] =
-        [Tool::Select, Tool::Room, Tool::PushPull, Tool::Carve, Tool::Slope, Tool::Paint, Tool::Strange, Tool::Place, Tool::Light];
-
-    fn name(self) -> &'static str {
-        match self {
-            Tool::Select => "Select",
-            Tool::Room => "Room",
-            Tool::PushPull => "Push/Pull",
-            Tool::Carve => "Carve / Fill",
-            Tool::Slope => "Slope",
-            Tool::Paint => "Paint",
-            Tool::Strange => "Strangeness",
-            Tool::Place => "Entity",
-            Tool::Light => "Light",
-        }
-    }
-
-    fn key(self) -> Key {
-        match self {
-            Tool::Select => Key::V,
-            Tool::Room => Key::R,
-            Tool::PushPull => Key::P,
-            Tool::Carve => Key::C,
-            Tool::Slope => Key::S,
-            Tool::Paint => Key::B,
-            Tool::Strange => Key::X,
-            Tool::Place => Key::E,
-            Tool::Light => Key::L,
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            Tool::Select => "click an entity in the Entities panel or the plan; Delete removes it",
-            Tool::Room => "drag a rectangle on the floor, then move up to extrude",
-            Tool::PushPull => "drag faces along their normal",
-            Tool::Carve => "click to open a cell, shift-click to fill it",
-            Tool::Slope => "click a floor edge to make a ramp or stairs",
-            Tool::Paint => "click faces to paint, shift-click to fill, alt-click to pick",
-            Tool::Strange => "brush strangeness on, shift to take it off, ctrl to smooth",
-            Tool::Place => "click to place the chosen entity",
-            Tool::Light => "click a face to put a light on it",
-        }
-    }
-
-    /// The milestone that brings it (docs/editor.md), for tools not built yet.
-    fn coming(self) -> Option<u32> {
-        match self {
-            Tool::Select => None,
-            Tool::Room | Tool::PushPull | Tool::Carve | Tool::Slope => Some(3),
-            Tool::Paint | Tool::Light => Some(4),
-            Tool::Place => Some(5),
-            Tool::Strange => Some(6),
-        }
-    }
-}
-
 /// Something that waits on the user saying what to do with unsaved changes.
 #[derive(Clone, Debug)]
 enum After {
@@ -145,7 +75,7 @@ pub struct Ui {
     pub settings: Settings,
     pub config: Config,
     pub quit_requested: bool,
-    tool: Tool,
+    tools: Tools,
     selected: Option<u32>,
     message: String,
     /// The unsaved-changes question, and what to do once it is answered.
@@ -176,7 +106,7 @@ impl Ui {
             settings,
             config,
             quit_requested: false,
-            tool: Tool::Select,
+            tools: Tools::default(),
             selected: None,
             message: String::new(),
             confirm: None,
@@ -280,7 +210,7 @@ pub fn draw(
     input.typing = ctx.egui_wants_keyboard_input();
 
     dialogs(&ctx, s, doc, &mut exit);
-    doc.settle(!ctx.egui_is_using_pointer() && !ctx.egui_wants_keyboard_input());
+    doc.settle(!ctx.egui_is_using_pointer() && !ctx.egui_wants_keyboard_input() && !s.tools.busy());
 
     if let Ok(mut w) = window.single_mut() {
         let title = format!("{}{} — neurofield editor", doc.name(), if doc.dirty() { " •" } else { "" });
@@ -309,8 +239,10 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
         s.quit_requested = true;
     }
     if cmd(shift_cmd, Key::Z) || cmd(Modifiers::COMMAND, Key::Y) {
+        s.tools.cancel(doc);
         doc.redo();
     } else if cmd(Modifiers::COMMAND, Key::Z) {
+        s.tools.cancel(doc);
         doc.undo();
     }
     if cmd(Modifiers::SHIFT, Key::F5) {
@@ -327,8 +259,8 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
     }
     let pressed = |k: Key| ctx.input(|i| i.key_pressed(k) && i.modifiers.is_none());
     for t in Tool::ALL {
-        if pressed(t.key()) {
-            s.tool = t;
+        if pressed(t.key()) && t.coming().is_none() {
+            s.tools.set_tool(t, doc);
         }
     }
     if pressed(Key::PageUp) {
@@ -340,8 +272,9 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
     if pressed(Key::Delete) || pressed(Key::Backspace) {
         delete_selected(s, doc);
     }
-    if pressed(Key::Escape) {
+    if pressed(Key::Escape) && !s.tools.cancel(doc) {
         s.selected = None;
+        s.tools.faces.clear();
     }
     if pressed(Key::F) {
         input.frame_request = Some(frame_target(s, doc));
@@ -349,7 +282,12 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
     if pressed(Key::Home) {
         input.frame_request = Some(level_centre(&doc.level));
     }
-    if pressed(Key::Tab) {
+    if pressed(Key::Tab) && s.tools.tool == Tool::Slope {
+        s.tools.kind = match s.tools.kind {
+            SlopeKind::Stairs => SlopeKind::Ramp,
+            SlopeKind::Ramp => SlopeKind::Stairs,
+        };
+    } else if pressed(Key::Tab) {
         built.mode = if built.mode == ViewMode::Plain { ViewMode::Psx } else { ViewMode::Plain };
         s.settings.mode = built.mode;
     }
@@ -461,12 +399,14 @@ fn poll_dialogs(s: &mut Ui, doc: &mut Doc) {
         Some(After::New) => {
             *doc = Doc::new(Level::new("untitled"), None);
             s.selected = None;
+            s.tools.reset();
             s.message = "new level".into();
         }
         Some(After::Open(Some(p))) => match Doc::open(&p) {
             Ok(d) => {
                 *doc = d;
                 s.selected = None;
+                s.tools.reset();
                 s.settings.opened(&p);
                 s.message = format!("opened {}", p.display());
             }
@@ -562,9 +502,11 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
         });
         ui.menu_button("Edit", |ui| {
             if ui.add_enabled(doc.can_undo(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                s.tools.cancel(doc);
                 doc.undo();
             }
             if ui.add_enabled(doc.can_redo(), egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
+                s.tools.cancel(doc);
                 doc.redo();
             }
             ui.separator();
@@ -573,6 +515,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             }
             if ui.add(egui::Button::new("Select none").shortcut_text("Esc")).clicked() {
                 s.selected = None;
+                s.tools.faces.clear();
             }
         });
         ui.menu_button("View", |ui| {
@@ -596,6 +539,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             ui.radio_value(&mut built.mode, ViewMode::Psx, "PS1");
             s.settings.mode = built.mode;
             ui.checkbox(&mut built.show_grid, "Grid");
+            ui.checkbox(&mut built.cut, "Cut above the slice");
             ui.checkbox(&mut built.show_entities, "Entity markers");
             ui.checkbox(&mut built.full_colour, "Full-colour creatures");
             s.settings.full_colour = built.full_colour;
@@ -616,7 +560,9 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
         ui.menu_button("Tools", |ui| {
             for t in Tool::ALL {
                 let label = format!("{}  ({:?})", t.name(), t.key());
-                ui.add_enabled_ui(t.coming().is_none(), |ui| ui.radio_value(&mut s.tool, t, label));
+                if ui.add_enabled(t.coming().is_none(), egui::RadioButton::new(s.tools.tool == t, label)).clicked() {
+                    s.tools.set_tool(t, doc);
+                }
             }
         });
         ui.menu_button("Play", |ui| {
@@ -640,9 +586,10 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
 
 fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorCam, sculpting: usize) {
     ui.horizontal(|ui| {
-        let hint = match s.tool.coming() {
-            None => format!("{}: {}", s.tool.name(), s.tool.hint()),
-            Some(m) => format!("{}: arrives in milestone {m}", s.tool.name()),
+        let t = s.tools.tool;
+        let hint = match t.coming() {
+            None => format!("{}: {}", t.name(), t.hint()),
+            Some(m) => format!("{}: arrives in milestone {m}", t.name()),
         };
         ui.label(hint);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -650,6 +597,19 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
             ui.separator();
             ui.label(format!("{} tris", built.scene.tris.len()));
             ui.separator();
+            if !s.tools.faces.is_empty() {
+                ui.label(format!("{} face{}", s.tools.faces.len(), if s.tools.faces.len() == 1 { "" } else { "s" }));
+                ui.separator();
+            }
+            if let Some(h) = s.tools.hover {
+                let [x, l, z] = h.cell;
+                let face = match h.face {
+                    engine::world::level::Face::Wall(d) => format!("{d:?} wall"),
+                    f => format!("{f:?}").to_lowercase(),
+                };
+                ui.label(format!("cell ({x}, {l}, {z}) {face}"));
+                ui.separator();
+            }
             if sculpting > 0 {
                 ui.label(format!("sculpting {sculpting} creature{}", if sculpting == 1 { "" } else { "s" }));
                 ui.separator();
@@ -729,32 +689,44 @@ impl Viewer<'_> {
         self.viewport_hovered = r.hovered() || r.contains_pointer();
         // A strip of view toggles in the corner.
         let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(r.rect.shrink(6.0)));
-        corner.horizontal(|ui| {
+        let toggles = corner.horizontal(|ui| {
             let b = &mut *self.built;
             ui.selectable_value(&mut b.mode, ViewMode::Plain, "Plain");
             ui.selectable_value(&mut b.mode, ViewMode::Psx, "PS1");
             self.s.settings.mode = b.mode;
             ui.separator();
             ui.toggle_value(&mut b.show_grid, "Grid");
+            ui.toggle_value(&mut b.cut, "Cut").on_hover_text("Hide everything more than a tile above the slice (PgUp/PgDn)");
             ui.toggle_value(&mut b.show_entities, "Markers");
             ui.toggle_value(&mut b.full_colour, "Flesh")
                 .on_hover_text("Creatures in full colour, as the game draws them (sculpted in the background)");
             self.s.settings.full_colour = b.full_colour;
         });
+        // The tools get the pointer where no panel (or the toggles) has it.
+        let ctx = ui.ctx().clone();
+        let pos = ctx.pointer_latest_pos();
+        let over = self.viewport_hovered
+            && pos.is_some_and(|p| {
+                !toggles.response.rect.contains(p) && !ctx.layer_id_at(p).is_some_and(|l| l.order != egui::Order::Background)
+            });
+        let s = &mut *self.s;
+        s.tools.viewport(&ctx, ctx.viewport_rect(), over, self.doc, self.built, self.cam, &mut s.selected, &mut s.message, self.input);
     }
 
     fn tools(&mut self, ui: &mut egui::Ui) {
         for t in Tool::ALL {
             let text = format!("{}  {:?}", t.name(), t.key());
-            let r = ui.add_enabled(t.coming().is_none(), egui::Button::selectable(self.s.tool == t, text));
+            let r = ui.add_enabled(t.coming().is_none(), egui::Button::selectable(self.s.tools.tool == t, text));
             let r = match t.coming() {
                 Some(m) => r.on_disabled_hover_text(format!("{}; arrives in milestone {m}", t.hint())),
                 None => r.on_hover_text(t.hint()),
             };
             if r.clicked() {
-                self.s.tool = t;
+                self.s.tools.set_tool(t, self.doc);
             }
         }
+        ui.separator();
+        self.s.tools.options(ui);
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
@@ -858,7 +830,7 @@ impl Viewer<'_> {
     }
 
     fn issues(&mut self, ui: &mut egui::Ui) {
-        let issues = validate(&self.doc.level, &self.built.scene);
+        let issues = validate(&self.doc.level, self.built.whole());
         if issues.is_empty() {
             ui.label(RichText::new("No problems found.").color(Color32::LIGHT_GREEN));
         }
@@ -878,7 +850,11 @@ impl Viewer<'_> {
         });
         let (rect, r) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let pv = &mut self.s.plan;
-        if r.dragged() {
+        let edits = matches!(self.s.tools.tool, Tool::Room | Tool::Carve | Tool::Slope);
+        if r.dragged_by(egui::PointerButton::Secondary)
+            || r.dragged_by(egui::PointerButton::Middle)
+            || (!edits && r.dragged_by(egui::PointerButton::Primary))
+        {
             pv.centre -= r.drag_delta() / pv.zoom;
         }
         if r.hovered() {
@@ -922,6 +898,15 @@ impl Viewer<'_> {
                 painter.circle_stroke(p, rad + 2.0, egui::Stroke::new(1.0, Color32::WHITE));
             }
         }
+        // The tool, at the tile under the pointer.
+        let (centre, zoom) = (pv.centre, pv.zoom);
+        let tile = r.hover_pos().or(r.interact_pointer_pos()).map(|p| (p - rect.center()) / zoom + centre);
+        let mods = ui.input(|i| i.modifiers);
+        if let Some((lo, hi)) = self.s.tools.plan(&r, mods, tile, slice, self.doc, &mut self.s.message) {
+            let to_screen = |x: f32, z: f32| rect.center() + (egui::vec2(x, z) - centre) * zoom;
+            let area = egui::Rect::from_min_max(to_screen(lo.0 as f32, lo.1 as f32), to_screen(hi.0 as f32 + 1.0, hi.1 as f32 + 1.0));
+            painter.rect_stroke(area, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(255, 140, 50)), egui::StrokeKind::Middle);
+        }
         // The camera, and which way it looks.
         let c = to_world(self.cam.pos);
         let f = crate::view3d::dir_to_world(self.cam.forward());
@@ -932,7 +917,7 @@ impl Viewer<'_> {
 
         if let Some(pos) = r.interact_pointer_pos() {
             let tile = (pos - rect.center()) / pv.zoom + pv.centre;
-            if r.clicked() {
+            if r.clicked() && !edits {
                 // Pick the nearest entity within a few pixels.
                 self.s.selected = self
                     .doc

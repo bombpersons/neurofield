@@ -37,6 +37,13 @@ pub struct Tri {
     pub(crate) tint: [f32; 3],
 }
 
+impl Tri {
+    /// The way it faces (world axes, y down): into the open space it bounds.
+    pub fn normal(&self) -> [f32; 3] {
+        self.n
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slope {
     Flat,

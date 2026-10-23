@@ -84,15 +84,24 @@ pub struct ViewInput {
     /// Keyboard focus belongs to a text field.
     pub typing: bool,
     pub frame_request: Option<Vec3>,
+    /// The wheel belongs to the current tool, not the camera.
+    pub wheel_taken: bool,
 }
 
 /// The level as built for viewing.
 #[derive(Resource)]
 pub struct Built {
+    /// The level as shown (cut at the slice, if `cut`).
     pub scene: Scene,
+    /// The whole level, when `scene` is cut.
+    pub full: Option<Scene>,
     pub version: u64,
     pub mode: ViewMode,
     pub slice: i32,
+    /// Hide everything more than `CUT_ABOVE` layers above the slice.
+    pub cut: bool,
+    /// The slice `scene` was cut at.
+    pub cut_at: Option<i32>,
     pub show_grid: bool,
     pub show_entities: bool,
     /// Creatures in full colour once sculpted (see `crate::flesh`), else as PS1 meshes.
@@ -105,6 +114,32 @@ pub struct Built {
     pub parts: Vec<Entity>,
     /// Shapes of the creatures left out of `parts` because they are shown in full colour.
     pub hidden: Vec<u64>,
+    /// Outlines from the current tool, drawn over the level.
+    pub lines: Vec<(Vec3, Vec3, Color)>,
+}
+
+/// With the cut on, how many layers above the slice still show: a tile of wall.
+pub const CUT_ABOVE: i32 = 4;
+
+impl Built {
+    /// The whole level, cut or not.
+    pub fn whole(&self) -> &Scene {
+        self.full.as_ref().unwrap_or(&self.scene)
+    }
+}
+
+/// The level with everything from `CUT_ABOVE` layers above `slice` filled in, and
+/// the entities up there left out. From above, the fill's undersides are back faces,
+/// so the cut shows as open tops.
+fn cut_level(level: &engine::world::level::Level, slice: i32) -> engine::world::level::Level {
+    let mut l = level.clone();
+    let top = slice + CUT_ABOVE;
+    let keys: Vec<_> = l.columns.keys().copied().collect();
+    for (x, z) in keys {
+        l.close(x, z, top, i32::MAX);
+    }
+    l.entities.retain(|e| -e.pos[1] < top as f32 * STEP as f32);
+    l
 }
 
 /// The level texture atlas, for the Textures panel.
@@ -140,10 +175,21 @@ pub fn rebuild(
     mut sculpts: ResMut<crate::flesh::Sculpts>,
     mut gfx: engine::render::Gfx,
 ) {
-    let changed = built.version != doc.0.version || built.version == 0;
+    let cut_at = built.cut.then_some(built.slice);
+    let changed = built.version != doc.0.version || built.version == 0 || built.cut_at != cut_at;
     if changed {
         built.version = doc.0.version.max(1);
-        built.scene = doc.0.level.to_scene();
+        built.cut_at = cut_at;
+        match cut_at {
+            Some(slice) => {
+                built.scene = cut_level(&doc.0.level, slice).to_scene();
+                built.full = Some(doc.0.level.to_scene());
+            }
+            None => {
+                built.scene = doc.0.level.to_scene();
+                built.full = None;
+            }
+        }
         built.shapes = built.scene.creatures.iter().map(|c| c.shape_hash()).collect();
         built.changed_at = time.elapsed_secs_f64();
     }
@@ -225,7 +271,7 @@ pub fn camera_control(
         let f = cam.focus;
         cam.frame(centre, f);
     }
-    if input.hovered && scroll.delta.y != 0.0 {
+    if input.hovered && !input.wheel_taken && scroll.delta.y != 0.0 {
         let step = scroll.delta.y.signum() * (cam.focus * 0.15).clamp(0.25, 4.0);
         let f = cam.forward();
         cam.pos += f * step;
@@ -263,9 +309,12 @@ pub fn screen_mode(built: Res<Built>, windows: Query<&Window>, mut screen: ResMu
     }
 }
 
-/// The grid at the height slice, and markers for entities and lights.
+/// The grid at the height slice, the tool's outlines, and markers for entities and lights.
 pub fn gizmos(mut g: Gizmos, built: Res<Built>, doc: Res<crate::Document>) {
     let level = &doc.0.level;
+    for &(a, b, c) in &built.lines {
+        g.line(a, b, c);
+    }
     let y = built.slice as f32 * STEP as f32 / TF;
     if built.show_grid {
         let (w, d) = (built.scene.w.max(8) + 2, built.scene.d.max(8) + 2);
