@@ -3,8 +3,9 @@
 //! cell grid (stairs and ramps yes, ledges no), walks cell centres, cutting
 //! straight across open floor, and now and then stops to look around.
 
-use crate::rng::Rng;
-use crate::scene::{torch_colour, Camera, Scene, MAX_STEP, T};
+use crate::world::creature::Creature;
+use crate::world::rng::Rng;
+use crate::world::scene::{torch_colour, Camera, Node, Scene, MAX_STEP, T};
 use std::collections::VecDeque;
 
 const TF: f32 = T as f32;
@@ -27,8 +28,8 @@ pub struct Walker {
     pub y: f32,
     pub yaw: f32,
     pub pitch: f32,
-    /// Remaining waypoints (cell coordinates), nearest first.
-    path: VecDeque<(i32, i32)>,
+    /// Remaining waypoints, nearest first.
+    path: VecDeque<Node>,
     /// Frames left in a stop-and-look-around, and where it is looking.
     pause: u32,
     look_yaw: f32,
@@ -39,7 +40,7 @@ pub struct Walker {
     torch_radius: i32,
 }
 
-fn centre(c: (i32, i32)) -> (f32, f32) {
+fn centre(c: Node) -> (f32, f32) {
     ((c.0 as f32 + 0.5) * TF, (c.1 as f32 + 0.5) * TF)
 }
 
@@ -62,7 +63,10 @@ impl Walker {
             return None;
         }
         let (x, z) = centre(start);
-        let fy = scene.walkable_y(x, z)?;
+        if scene.span(start).blocked {
+            return None;
+        }
+        let fy = scene.node_floor(start, [x, z]);
         let fog_near = rng.fr(1.0, 2.5) * TF;
         Some(Walker {
             x,
@@ -81,9 +85,31 @@ impl Walker {
         })
     }
 
+    /// A walker standing at `pos` (world units, on or above a floor) facing `yaw` radians.
+    pub fn at(scene: &Scene, pos: [f32; 3], yaw: f32, rng: &mut Rng) -> Option<Walker> {
+        let n = scene.node_at(pos[0], pos[1], pos[2])?;
+        let fy = scene.node_floor(n, [pos[0], pos[2]]);
+        let fog_near = rng.fr(1.5, 2.5) * TF;
+        Some(Walker {
+            x: pos[0],
+            z: pos[2],
+            y: fy - EYE,
+            yaw: yaw / std::f32::consts::TAU * 4096.0,
+            pitch: 0.0,
+            path: VecDeque::new(),
+            pause: 0,
+            look_yaw: 0.0,
+            target_pitch: 0.0,
+            fog_near: fog_near as i32,
+            fog_far: (fog_near + rng.fr(4.0, 6.0) * TF) as i32,
+            torch: torch_colour(rng),
+            torch_radius: (3.0 * TF) as i32,
+        })
+    }
+
     /// Choose a destination (biased toward far cells) and the cell path to it.
     fn plan(&mut self, scene: &Scene, rng: &mut Rng) {
-        let here = ((self.x / TF).floor() as i32, (self.z / TF).floor() as i32);
+        let Some(here) = scene.node_at(self.x, self.feet(), self.z) else { return };
         let tree = scene.reachable(here);
         // BFS order is distance order, so the back half is the far half.
         let pick = tree.len() / 2 + rng.next() as usize % tree.len().div_ceil(2);
@@ -96,13 +122,21 @@ impl Walker {
         self.path = path;
     }
 
-    /// Can the body stand at (x, z) coming from floor height `from`?
+    /// Height of the feet: the eye eases toward the floor, so this is near it.
+    fn feet(&self) -> f32 {
+        self.y + EYE
+    }
+
+    /// Can the body stand at (x, z) coming from floor height `from`? The centre may
+    /// move at most a step up or down; the corners of the body only need floor that
+    /// isn't steeper than 45° from it, so steep stairs pass but walls and pits don't.
     fn free(scene: &Scene, x: f32, z: f32, from: f32) -> Option<f32> {
-        let fy = scene.walkable_y(x, z)?;
+        let fy = scene.walkable_y(x, from, z)?;
+        let reach = MAX_STEP + RADIUS * std::f32::consts::SQRT_2;
         let ok = (fy - from).abs() <= MAX_STEP
             && [(-RADIUS, -RADIUS), (RADIUS, -RADIUS), (-RADIUS, RADIUS), (RADIUS, RADIUS)]
                 .iter()
-                .all(|&(dx, dz)| scene.walkable_y(x + dx, z + dz).is_some_and(|f| (f - fy).abs() <= MAX_STEP));
+                .all(|&(dx, dz)| scene.walkable_y(x + dx, fy, z + dz).is_some_and(|f| (f - fy).abs() <= reach));
         ok.then_some(fy)
     }
 
@@ -110,7 +144,7 @@ impl Walker {
     fn clear_line(&self, scene: &Scene, tx: f32, tz: f32) -> bool {
         let (dx, dz) = (tx - self.x, tz - self.z);
         let n = ((dx * dx + dz * dz).sqrt() / 16.0).ceil().max(1.0) as i32;
-        let mut from = scene.floor_y(self.x, self.z).unwrap_or(0.0);
+        let mut from = scene.floor_y(self.x, self.feet(), self.z).unwrap_or(0.0);
         (1..=n).all(|i| {
             let t = i as f32 / n as f32;
             Self::free(scene, self.x + dx * t, self.z + dz * t, from).map(|f| from = f).is_some()
@@ -131,40 +165,56 @@ impl Walker {
         }
     }
 
-    /// A camera like this walker's, standing on open floor 0.6-2.2 tiles from `target`
-    /// with nothing solid between, looking at it (give or take a little).
-    pub fn view_of(&self, scene: &Scene, target: [f32; 3], rng: &mut Rng) -> Option<Camera> {
-        let cells = scene.floor_cells();
-        for _ in 0..30 {
-            let (cx, cz) = cells[rng.next() as usize % cells.len()];
-            if scene.blocked[(cz * scene.w + cx) as usize] {
+    /// A camera like this walker's, looking at somewhere on creature `c` from any
+    /// side, mostly close: 0.4-2.4 tiles out from its outer edge, biased near. The
+    /// eye is usually at walking height but often anywhere from a crouch to
+    /// overhead, the gaze can tilt steeply, and sometimes the head rolls a little.
+    pub fn view_of(&self, scene: &Scene, c: &Creature, rng: &mut Rng) -> Option<Camera> {
+        let (reach, top, bottom) = c.extent();
+        let own = ((c.base[0] / TF).floor(), (c.base[2] / TF).floor());
+        let in_own = |x: f32, z: f32| ((x / TF).floor(), (z / TF).floor()) == own;
+        for _ in 0..40 {
+            let target = [c.base[0], bottom + (top - bottom) * rng.fr(0.15, 0.85), c.base[2]];
+            let angle = rng.fr(0.0, std::f32::consts::TAU);
+            let dist = reach + (0.4 + 2.0 * rng.f() * rng.f()) * TF;
+            let (x, z) = (target[0] + angle.cos() * dist, target[2] + angle.sin() * dist);
+            // Open floor under the eye and all round it, so the near plane cuts no wall.
+            let Some(fy) = scene.floor_y(x, c.base[1], z) else { continue };
+            let open = |px: f32, pz: f32| in_own(px, pz) || scene.walkable_y(px, fy, pz).is_some();
+            if ![(0.0, 0.0), (RADIUS, 0.0), (-RADIUS, 0.0), (0.0, RADIUS), (0.0, -RADIUS)]
+                .iter()
+                .all(|&(ox, oz)| open(x + ox, z + oz))
+            {
                 continue;
             }
-            let (x, z) = centre((cx, cz));
-            let (x, z) = (x + rng.fr(-0.3, 0.3) * TF, z + rng.fr(-0.3, 0.3) * TF);
-            let (dx, dz) = (target[0] - x, target[2] - z);
-            let dist = dx.hypot(dz);
-            if !(0.6 * TF..2.2 * TF).contains(&dist) {
+            let ceiling = scene.ceiling_y(x, fy, z).unwrap_or(fy - 2.0 * TF);
+            let lift = if rng.chance(0.5) { EYE + rng.fr(-0.08, 0.08) * TF } else { rng.fr(0.15, 1.5) * TF };
+            let lift = lift.min(fy - ceiling - 0.2 * TF);
+            if lift < 0.1 * TF {
                 continue;
             }
-            let Some(fy) = scene.walkable_y(x, z) else { continue };
-            let y = fy - EYE;
-            // Nothing solid along the line of sight, skipping the target's own cell.
+            let y = fy - lift;
+            // Nothing solid along the line of sight, skipping the creature's own cell.
+            let (dx, dy, dz) = (target[0] - x, target[1] - y, target[2] - z);
             let n = (dist / 32.0).ceil() as i32;
             let clear = (1..n).all(|i| {
                 let t = i as f32 / n as f32;
-                let (px, pz) = (x + dx * t, z + dz * t);
-                let own = (px / TF).floor() == (target[0] / TF).floor() && (pz / TF).floor() == (target[2] / TF).floor();
-                own || scene.floor_y(px, pz).is_some_and(|f| f > y + (target[1] - y) * t)
+                let (px, py, pz) = (x + dx * t, y + dy * t, z + dz * t);
+                in_own(px, pz)
+                    || scene.node_at(px, py, pz).is_some_and(|n| {
+                        let s = scene.span(n);
+                        s.floor(n.0, n.1, [px, pz]) > py && (s.sky || s.ceiling(n.0, n.1, [px, pz]) < py)
+                    })
             });
             if !clear {
                 continue;
             }
-            let pitch = (target[1] - y).atan2(dist) / std::f32::consts::TAU * 4096.0;
+            let pitch = dy.atan2(dist) / std::f32::consts::TAU * 4096.0;
             return Some(Camera {
                 pos: [x as i32, y as i32, z as i32],
                 yaw: (yaw_towards(dx, dz) + rng.fr(-120.0, 120.0)).round() as i32,
-                pitch: (pitch + rng.fr(-60.0, 60.0)).clamp(-MAX_PITCH, MAX_PITCH).round() as i32,
+                pitch: (pitch + rng.fr(-60.0, 60.0)).clamp(-900.0, 900.0).round() as i32,
+                roll: if rng.chance(0.2) { rng.range(-120, 120) } else { 0 },
                 ..self.camera()
             });
         }
@@ -225,7 +275,7 @@ impl Walker {
                 self.look_yaw = self.yaw + if rng.chance(0.5) { sweep } else { -sweep };
             }
         }
-        if let Some(fy) = scene.floor_y(self.x, self.z) {
+        if let Some(fy) = scene.floor_y(self.x, self.feet(), self.z) {
             self.y += (fy - EYE - self.y) * 0.35;
         }
     }
@@ -245,7 +295,7 @@ impl Walker {
         // Forward is (-sin, cos) as in `yaw_towards`; right is down x forward.
         let dx = (-s * forward + c * strafe) * SPEED;
         let dz = (c * forward + s * strafe) * SPEED;
-        let from = scene.floor_y(self.x, self.z).unwrap_or(0.0);
+        let from = scene.floor_y(self.x, self.feet(), self.z).unwrap_or(0.0);
         for (mx, mz) in [(dx, dz), (dx, 0.0), (0.0, dz)] {
             if (mx != 0.0 || mz != 0.0) && Self::free(scene, self.x + mx, self.z + mz, from).is_some() {
                 self.x += mx;
@@ -253,7 +303,7 @@ impl Walker {
                 break;
             }
         }
-        if let Some(fy) = scene.floor_y(self.x, self.z) {
+        if let Some(fy) = scene.floor_y(self.x, self.feet(), self.z) {
             self.y += (fy - EYE - self.y) * 0.35;
         }
     }
@@ -266,16 +316,18 @@ mod tests {
     /// Corridors plan their climbs, so every room should be walkable from the first.
     #[test]
     fn rooms_are_connected() {
+        // Only the layout matters here; skip sculpting the creatures.
+        crate::world::flesh::set_psx(true);
         let (mut connected, mut total) = (0, 0);
         for seed in 0..300 {
             let mut rng = Rng::new(seed);
             let scene = Scene::generate(&mut rng);
             let first = &scene.rooms[0];
-            let start = (first.x + first.w / 2, first.z + first.d / 2);
+            let start = (first.x + first.w / 2, first.z + first.d / 2, 0);
             let reach: Vec<_> = scene.reachable(start).into_iter().map(|e| e.0).collect();
             for r in &scene.rooms[1..] {
                 total += 1;
-                let inside = |c: &(i32, i32)| c.0 >= r.x && c.0 < r.x + r.w && c.1 >= r.z && c.1 < r.z + r.d;
+                let inside = |c: &Node| c.0 >= r.x && c.0 < r.x + r.w && c.1 >= r.z && c.1 < r.z + r.d;
                 connected += reach.iter().any(inside) as usize;
             }
         }

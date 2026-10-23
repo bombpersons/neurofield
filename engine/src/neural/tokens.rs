@@ -1,8 +1,8 @@
 //! Network inputs for one view: a port of `tri_tokens` and `cam_token` in
 //! train/data.py, reading the same per-triangle and per-view features that
-//! datagen writes to `tris.npy` and `views.npy`. Keep the two in step.
+//! the training data stores in `tris.npy` and `views.npy`. Keep the two in step.
 
-use datagen::TRI_FEATURES as RAW;
+use crate::neural::features::TRI_FEATURES as RAW;
 
 pub const MAX_TRIS: usize = 512;
 /// Floats per triangle token and in the camera token (data.py TRI_FEATURES, CAM_FEATURES).

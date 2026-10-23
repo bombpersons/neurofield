@@ -28,7 +28,9 @@ else:
 if not os.path.exists(os.path.expanduser("~/.cargo/bin/cargo")):
     sh("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -q")
 sh("pip install -q lpips")
-sh(f"cd {REPO}/datagen && ~/.cargo/bin/cargo build --release -q")
+# datagen draws with Bevy: it builds against udev, and needs Vulkan (lavapipe if no GPU driver has it).
+sh("apt-get -qq update && apt-get -qq install -y pkg-config libudev-dev libvulkan1 mesa-vulkan-drivers > /dev/null")
+sh(f"cd {REPO} && ~/.cargo/bin/cargo build --release -q -p training-data-gen")
 if not os.path.exists(f"{DATA}/format.json"):
-    sh(f"{REPO}/datagen/target/release/datagen gen --out {DATA} --scenes {SCENES} --views {VIEWS} --shard-scenes {SHARD} 2>&1 | tail -2")
+    sh(f"{REPO}/target/release/datagen gen --out {DATA} --scenes {SCENES} --views {VIEWS} --shard-scenes {SHARD} 2>&1 | tail -2")
 sh(f"du -sh {DATA}; ls {DATA} | head -3; ls {DATA} | wc -l")

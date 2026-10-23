@@ -2,9 +2,9 @@
 //! to the ceiling, and usually a door leaf swung open almost flat against the
 //! room wall. Doors are never closed, so they never block the walker.
 
-use crate::rng::Rng;
-use crate::scene::{rot_y, Cell, Scene, T};
-use crate::tex;
+use crate::world::rng::Rng;
+use crate::world::scene::{rot_y, Scene, T};
+use crate::world::tex;
 
 const TF: f32 = T as f32;
 /// Half the clear opening between the posts.
@@ -22,7 +22,7 @@ impl Scene {
                 for cx in r.x..r.x + r.w {
                     for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                         let (nx, nz) = (cx + dx, cz + dz);
-                        let corridor = matches!(self.cell(nx, nz), Cell::Floor { .. }) && !in_any_room(nx, nz);
+                        let corridor = !self.spans(nx, nz).is_empty() && !in_any_room(nx, nz);
                         if corridor && rng.chance(0.65) {
                             self.doorway(ri, (cx, cz), (dx, dz), rng);
                         }
@@ -41,13 +41,13 @@ impl Scene {
         let lat = [-dz, dx];
         let into = [-dx, -dz];
         let (n, room_side, far_side) = ((c.0 + d.0, c.1 + d.1), [e[0] - dx, e[1] - dz], [e[0] + dx, e[1] + dz]);
-        let (Some(fr), Some(fc)) = (self.cell_floor(c.0, c.1, room_side), self.cell_floor(n.0, n.1, far_side)) else {
+        // Generated levels have one span per column.
+        let (cn, nn) = ((c.0, c.1, 0), (n.0, n.1, 0));
+        if self.spans(c.0, c.1).is_empty() || self.spans(n.0, n.1).is_empty() {
             return;
-        };
-        let (Some(cr), Some(cc)) = (self.cell_ceiling(c.0, c.1, room_side), self.cell_ceiling(n.0, n.1, far_side))
-        else {
-            return;
-        };
+        }
+        let (fr, fc) = (self.node_floor(cn, room_side), self.node_floor(nn, far_side));
+        let (cr, cc) = (self.node_ceiling(cn, room_side), self.node_ceiling(nn, far_side));
         // y grows downward: the lower floor has the larger y, the lower ceiling too.
         let (bottom, top_floor, ceiling) = (fr.max(fc), fr.min(fc), cr.max(cc));
         let door_top = (top_floor - DOOR_H).max(ceiling + 24.0);
@@ -69,9 +69,7 @@ impl Scene {
             let c = point(0.0, (ceiling + fill_bottom) / 2.0, 0.0);
             self.add_obox(c, m, [TF / 2.0, (fill_bottom - ceiling) / 2.0, 14.0], r.wall_tex, tint);
         }
-        let w = self.w;
-        let k = |x: i32, z: i32| (z * w + x) as usize;
-        self.reserved[k(c.0, c.1)] = true;
+        self.span_mut(cn).reserved = true;
 
         // The leaf rests along the room wall beside the opening, so that wall must be there.
         let li = (-d.1, d.0);
@@ -79,7 +77,7 @@ impl Scene {
         for s in sides {
             let beside = (c.0 + li.0 * s, c.1 + li.1 * s);
             let in_room = beside.0 >= r.x && beside.0 < r.x + r.w && beside.1 >= r.z && beside.1 < r.z + r.d;
-            if !in_room || !matches!(self.cell(beside.0 + d.0, beside.1 + d.1), Cell::Solid { .. }) {
+            if !in_room || !self.spans(beside.0 + d.0, beside.1 + d.1).is_empty() {
                 continue;
             }
             let sf = s as f32;
@@ -96,7 +94,7 @@ impl Scene {
                 tex::DOOR,
                 [0.9; 3],
             );
-            self.reserved[k(beside.0, beside.1)] = true;
+            self.span_mut((beside.0, beside.1, 0)).reserved = true;
             break;
         }
     }

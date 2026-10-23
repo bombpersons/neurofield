@@ -7,8 +7,8 @@
 //! Palettes: entries 0-9 are a dark-to-light ramp of the motif's base surface,
 //! 10-15 its accents (iris, pupil, teeth, lips, ...). Vertex tint colours the lot.
 
-use crate::rng::{hash, Rng};
-use crate::tex::{fbm, Texture, SIZE};
+use crate::world::rng::{hash, Rng};
+use crate::world::tex::{fbm, Texture, SIZE};
 use std::f32::consts::TAU;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,7 +328,11 @@ fn texel(m: Motif, x: usize, y: usize, d: f32, s: u64) -> u8 {
     }
 }
 
+/// A skin of motif `m`: cut from a photo when a library is loaded (see `photo`), else drawn.
 pub fn make(m: Motif, density: f32, seed: u32) -> Texture {
+    if let Some(t) = crate::world::photo::make(m, density, seed) {
+        return t;
+    }
     let mut rng = Rng::new(seed as u64 ^ 0x5EED_5EED);
     let pal = palette(m, &mut rng);
     let s = rng.next() as u64;

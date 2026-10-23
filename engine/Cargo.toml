@@ -1,0 +1,21 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+description = "neurofield's engine: the world (dungeons, creatures, walking), its PS1-look renderer and the neural renderer"
+
+[dependencies]
+bevy.workspace = true
+psx-bevy.workspace = true
+# The GTE's fixed-point rotations, from the psx submodule (https://github.com/bombpersons/psx):
+# they define the camera convention the training views record.
+psx-gte = { path = "../external/psx/crates/psx-gte" }
+ron.workspace = true
+serde.workspace = true
+png = "0.17"
+rayon = "1"
+half = "2"
+safetensors = "0.8.0"
+wgpu = "30.0.1"
+pollster = "0.4"
+bytemuck = { version = "1.25", features = ["derive"] }

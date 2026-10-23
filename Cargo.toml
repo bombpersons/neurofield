@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["psx-bevy"]
-# The psx submodule is a workspace of its own; the rest are still standalone crates.
-exclude = ["external", "datagen", "viewer", "game"]
+members = ["psx-bevy", "engine", "training-data-gen", "game"]
+# The psx submodule is a workspace of its own.
+exclude = ["external"]
 
 # psx-bevy (the psx template's crate, see docs/template.md) inherits these.
 [workspace.package]
@@ -46,3 +46,9 @@ debug = "line-tables-only"
 opt-level = 3
 debug = false
 
+# Our own heavy lifting (level building, sculpting, relighting).
+[profile.dev.package.engine]
+opt-level = 3
+
+[profile.dev.package.training-data-gen]
+opt-level = 3

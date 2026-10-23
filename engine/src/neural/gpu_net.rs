@@ -7,9 +7,9 @@
 //! is one submission: upload the tokens, run ~150 small kernels, read back the image. The
 //! kernels take any sizes, so nothing is compiled per triangle count.
 
-use crate::net::{Dream, DREAM_DIRS, NUM_TEX, PATCHES};
-use crate::tokens::{Tokens, CAM_FEATURES, MAX_TRIS, TRI_FEATURES};
-use datagen::render::{H, W};
+use crate::neural::dream::{Dream, DREAM_DIRS, NUM_TEX, PATCHES};
+use crate::neural::tokens::{Tokens, CAM_FEATURES, MAX_TRIS, TRI_FEATURES};
+use crate::world::view::{H, W};
 use std::collections::HashMap;
 use std::path::Path;
 

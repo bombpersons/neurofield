@@ -1,11 +1,11 @@
-//! Twelve fixed 64x64 4-bit CLUT textures, generated procedurally and packed
-//! into one VRAM texture page (4 across, 3 down) at x=640: eight for the
-//! level, three for props and one for doors. Texture ids from `SKIN_BASE` on
-//! are per-scene creature skins (see `skin`), on two more pages at x=704 and 768.
+//! Twelve fixed 64x64 16-colour textures, generated procedurally and laid out
+//! as one PS1 texture page would hold them (4 across, 3 down), which is what
+//! triangles' uv coordinates count in: eight for the level, three for props
+//! and one for doors. Texture ids from `SKIN_BASE` on are per-scene creature
+//! skins (see `skin`), on pages of 16 of their own. Ids from `STRANGE_BASE` on
+//! are the level textures at higher strangeness (see `load_strange`), 16 to a page.
 
-use crate::rng::hash;
-use psx_gpu::prim::{Blend, Clut, Env, Prim, TexDepth, TexPage};
-use psx_gpu::vram::rgb8_to_rgb15;
+use crate::world::rng::hash;
 
 pub const N: usize = 12;
 pub const SCALES: u8 = 8;
@@ -15,13 +15,17 @@ pub const DOOR: u8 = 11;
 /// Rows of textures in the page.
 const ROWS: usize = N.div_ceil(4);
 pub const SIZE: usize = 64;
-const PAGE_X: u16 = 640;
-const CLUT_Y: u16 = 480;
 /// First texture id of the per-scene creature skins.
 pub const SKIN_BASE: u8 = 16;
 /// Skins one scene can hold: two pages of 16.
 pub const SKIN_SLOTS: usize = 32;
-const SKIN_PAGE_X: u16 = 704;
+/// Level textures that morph with strangeness, and the steps each is baked at
+/// (0 is the texture itself, `STRANGE_STEPS - 1` is fully strange).
+pub const STRANGE_SLOTS: usize = 8;
+pub const STRANGE_STEPS: usize = 8;
+/// First texture id of the baked strange steps: step k (1..) of slot s is
+/// `STRANGE_BASE + (k - 1) * STRANGE_SLOTS + s`.
+pub const STRANGE_BASE: u8 = 64;
 
 /// Dark and light ends of each texture's 16-step palette.
 const PALETTES: [([u8; 3], [u8; 3]); N] = [
@@ -45,33 +49,38 @@ pub struct Texture {
     pub pal: [[u8; 3]; 16],
 }
 
-pub fn page() -> TexPage {
-    TexPage::at(PAGE_X, 0, TexDepth::Clut4, Blend::Half)
-}
-
-/// The texture page holding texture `t`.
-pub fn page_of(t: u8) -> TexPage {
-    if t < SKIN_BASE {
-        page()
-    } else {
-        TexPage::at(SKIN_PAGE_X + 64 * ((t - SKIN_BASE) as u16 / 16), 0, TexDepth::Clut4, Blend::Half)
-    }
-}
-
-pub fn clut(t: u8) -> Clut {
-    if t < SKIN_BASE {
-        Clut::at(0, CLUT_Y + t as u16)
-    } else {
-        // Skin CLUTs sit beside the level's, 16 to a row.
-        let s = (t - SKIN_BASE) as u16;
-        Clut::at(16 * (1 + s % 16), CLUT_Y + s / 16)
+impl Texture {
+    /// As 64x64 RGBA8, row-major.
+    pub fn rgba(&self) -> Vec<u8> {
+        self.idx.iter().flat_map(|&i| {
+            let c = self.pal[i as usize];
+            [c[0], c[1], c[2], 255]
+        }).collect()
     }
 }
 
 /// Top-left texel of texture `t` inside its page.
 pub fn uv_origin(t: u8) -> (u8, u8) {
-    let s = if t < SKIN_BASE { t as usize } else { (t - SKIN_BASE) as usize % 16 };
+    let s = if t >= STRANGE_BASE {
+        (t - STRANGE_BASE) as usize % 16
+    } else if t >= SKIN_BASE {
+        (t - SKIN_BASE) as usize % 16
+    } else {
+        t as usize
+    };
     ((s % 4 * SIZE) as u8, (s / 4 * SIZE) as u8)
+}
+
+/// The texture to draw for level texture `t` at strangeness `s` (0..1), and how far
+/// down its page it sits relative to `t` (add it to the triangle's v coordinates).
+/// Only level slots with baked steps change, and only once `load_strange` has run.
+pub fn strange_variant(t: u8, s: f32) -> (u8, u8) {
+    let step = (s.clamp(0.0, 1.0) * (STRANGE_STEPS - 1) as f32).round() as usize;
+    if step == 0 || (t as usize) >= STRANGE_SLOTS || STRANGE.get().is_none() {
+        return (t, 0);
+    }
+    let id = STRANGE_BASE + ((step - 1) * STRANGE_SLOTS) as u8 + t;
+    (id, uv_origin(id).1 - uv_origin(t).1)
 }
 
 /// Tileable value noise over a `period`-cell lattice, 0..1.
@@ -215,9 +224,74 @@ fn texel(t: usize, x: usize, y: usize) -> f32 {
     }
 }
 
+/// Level textures from images, by slot (see `load_level`).
+static LEVEL: std::sync::OnceLock<Vec<Option<Texture>>> = std::sync::OnceLock::new();
+/// Baked strange steps 1.. of the level textures: [step - 1][slot] (see `load_strange`).
+static STRANGE: std::sync::OnceLock<Vec<Vec<Texture>>> = std::sync::OnceLock::new();
+
+/// A 256x256 RGB PNG box-filtered to 64x64 and cut to 16 colours.
+fn image_texture(path: &std::path::Path) -> Option<Texture> {
+    let rgb = crate::world::photo::read_rgb(path)?;
+    let k = 256 / SIZE;
+    let small: Vec<[f32; 3]> = (0..SIZE * SIZE)
+        .map(|i| {
+            let (x, y) = (i % SIZE * k, i / SIZE * k);
+            let mut c = [0.0; 3];
+            for dy in 0..k {
+                for dx in 0..k {
+                    let p = rgb[(y + dy) * 256 + x + dx];
+                    (0..3).for_each(|ch| c[ch] += p[ch] / (k * k) as f32);
+                }
+            }
+            c
+        })
+        .collect();
+    Some(crate::world::photo::quantise(&small))
+}
+
+/// Take level textures 0-7 from DIR/<slot>.png (256x256 RGB, seamless; see
+/// `photo/fetch_ambientcg.py`). Slots without an image keep their drawn texture.
+pub fn load_level(dir: &std::path::Path) {
+    let level: Vec<_> = (0..STRANGE_SLOTS).map(|t| image_texture(&dir.join(format!("{t}.png")))).collect();
+    eprintln!("level textures from {}: {} of 8", dir.display(), level.iter().flatten().count());
+    LEVEL.set(level).ok().expect("level textures loaded twice");
+}
+
+/// Take the level textures at every strangeness step from DIR/<step>/<slot>.png
+/// (see `photo/bake_strange.py`): step 0 is the level itself, as `load_level`.
+pub fn load_strange(dir: &std::path::Path) {
+    load_level(&dir.join("0"));
+    let steps: Vec<Vec<Texture>> = (1..STRANGE_STEPS)
+        .map(|k| {
+            (0..STRANGE_SLOTS)
+                .map(|t| {
+                    let path = dir.join(format!("{k}/{t}.png"));
+                    image_texture(&path).unwrap_or_else(|| panic!("missing {}", path.display()))
+                })
+                .collect()
+        })
+        .collect();
+    eprintln!("strange steps from {}: {}", dir.display(), steps.len());
+    STRANGE.set(steps).ok().expect("strange textures loaded twice");
+}
+
+/// Level texture `id` as drawn: one of `make_all`'s (`base`), or a strange step's
+/// (ids from `STRANGE_BASE`, see `strange_variant`). Skins are the scene's own.
+pub fn level_texture(base: &[Texture], id: u8) -> Option<&Texture> {
+    if id >= STRANGE_BASE {
+        let i = (id - STRANGE_BASE) as usize;
+        STRANGE.get()?.get(i / STRANGE_SLOTS)?.get(i % STRANGE_SLOTS)
+    } else {
+        base.get(id as usize)
+    }
+}
+
 pub fn make_all() -> Vec<Texture> {
     (0..N)
         .map(|t| {
+            if let Some(tex) = LEVEL.get().and_then(|l| l.get(t)).and_then(|t| t.as_ref()) {
+                return Texture { idx: tex.idx.clone(), pal: tex.pal };
+            }
             let (lo, hi) = PALETTES[t];
             let mut pal = [[0u8; 3]; 16];
             for (i, c) in pal.iter_mut().enumerate() {
@@ -233,50 +307,7 @@ pub fn make_all() -> Vec<Texture> {
         .collect()
 }
 
-/// GP0 uploads for the texture page and the CLUTs.
-pub fn uploads(texs: &[Texture]) -> Vec<Prim> {
-    let mut out = vec![page_upload(texs, PAGE_X)];
-    for (t, tex) in texs.iter().enumerate() {
-        out.push(clut_upload(tex, t as u8));
-    }
-    out
-}
-
-/// GP0 uploads for a scene's creature skins (at most `SKIN_SLOTS`).
-pub fn skin_uploads(skins: &[Texture]) -> Vec<Prim> {
-    let mut out: Vec<Prim> =
-        skins.chunks(16).enumerate().map(|(p, page)| page_upload(page, SKIN_PAGE_X + 64 * p as u16)).collect();
-    for (s, tex) in skins.iter().enumerate() {
-        out.push(clut_upload(tex, SKIN_BASE + s as u8));
-    }
-    out
-}
-
-/// Up to 16 textures packed 4 across into one 4-bit page at VRAM x.
-fn page_upload(texs: &[Texture], x: u16) -> Prim {
-    // The page region is 256 texels wide = 64 halfwords (4 texels each).
-    let (w, h) = (64usize, texs.len().div_ceil(4) * SIZE);
-    let mut page = vec![0u16; w * h];
-    for (t, tex) in texs.iter().enumerate() {
-        let (u0, v0) = uv_origin(t as u8);
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let (u, v) = (u0 as usize + x, v0 as usize + y);
-                page[v * w + u / 4] |= (tex.idx[y * SIZE + x] as u16) << ((u % 4) * 4);
-            }
-        }
-    }
-    Prim::Env(Env::Upload { x, y: 0, w: w as u16, h: h as u16, data: page })
-}
-
-fn clut_upload(tex: &Texture, t: u8) -> Prim {
-    // 0x0000 is transparent on the PS1, so nudge pure black off it.
-    let data = tex.pal.iter().map(|&[r, g, b]| rgb8_to_rgb15(r, g, b).max(0x0421)).collect();
-    let c = clut(t).0;
-    Prim::Env(Env::Upload { x: (c & 0x3F) * 16, y: c >> 6, w: 16, h: 1, data })
-}
-
-/// RGB8 atlas of all textures (256 wide), laid out as in VRAM.
+/// RGB8 atlas of all textures (256 wide), laid out as on their page.
 pub fn atlas_rgb(texs: &[Texture]) -> (u32, u32, Vec<u8>) {
     let (w, h) = (4 * SIZE, ROWS * SIZE);
     let mut out = vec![0u8; w * h * 3];

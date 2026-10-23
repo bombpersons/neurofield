@@ -9,10 +9,10 @@
 //! it joins its parent and +y its far end, like a hanging limb. A creature's
 //! own frame faces +z.
 
-use crate::rng::Rng;
-use crate::scene::{apply, dot, mul, norm, rot_x, rot_y, rot_z, Scene, Tri, Vert, M3, T};
-use crate::skin::{self, Motif};
-use crate::tex;
+use crate::world::rng::Rng;
+use crate::world::scene::{apply, dot, mul, norm, rot_x, rot_y, rot_z, Scene, Tri, Vert, M3, T};
+use crate::world::skin::{self, Motif};
+use crate::world::tex;
 use std::cell::RefCell;
 use std::f32::consts::{PI, TAU};
 
@@ -148,7 +148,7 @@ impl Part {
     }
 
     /// Radius along the axis (1 = `half`) at t in -1..1, before lumps. Every shape closes at both ends.
-    fn profile(&self, t: f32) -> f32 {
+    pub(crate) fn profile(&self, t: f32) -> f32 {
         // Rounds an end off over the last `k` of the length.
         let cap = |e: f32, k: f32| (e / k).clamp(0.0, 1.0).sqrt();
         let r = match self.shape {
@@ -167,6 +167,11 @@ impl Part {
             }
         };
         r * (1.0 + (self.taper - 1.0) * (t + 1.0) / 2.0) * (1.0 + self.bulge * (1.0 - t * t))
+    }
+
+    /// The largest radius `profile` reaches.
+    pub(crate) fn widest(&self) -> f32 {
+        (0..=32).map(|k| self.profile(k as f32 / 16.0 - 1.0)).fold(1e-3, f32::max)
     }
 
     /// Point at `t` along the axis and angle `a` (radians) around it, `out` of the
@@ -200,7 +205,7 @@ impl Part {
     }
 
     /// Smooth bumps in -1..1, periodic around the axis.
-    fn lump_waves(&self) -> [[f32; 4]; 3] {
+    pub(crate) fn lump_waves(&self) -> [[f32; 4]; 3] {
         let mut rng = Rng::new(self.seed as u64);
         [0; 3].map(|_| [rng.range(1, 6) as f32, rng.fr(1.0, 4.0), rng.fr(0.0, TAU), rng.fr(0.0, TAU)])
     }
@@ -219,6 +224,16 @@ impl Part {
         }
         (lo, hi)
     }
+}
+
+/// The body plans a creature can grow from, numbered as the generator rolls them (0..20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Kind {
+    Humanoid = 0,
+    Beast = 6,
+    Blob = 9,
+    Floater = 11,
+    Mass = 13,
 }
 
 pub struct Creature {
@@ -295,14 +310,17 @@ impl Creature {
 
     /// Shrink to fit within `max_r` of the base and below `ceiling`, then stand on
     /// `floor` (grounded) or just keep out of it.
+    /// How far the creature reaches from its base in x/z, and its top and bottom y.
+    pub fn extent(&self) -> (f32, f32, f32) {
+        let pts = self.samples();
+        let r = pts.iter().map(|p| (p[0] - self.base[0]).hypot(p[2] - self.base[2])).fold(0.0, f32::max);
+        let top = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+        let bottom = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+        (r, top, bottom)
+    }
+
     fn fit(&mut self, floor: f32, ceiling: f32, max_r: f32, grounded: bool) {
-        let extent = |c: &Creature| {
-            let pts = c.samples();
-            let r = pts.iter().map(|p| (p[0] - c.base[0]).hypot(p[2] - c.base[2])).fold(0.0, f32::max);
-            let top = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
-            let bottom = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
-            (r, top, bottom)
-        };
+        let extent = Creature::extent;
         let (r, top, bottom) = extent(self);
         let room = floor - ceiling - 24.0;
         let k = (max_r / r).min(room / (bottom - top)).min(1.0);
@@ -694,51 +712,78 @@ impl Scene {
                 }
                 let base = [(cx as f32 + rng.fr(0.4, 0.6)) * TF, r.floor as f32, (cz as f32 + rng.fr(0.4, 0.6)) * TF];
                 let clearance = if self.outdoor { 6.0 * TF } else { r.height as f32 * TF };
-                let c = Creature { base, yaw: rng.fr(0.0, TAU), skins: Vec::new(), parts: Vec::new(), slots: Vec::new() };
-                let mut g = Grow { c, rng: RefCell::new(rng.clone()) };
-                let kind = g.range(0, 20);
-                let grounded = match kind {
-                    0..=5 => {
-                        let h = if g.chance(0.15) { g.fr(1.4, 1.9) } else { g.fr(0.75, 1.1) } * TF;
-                        g.humanoid(h.min(clearance - 30.0));
-                        true
-                    }
-                    6..=8 => {
-                        let len = g.fr(0.55, 0.85) * TF;
-                        g.beast(len);
-                        true
-                    }
-                    9..=10 => {
-                        let r = g.fr(0.25, 0.42) * TF;
-                        g.blob(r);
-                        true
-                    }
-                    11..=12 => {
-                        let (r, lift) = (g.fr(0.15, 0.28) * TF, g.fr(0.8, 1.4) * TF);
-                        g.floater(r, lift);
-                        false
-                    }
-                    _ => {
-                        let size = g.fr(0.18, 0.32) * TF;
-                        g.mass(size);
-                        true
-                    }
-                };
-                // Most also grow something they shouldn't.
-                if kind <= 10 && g.chance(0.6) {
-                    for _ in 0..g.range(1, 6) {
-                        let p = g.pick_part();
-                        g.sprout(p, 1);
-                    }
-                }
-                *rng = g.rng.into_inner();
-                let mut c = g.c;
-                c.fit(r.floor as f32, r.floor as f32 - clearance, 0.95 * TF, grounded);
-                c.slots = c.skins.iter().map(|s| self.skin_slot(s)).collect();
-                self.mesh_creature(&c);
-                self.creatures.push(c);
+                self.grow_creature(rng, base, clearance, None, 1.0, None);
             }
         }
+    }
+
+    /// Grow a creature standing on the floor at `base` under `clearance` of headroom,
+    /// mesh it and add it: of `kind` (or a random one), `scale` times its usual size.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn grow_creature(
+        &mut self,
+        rng: &mut Rng,
+        base: [f32; 3],
+        clearance: f32,
+        kind: Option<Kind>,
+        scale: f32,
+        yaw: Option<f32>,
+    ) {
+        let floor = base[1];
+        let yaw = match yaw {
+            Some(y) => y,
+            None => rng.fr(0.0, TAU),
+        };
+        let c = Creature { base, yaw, skins: Vec::new(), parts: Vec::new(), slots: Vec::new() };
+        let mut g = Grow { c, rng: RefCell::new(rng.clone()) };
+        let kind = match kind {
+            Some(k) => k as i32,
+            None => g.range(0, 20),
+        };
+        let grounded = match kind {
+            0..=5 => {
+                let h = if g.chance(0.15) { g.fr(1.4, 1.9) } else { g.fr(0.75, 1.1) } * TF;
+                g.humanoid(h.min(clearance - 30.0));
+                true
+            }
+            6..=8 => {
+                let len = g.fr(0.55, 0.85) * TF;
+                g.beast(len);
+                true
+            }
+            9..=10 => {
+                let r = g.fr(0.25, 0.42) * TF;
+                g.blob(r);
+                true
+            }
+            11..=12 => {
+                let (r, lift) = (g.fr(0.15, 0.28) * TF, g.fr(0.8, 1.4) * TF);
+                g.floater(r, lift);
+                false
+            }
+            _ => {
+                let size = g.fr(0.18, 0.32) * TF;
+                g.mass(size);
+                true
+            }
+        };
+        // Most also grow something they shouldn't.
+        if kind <= 10 && g.chance(0.6) {
+            for _ in 0..g.range(1, 6) {
+                let p = g.pick_part();
+                g.sprout(p, 1);
+            }
+        }
+        *rng = g.rng.into_inner();
+        let mut c = g.c;
+        if scale != 1.0 {
+            c.rescale(scale);
+        }
+        c.fit(floor, floor - clearance, 0.95 * TF * scale.max(1.0), grounded);
+        // The full-colour pass has skins of its own; PS1 ones are only for the PS1 pass.
+        c.slots = if crate::world::flesh::enabled() { vec![0; c.skins.len()] } else { c.skins.iter().map(|s| self.skin_slot(s)).collect() };
+        self.mesh_creature(&c);
+        self.creatures.push(c);
     }
 
     /// Texture id for a creature skin: a fresh slot while there are any, else the
@@ -754,16 +799,41 @@ impl Scene {
         tex::SKIN_BASE + best.unwrap_or(0) as u8
     }
 
+    /// The creature's meshes: through the PS1 pipeline, or for the full-colour pass
+    /// as one sculpted surface (see `sculpt`) plus whatever parts are too thin for it.
     fn mesh_creature(&mut self, c: &Creature) {
-        for (p, at) in c.parts.iter().zip(c.pose()) {
-            let skin = c.skins[p.skin];
-            self.mesh_part(p, &at, &skin, c.slots[p.skin]);
+        let placed = c.pose();
+        if !crate::world::flesh::enabled() {
+            for (p, at) in c.parts.iter().zip(&placed) {
+                self.mesh_part(p, at, &c.skins[p.skin], c.slots[p.skin], None);
+            }
+            return;
+        }
+        let base = self.flesh.skins.len();
+        for s in &c.skins {
+            self.flesh.skins.push(crate::world::flesh::Skin::make(s.motif, s.density, s.seed, s.tint));
+        }
+        let skins: Vec<u16> = c.parts.iter().map(|p| (base + p.skin) as u16).collect();
+        let lights: Vec<u16> = placed
+            .iter()
+            .map(|at| {
+                self.flesh.lights.push(self.light_sh(at.centre));
+                self.flesh.light_at.push(at.centre);
+                (self.flesh.lights.len() - 1) as u16
+            })
+            .collect();
+        let (tris, thin) = crate::world::sculpt::mesh(c, &placed, &skins, &lights);
+        self.flesh.tris.extend(tris);
+        for i in thin {
+            let p = &c.parts[i];
+            self.mesh_part(p, &placed[i], &c.skins[p.skin], 0, Some((skins[i], lights[i])));
         }
     }
 
     /// A dense latitude-longitude mesh of one part, smooth-shaded, its skin
-    /// repeated a whole number of times around and along.
-    fn mesh_part(&mut self, p: &Part, at: &Placed, skin: &Skin, tex: u8) {
+    /// repeated a whole number of times around and along: for the PS1 pass, or with
+    /// `full` (a full-colour skin and light index) for the full-colour one.
+    fn mesh_part(&mut self, p: &Part, at: &Placed, skin: &Skin, tex: u8, full: Option<(u16, u16)>) {
         let circ = PI * (p.half[0] + p.half[2]) * (1.0 + p.bulge) * p.taper.max(1.0);
         let len = 2.0 * p.half[1] * (1.0 + 0.5 * p.bend.abs());
         let reps = |l: f32| (l / skin.scale).round().clamp(1.0, 8.0) as usize;
@@ -785,10 +855,14 @@ impl Scene {
         let at_grid = |k: usize, j: usize| pos[k * (na + 1) + j % na];
         let yaxis = [at.axes[0][1], at.axes[1][1], at.axes[2][1]];
         let mut nrm = Vec::with_capacity(pos.len());
+        // Directions of increasing u (around) and v (along), for normal maps; zero at the poles.
+        let mut tan = Vec::with_capacity(pos.len());
         for k in 0..=nl {
             let t = k as f32 / nl as f32 * 2.0 - 1.0;
             let mid = at.world(p.axis(t));
             for j in 0..=na {
+                let (da, dt) = (sub(at_grid(k, j + 1), at_grid(k, j + na - 1)), sub(at_grid((k + 1).min(nl), j), at_grid(k.max(1) - 1, j)));
+                tan.push((if dot(da, da) > 1e-9 { norm(da) } else { [0.0; 3] }, if dot(dt, dt) > 1e-9 { norm(dt) } else { [0.0; 3] }));
                 let n = if k == 0 {
                     scale(yaxis, -1.0)
                 } else if k == nl {
@@ -809,6 +883,8 @@ impl Scene {
             }
         }
 
+        let widest = p.widest();
+        let cap_axes = [0, 2].map(|c| [at.axes[0][c], at.axes[1][c], at.axes[2][c]]);
         let (u0, v0) = tex::uv_origin(tex);
         let alb = skin.tint.map(|c| (c * 128.0).clamp(0.0, 255.0) as u8);
         let coord = |i: usize, sub: usize| (63 * i / sub) as u8;
@@ -818,8 +894,35 @@ impl Scene {
                 let (ua, ub) = (coord(j % sa, sa), coord(j % sa + 1, sa));
                 let v = |kk: usize, jj: usize, uv: [u8; 2]| (kk * (na + 1) + jj, [u0 + uv[0], v0 + uv[1]]);
                 let quad = [v(k, j, [ua, va]), v(k, j + 1, [ub, va]), v(k + 1, j, [ua, vb]), v(k + 1, j + 1, [ub, vb])];
-                for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
-                    self.creature_tri([quad[a], quad[b], quad[c]], &pos, &nrm, tex, skin.tint, alb);
+                if full.is_none() {
+                    for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
+                        self.creature_tri([quad[a], quad[b], quad[c]], &pos, &nrm, tex, skin.tint, alb);
+                    }
+                }
+                if let Some((skin_id, light)) = full {
+                    let fv = |kk: usize, jj: usize| {
+                        let i = kk * (na + 1) + jj;
+                        let g = kk * (na + 1) + jj % na;
+                        let uv = [jj as f32 / sa as f32, kk as f32 / sl as f32];
+                        let t = kk as f32 / nl as f32 * 2.0 - 1.0;
+                        let l = p.local(t, jj as f32 / na as f32 * TAU, 1.0);
+                        let cap = [l[0] / skin.scale, l[2] / skin.scale];
+                        let wrap = crate::world::flesh::wrap_weight(p.profile(t) / widest);
+                        crate::world::flesh::Vertex {
+                            p: pos[g],
+                            n: nrm[i],
+                            w: 1.0,
+                            uv: [uv; 2],
+                            t: [tan[i].0; 2],
+                            b: [tan[i].1; 2],
+                            cap: [cap; 2],
+                            wrap: [wrap; 2],
+                        }
+                    };
+                    let q = [fv(k, j), fv(k, j + 1), fv(k + 1, j), fv(k + 1, j + 1)];
+                    for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
+                        self.flesh.tris.push(crate::world::flesh::Tri { v: [q[a], q[b], q[c]], skin: [skin_id; 2], light: [light; 2], cap_axes: [cap_axes; 2] });
+                    }
                 }
             }
         }
@@ -838,6 +941,6 @@ impl Scene {
         if dot(cr, n_sum) < 0.0 {
             verts.swap(1, 2);
         }
-        self.creature_tris.push(Tri { v: verts, tex });
+        self.creature_tris.push(Tri { v: verts, tex, n: norm(n_sum), tint });
     }
 }

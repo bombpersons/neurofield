@@ -5,9 +5,9 @@
 //! of them can be on at once: texture mixes multiply, attention temperatures
 //! multiply and query pushes add up.
 
-use crate::net::{Dream, NUM_TEX};
-use crate::tokens::{Tokens, TRI_FEATURES};
-use datagen::TRI_FEATURES as RAW;
+use crate::neural::dream::{Dream, NUM_TEX};
+use crate::neural::tokens::{Tokens, TRI_FEATURES};
+use crate::neural::features::TRI_FEATURES as RAW;
 use std::f32::consts::TAU;
 
 pub const EFFECTS: [&str; 12] = [
@@ -25,39 +25,8 @@ pub const EFFECTS: [&str; 12] = [
     "colour drift",
 ];
 
-/// The effects in the viewer's "dream" choice: morph, waves, smear and forgetting together.
+/// The "dream" set: morph, waves, smear and forgetting together.
 pub const DREAM: [usize; 4] = [0, 3, 4, 5];
-
-/// Whether effect `e` reaches inside the network (needs a model exported with the dream inputs).
-pub fn needs_dream_inputs(e: usize) -> bool {
-    matches!(e, 0 | 1 | 2 | 5 | 6 | 7)
-}
-
-/// The viewer's F/G choices: none, each effect alone, then the dream set.
-pub const CHOICES: usize = EFFECTS.len() + 2;
-
-pub fn choice_name(c: usize) -> &'static str {
-    match c {
-        0 => "none",
-        c if c <= EFFECTS.len() => EFFECTS[c - 1],
-        _ => "dream (morph + forgetting + waves + smear)",
-    }
-}
-
-/// The effects on for choice `c`, each at `t` seconds.
-pub fn choice_times(c: usize, t: f32) -> [Option<f32>; EFFECTS.len()] {
-    let mut times = [None; EFFECTS.len()];
-    match c {
-        0 => {}
-        c if c <= EFFECTS.len() => times[c - 1] = Some(t),
-        _ => DREAM.iter().for_each(|&e| times[e] = Some(t)),
-    }
-    times
-}
-
-pub fn choice_needs_dream_inputs(c: usize) -> bool {
-    choice_times(c, 0.0).iter().enumerate().any(|(e, t)| t.is_some() && needs_dream_inputs(e))
-}
 
 /// A hash of (a, b) to -1..1.
 fn hash(a: u64, b: u64) -> f32 {
@@ -139,9 +108,11 @@ pub fn apply_set(times: &[Option<f32>; EFFECTS.len()], tok: &mut Tokens, tris: &
     dream
 }
 
-/// One choice of the viewer's (see `choice_times`) at `t` seconds.
+/// Effect `e` alone at `t` seconds.
 pub fn apply(choice: usize, t: f32, tok: &mut Tokens, tris: &[f32]) -> Dream {
-    apply_set(&choice_times(choice, t), tok, tris)
+    let mut times = [None; EFFECTS.len()];
+    times[choice] = Some(t);
+    apply_set(&times, tok, tris)
 }
 
 fn apply_one(e: usize, t: f32, tok: &mut Tokens, tris: &[f32], dream: &mut Dream) {

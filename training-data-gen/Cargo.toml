@@ -1,0 +1,14 @@
+[package]
+name = "training-data-gen"
+version = "0.1.0"
+edition = "2021"
+description = "Training data for the neural renderer: views of the engine's worlds, drawn by its renderer without a window (the `datagen` command)"
+
+[[bin]]
+name = "datagen"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+png = "0.17"
+rayon = "1"

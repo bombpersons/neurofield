@@ -31,7 +31,7 @@ def fourier(x, bands):
 def biased_attention(attn, x, mem, bias, temp=1.0):
     """`attn` (an nn.MultiheadAttention, for its weights) from x to mem, with `bias`
     [b, heads, queries, keys] added to the scores, softmax at temperature `temp`. Done by
-    hand because the module's own path with a per-head float mask does not export to ONNX."""
+    hand, step by step as the WGSL network (engine/src/neural/gpu_net.wgsl) does it."""
     heads = attn.num_heads
     wq, wk, wv = attn.in_proj_weight.chunk(3)
     bq, bk, bv = attn.in_proj_bias.chunk(3)
@@ -87,7 +87,7 @@ class Renderer(nn.Module):
         self.decoder = nn.ModuleList([Block(d, heads, True) for _ in range(dec_layers)])
         # How strongly each decoder layer's heads prefer covering triangles; zero = no preference.
         self.cover = nn.Parameter(torch.zeros(dec_layers, heads))
-        # Fixed directions for the viewer's dream effects to push patch queries along.
+        # Fixed directions for the dream effects (engine::neural::effects) to push patch queries along.
         noise_dirs = torch.randn(DREAM_DIRS, d, generator=torch.Generator().manual_seed(0)) / math.sqrt(DREAM_DIRS)
         self.register_buffer("noise_dirs", noise_dirs, persistent=False)
         self.out_norm = nn.LayerNorm(d)
@@ -97,7 +97,7 @@ class Renderer(nn.Module):
         )
 
     def forward(self, feats, tex, pad, cams, tex_mix=None, temp=None, q_noise=None):
-        """The optional inputs are for disturbing a trained model (the viewer's dream effects):
+        """The optional inputs are for disturbing a trained model (the game's dream effects):
         `tex_mix` [NUM_TEX, NUM_TEX] mixes texture embeddings (identity: none), `temp` [1]
         is the cross-attention temperature (1: none), and `q_noise` [patches, DREAM_DIRS]
         pushes each patch query along fixed random directions (zeros: none)."""

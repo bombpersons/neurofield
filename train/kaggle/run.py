@@ -41,8 +41,10 @@ sh(f"git clone -q --recurse-submodules https://github.com/bombpersons/neurofield
 sh(f"cd {REPO} && git log --oneline -1")
 sh("pip install -q lpips")
 sh("curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -q")
-sh(f"cd {REPO}/datagen && ~/.cargo/bin/cargo build --release -q")
-sh(f"{REPO}/datagen/target/release/datagen gen --out {DATA} --scenes {SCENES} --views {VIEWS} --shard-scenes {SHARD} --seed {SEED} 2>&1 | tail -2")
+# datagen draws with Bevy: it builds against udev, and needs Vulkan (lavapipe if no GPU driver has it).
+sh("apt-get -qq update && apt-get -qq install -y pkg-config libudev-dev libvulkan1 mesa-vulkan-drivers > /dev/null")
+sh(f"cd {REPO} && ~/.cargo/bin/cargo build --release -q -p training-data-gen")
+sh(f"{REPO}/target/release/datagen gen --out {DATA} --scenes {SCENES} --views {VIEWS} --shard-scenes {SHARD} --seed {SEED} 2>&1 | tail -2")
 
 os.makedirs(OUT, exist_ok=True)
 ckpts = glob.glob("/kaggle/input/**/ckpt.pt", recursive=True)

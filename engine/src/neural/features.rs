@@ -1,38 +1,16 @@
-//! Procedural PS1-style levels, a first-person walker and the PS1 rasteriser,
-//! shared by the `datagen` binary and the realtime viewer.
+//! What the network is told about a scene and a view, as floats: per level
+//! triangle, per creature part and per view. The training data stores exactly
+//! these (`tris.npy`, `parts.npy`, `views.npy`; see `FORMAT` in
+//! training-data-gen) and `tokens` builds the network's inputs from them.
 
-pub mod creature;
-pub mod door;
-pub mod npy;
-pub mod render;
-pub mod rng;
-pub mod scene;
-pub mod skin;
-pub mod tex;
-pub mod walker;
-
-use rng::Rng;
-use scene::{Camera, Scene, T};
-use walker::Walker;
+use crate::world::scene::{Camera, Scene, T};
+use crate::world::{tex, view};
 
 /// Floats per triangle in `tris.npy`, per creature part in `parts.npy` and per
-/// view in `views.npy` (see `FORMAT` in main.rs).
-pub const TRI_FEATURES: usize = 34;
+/// view in `views.npy`.
+pub const TRI_FEATURES: usize = 35;
 pub const PART_FEATURES: usize = 49;
-pub const VIEW_FEATURES: usize = 23;
-
-/// A level the first-person walker can move around in, and the walker.
-pub fn walkable_scene(rng: &mut Rng, min_cells: usize) -> (Scene, Walker) {
-    loop {
-        let scene = Scene::generate(rng);
-        if scene.floor_cells().len() < min_cells {
-            continue;
-        }
-        if let Some(w) = Walker::new(&scene, rng) {
-            return (scene, w);
-        }
-    }
-}
+pub const VIEW_FEATURES: usize = 26;
 
 /// Per-triangle features as written to `tris.npy`, appended to `out`.
 pub fn tri_features(scene: &Scene, out: &mut Vec<f32>) {
@@ -52,6 +30,8 @@ pub fn tri_features(scene: &Scene, out: &mut Vec<f32>) {
         for v in &t.v {
             out.extend(v.alb.map(|c| c as f32 / 255.0));
         }
+        let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
+        out.push(scene.strangeness(centre));
     }
 }
 
@@ -73,14 +53,7 @@ pub fn part_features(scene: &Scene, out: &mut Vec<f32>) {
             out.extend([skin.motif as u8 as f32, skin.density, skin.scale / T as f32]);
             out.extend(skin.tint);
             // Baked light at the centre as linear spherical harmonics: mean, then gradient along x, y, z.
-            let centre = at.centre.map(|x| x.round() as i32);
-            let light = |n: [f32; 3]| scene.shade(centre, n, [1.0; 3]).map(|c| c as f32 / 128.0);
-            let axis = |k: usize, s: f32| [0, 1, 2].map(|c| if c == k { s } else { 0.0 });
-            let pairs: Vec<_> = (0..3).map(|k| (light(axis(k, 1.0)), light(axis(k, -1.0)))).collect();
-            out.extend((0..3).map(|ch| pairs.iter().map(|(a, b)| a[ch] + b[ch]).sum::<f32>() / 6.0));
-            for (a, b) in &pairs {
-                out.extend((0..3).map(|ch| (a[ch] - b[ch]) / 2.0));
-            }
+            out.extend(scene.light_sh(at.centre).iter().flatten());
             out.push(p.parent.map_or(-1.0, |i| (first + i) as f32));
             out.push(ci as f32);
         }
@@ -89,10 +62,10 @@ pub fn part_features(scene: &Scene, out: &mut Vec<f32>) {
 }
 
 /// Per-view features as written to `views.npy`, appended to `out`.
-pub fn view_features(scene_index: usize, cam: &Camera, out: &mut Vec<f32>) {
+pub fn view_features(scene: &Scene, scene_index: usize, cam: &Camera, out: &mut Vec<f32>) {
     out.push(scene_index as f32);
     out.extend(cam.pos.map(|c| c as f32 / T as f32));
-    let m = render::view_matrix(cam);
+    let m = view::view_matrix(cam);
     out.extend(m.m.iter().flatten().map(|&e| e as f32 / 4096.0));
     out.push(cam.h as f32);
     out.push(cam.fog_near as f32 / T as f32);
@@ -100,4 +73,5 @@ pub fn view_features(scene_index: usize, cam: &Camera, out: &mut Vec<f32>) {
     out.extend([cam.yaw, cam.pitch, cam.roll].map(|a| a as f32 / 4096.0));
     out.extend(cam.torch);
     out.push(cam.torch_radius as f32 / T as f32);
+    out.extend(scene.fog_colour(cam.pos));
 }

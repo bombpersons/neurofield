@@ -1,4 +1,4 @@
-"""Export a checkpoint's weights for the viewer's GPU renderer (viewer/src/gpu_net.rs).
+"""Export a checkpoint's weights for the neural renderer (engine/src/neural/gpu_net.rs).
 
     .venv/bin/python train/export_weights.py --ckpt runs/x/ckpt.pt --out runs/x/model.safetensors
 

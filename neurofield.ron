@@ -1,0 +1,14 @@
+// Where the game, viewer and editor find their data. Paths are relative to this
+// file; command-line options of the same name override them.
+Config(
+    // The exported network (./model.sh exports the newest checkpoint, or downloads
+    // the latest release). A .safetensors export, run on the GPU.
+    model: Some("runs/model.safetensors"),
+    // Creature skins: DIR/<motif>/*.png.
+    photos: Some("data/skins_gen"),
+    // Level textures at every strangeness step: DIR/<step>/<slot>.png.
+    strange: Some("data/strange"),
+    // Level textures alone (DIR/<slot>.png), used when `strange` is None.
+    level_textures: None,
+    levels: Some("levels"),
+)
