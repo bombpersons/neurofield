@@ -98,6 +98,8 @@ pub struct Ui {
     pub(crate) panels: Vec<(Tab, egui::Rect)>,
     /// The whole window in egui points, which the 3D view fills.
     pub(crate) screen: Option<egui::Rect>,
+    /// The agent server and its window (Tools > Agents).
+    pub(crate) agents: crate::mcp::Agents,
 }
 
 pub(crate) struct PlanView {
@@ -109,7 +111,8 @@ pub(crate) struct PlanView {
 }
 
 impl Ui {
-    pub fn new(settings: Settings, config: Config) -> Ui {
+    pub fn new(mut settings: Settings, config: Config) -> Ui {
+        let agents = crate::mcp::Agents::new(&mut settings);
         Ui {
             settings,
             config,
@@ -130,6 +133,7 @@ impl Ui {
             filter: String::new(),
             panels: Vec::new(),
             screen: None,
+            agents,
         }
     }
 
@@ -232,6 +236,7 @@ pub fn draw(
     input.hovered = hovered && !ctx.layer_id_at(ctx.pointer_hover_pos().unwrap_or_default()).is_some_and(|l| l.order != egui::Order::Background);
     input.typing = ctx.egui_wants_keyboard_input();
 
+    crate::mcp::agents_window(&ctx, s);
     dialogs(&ctx, s, doc, &mut exit);
     doc.settle(!ctx.egui_is_using_pointer() && !ctx.egui_wants_keyboard_input() && !s.tools.busy());
 
@@ -606,6 +611,10 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
                     s.tools.set_tool(t, doc);
                 }
             }
+            ui.separator();
+            if ui.button("Agents…").on_hover_text("Let AI agents connect and help build the level").clicked() {
+                s.agents.window = true;
+            }
         });
         ui.menu_button("Play", |ui| {
             if ui.add(egui::Button::new("Play").shortcut_text("F5")).clicked() {
@@ -621,6 +630,15 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             }
             if ui.button("▶ Play").on_hover_text("Play from the player start (F5)").clicked() {
                 play(s, doc, None);
+            }
+            if s.agents.listening.is_some() {
+                let (text, hint) = match s.agents.active() {
+                    true => (RichText::new("• Agent at work").color(Color32::from_rgb(120, 220, 120)), "An agent is working on the level"),
+                    false => (RichText::new("• Agents on"), "Agents can connect (Tools > Agents)"),
+                };
+                if ui.add(egui::Button::new(text).frame(false)).on_hover_text(hint).clicked() {
+                    s.agents.window = true;
+                }
             }
         });
     });

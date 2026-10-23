@@ -8,8 +8,8 @@
 //! Wheel: dolly   F: frame the selection   PgUp/PgDn: move the height slice
 //! Tools (V R P C S): see `tools`; Esc or the right button cancels a drag.
 //!
-//! `--mcp` serves the editor's MCP on stdio, `--mcp-listen 127.0.0.1:7801` over HTTP
-//! (with `--mcp-token`, or a token printed at startup); see `mcp`. `--headless` runs
+//! `--mcp` serves the editor's MCP on stdio; Tools > Agents (or `--mcp-listen
+//! 127.0.0.1:7801`, `--mcp-token`) serves it over HTTP; see `mcp`. `--headless` runs
 //! without an OS window (`--size 1280x800`), and `--software` picks a software
 //! renderer. Developer builds (`--features dev-mcp`) add testing tools on stdio.
 
@@ -67,9 +67,16 @@ fn main() {
     // Agents that start the editor themselves get the defaults and leave the
     // person's settings alone.
     let settings = if mcp { settings::Settings { persist: false, ..default() } } else { settings::Settings::load() };
-    let listen = opts.get("mcp-listen").map(|a| a.parse::<std::net::SocketAddr>().expect("--mcp-listen 127.0.0.1:PORT"));
-    let token = opts.get("mcp-token").cloned();
-    let file = file.or_else(|| settings.recent.first().cloned().filter(|p| p.is_file()));
+    let mut ui = ui::Ui::new(settings, config);
+    // The agent server's address and token from the command line, for this run.
+    if let Some(addr) = opts.get("mcp-listen") {
+        ui.agents.addr = addr.parse().expect("--mcp-listen 127.0.0.1:PORT");
+        ui.agents.on = true;
+    }
+    if let Some(token) = opts.get("mcp-token") {
+        ui.agents.token = token.clone();
+    }
+    let file = file.or_else(|| ui.settings.recent.first().cloned().filter(|p| p.is_file()));
     let doc = match &file {
         Some(f) => doc::Doc::open(f).unwrap_or_else(|e| {
             eprintln!("{e}");
@@ -116,7 +123,7 @@ fn main() {
     .add_plugins(engine::render::LevelGfxPlugin)
     .add_plugins(EguiPlugin::default())
     .insert_resource(Document(doc))
-    .insert_resource(ui::Ui::new(settings, config))
+    .insert_resource(ui)
     .insert_resource(ViewInput::default())
     .insert_resource(cam)
     .insert_resource(Built {
@@ -156,9 +163,7 @@ fn main() {
     );
     // egui draws on the window at full resolution, not into the PS1 screen.
     app.world_mut().resource_mut::<EguiGlobalSettings>().auto_create_primary_context = false;
-    if mcp || listen.is_some() {
-        app.add_plugins(mcp::EditorMcpPlugin { stdio: mcp, listen, token, headless });
-    }
+    app.add_plugins(mcp::EditorMcpPlugin { stdio: mcp, headless });
     let atlas = view3d::atlas_image(&textures);
     let atlas = app.world_mut().resource_mut::<Assets<Image>>().add(atlas);
     app.insert_resource(Atlas(atlas));

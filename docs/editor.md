@@ -445,18 +445,29 @@ someone build theirs. Two transports serve the same tools:
 ```bash
 # An agent starts the editor itself and talks over stdio (stdout carries nothing else).
 cargo run -p editor -- --mcp --headless --software --size 1280x800
-# An agent joins an editor someone has open, over HTTP.
+# An agent joins an editor someone has open, over HTTP (or Tools > Agents).
 cargo run -p editor -- --mcp-listen 127.0.0.1:7801 levels/demo.ron
 ```
 
 `--headless` runs without an OS window: the window is only a size and the editor
-draws into an image. Over HTTP only local addresses are served, and every request
-needs `Authorization: Bearer <token>`. The token is printed at startup, or set with
-`--mcp-token`. To add it to Claude Code:
+draws into an image.
+
+To let an agent into an editor you have open, use **Tools > Agents** and tick
+*Let agents connect*. The window shows the address, the token and the command
+that adds the editor to Claude Code, each with a Copy button:
 
 ```bash
 claude mcp add --transport http neurofield-editor http://127.0.0.1:7801/mcp --header "Authorization: Bearer TOKEN"
 ```
+
+Only this computer can connect, and every request needs that bearer token. The
+port, the token and whether the server is on are kept in the editor's settings,
+so the command keeps working from one session to the next; *New* makes a fresh
+token and disconnects agents holding the old one. While the server is on, the
+menu bar shows *• Agents on*, and *• Agent at work* in green when an agent has
+asked something in the last few seconds; click it to open the window.
+`--mcp-listen` and `--mcp-token` switch it on with that address and token for
+one run without changing the settings.
 
 Runs started with `--mcp` begin from the default layout, open the demo level
 unless given a file, and never save the person's settings.

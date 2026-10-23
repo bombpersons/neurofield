@@ -155,7 +155,7 @@ cargo run -p editor -- levels/demo.ron
 
 Agents can build levels through the editor's MCP, on stdio (`--mcp`, with
 `--headless` for no window) or over HTTP to an editor already open
-(`--mcp-listen 127.0.0.1:7801`); see docs/editor.md, MCP.
+(Tools > Agents, or `--mcp-listen 127.0.0.1:7801`); see docs/editor.md, MCP.
 
 The psx crates come from a git submodule pinned to a known commit, so clone with:
 

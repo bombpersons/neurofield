@@ -6,9 +6,10 @@
 //!   then carries nothing else). With `--headless` there is no OS window: the
 //!   window is a plain Bevy entity and everything draws into an image (see
 //!   `headless_display`).
-//! - `--mcp-listen 127.0.0.1:7801`: streamable HTTP at `/mcp`, so an agent can join
-//!   an editor someone already has open. Only local addresses are accepted, and
-//!   every request needs the bearer token printed at startup (or `--mcp-token`).
+//! - streamable HTTP at `/mcp`, so an agent can join an editor someone already has
+//!   open: switched on in Tools > Agents (or with `--mcp-listen 127.0.0.1:7801`).
+//!   Only local addresses are accepted, and every request needs the bearer token
+//!   the Agents window shows (or `--mcp-token`). See `agents`.
 //!
 //! The tools come in sets:
 //! - reading and viewing: `editor_status`, `editor_level`, `editor_locate`,
@@ -23,6 +24,7 @@
 //! The server threads hand requests to the main thread over a channel and wait for
 //! replies, as psx-bevy's game MCP does.
 
+mod agents;
 mod edit;
 #[cfg(feature = "dev-mcp")]
 mod input;
@@ -52,7 +54,6 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -61,13 +62,11 @@ use tokio::sync::{oneshot, Semaphore};
 
 const TF: f32 = T as f32;
 
+pub(crate) use agents::{window as agents_window, Agents};
+
 pub struct EditorMcpPlugin {
     /// Serve on stdio; the editor quits when that client goes.
     pub stdio: bool,
-    /// Serve over HTTP here.
-    pub listen: Option<SocketAddr>,
-    /// The HTTP bearer token; one is made up (and printed) if not given.
-    pub token: Option<String>,
     pub headless: bool,
 }
 
@@ -81,6 +80,8 @@ enum Response {
 struct Request {
     command: Command,
     reply: Reply,
+    /// From an agent over HTTP (shown in the Agents window).
+    remote: bool,
 }
 
 enum Command {
@@ -172,50 +173,56 @@ struct HeadlessTarget(Option<Handle<Image>>);
 #[derive(Resource, Default)]
 struct Frame(u64);
 
+/// The server threads and what they hand requests on with.
+#[derive(Resource)]
+struct Servers {
+    /// Made when first needed: most editors never serve anything.
+    runtime: Option<tokio::runtime::Runtime>,
+    sender: mpsc::SyncSender<Request>,
+    /// One request at a time, from either transport: each waits for the main
+    /// thread's answer.
+    slots: Arc<Semaphore>,
+    http: Option<agents::Http>,
+}
+
+impl Servers {
+    fn runtime(&mut self) -> &tokio::runtime::Runtime {
+        self.runtime.get_or_insert_with(|| {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("editor-mcp").enable_all().build().unwrap()
+        })
+    }
+}
+
 impl Plugin for EditorMcpPlugin {
     fn build(&self, app: &mut App) {
-        // Requests are served even while the window is unfocused.
-        app.insert_resource(bevy::winit::WinitSettings::continuous());
         let (sender, receiver) = mpsc::sync_channel(16);
         let closed = Arc::new(AtomicBool::new(false));
-        // One request at a time, from either transport: each waits for the main
-        // thread's answer.
-        let slots = Arc::new(Semaphore::new(1));
-        let token = self.token.clone().unwrap_or_else(new_token);
-        if let Some(addr) = self.listen {
-            eprintln!("editor MCP: http://{addr}/mcp (header \"Authorization: Bearer {token}\")");
-        }
-        let (stdio, listen, thread_closed) = (self.stdio, self.listen, closed.clone());
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-            runtime.block_on(async move {
-                let http = listen.map(|addr| {
-                    let server = EditorServer { sender: sender.clone(), slots: slots.clone(), testing: false };
-                    tokio::spawn(serve_http(addr, token, server))
-                });
-                if stdio {
-                    let server = EditorServer { sender, slots, testing: cfg!(feature = "dev-mcp") };
-                    match server.serve(rmcp::transport::stdio()).await {
-                        Ok(service) => {
-                            if let Err(e) = service.waiting().await {
-                                eprintln!("editor MCP: {e}");
-                            }
+        let mut servers = Servers { runtime: None, sender, slots: Arc::new(Semaphore::new(1)), http: None };
+        if self.stdio {
+            // Requests are served even while the window is unfocused.
+            app.insert_resource(bevy::winit::WinitSettings::continuous());
+            let server = EditorServer { sender: servers.sender.clone(), slots: servers.slots.clone(), testing: cfg!(feature = "dev-mcp"), remote: false };
+            let closed = closed.clone();
+            servers.runtime().spawn(async move {
+                match server.serve(rmcp::transport::stdio()).await {
+                    Ok(service) => {
+                        if let Err(e) = service.waiting().await {
+                            eprintln!("editor MCP: {e}");
                         }
-                        Err(e) => eprintln!("editor MCP startup: {e}"),
                     }
-                    thread_closed.store(true, Ordering::Release);
-                } else if let Some(http) = http {
-                    let _ = http.await;
+                    Err(e) => eprintln!("editor MCP startup: {e}"),
                 }
+                closed.store(true, Ordering::Release);
             });
-        });
+        }
         let ready = RenderReady(Arc::new(AtomicBool::new(false)));
         app.sub_app_mut(RenderApp)
             .insert_resource(ready.clone())
             .add_systems(Render, mark_render_ready.after(RenderSystems::Render).before(RenderSystems::Cleanup));
         app.insert_resource(Bridge { receiver: Mutex::new(receiver), closed, ready, waiting: Vec::new() })
+            .insert_resource(servers)
             .init_resource::<Frame>()
-            .add_systems(PreUpdate, serve);
+            .add_systems(PreUpdate, (agents::switch, serve).chain());
         #[cfg(feature = "dev-mcp")]
         if self.stdio {
             input::build(app);
@@ -237,41 +244,6 @@ fn new_token() -> String {
         h.finish()
     };
     format!("{:016x}{:016x}", part(1), part(2))
-}
-
-async fn serve_http(addr: SocketAddr, token: String, server: EditorServer) {
-    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-    if !addr.ip().is_loopback() {
-        eprintln!("editor MCP: {addr} isn't a local address; not serving HTTP");
-        return;
-    }
-    let port = addr.port();
-    // Host names a browser could be tricked into sending (DNS rebinding) are refused.
-    let hosts = ["localhost", "127.0.0.1", "[::1]"].map(|h| format!("{h}:{port}"));
-    let config = StreamableHttpServerConfig::default().with_allowed_hosts(hosts);
-    let service = StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config);
-    let wanted = format!("Bearer {token}");
-    let router = axum::Router::new().nest_service("/mcp", service).layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let ok = request.headers().get("authorization").and_then(|v| v.to_str().ok()) == Some(wanted.as_str());
-            async move {
-                if ok {
-                    next.run(request).await
-                } else {
-                    axum::response::IntoResponse::into_response((axum::http::StatusCode::UNAUTHORIZED, "bearer token needed"))
-                }
-            }
-        },
-    ));
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            if let Err(e) = axum::serve(listener, router).await {
-                eprintln!("editor MCP over HTTP: {e}");
-            }
-        }
-        Err(e) => eprintln!("editor MCP: can't listen on {addr}: {e}"),
-    }
 }
 
 fn mark_render_ready(
@@ -344,9 +316,12 @@ fn serve(
         }
     }
     let requests: Vec<Request> = bridge.receiver.lock().unwrap().try_iter().collect();
-    for Request { command, reply } in requests {
+    for Request { command, reply, remote } in requests {
         if reply.is_closed() {
             continue;
+        }
+        if remote {
+            ui.agents.last_request = Some(std::time::Instant::now());
         }
         let result = match command {
             Command::Status => Ok(status(&ui, &doc.0, &built, &cam, windows.single().ok(), headless.is_some(), frame.0)),
@@ -608,6 +583,8 @@ struct EditorServer {
     /// Whether this client gets the testing tools (developer builds, stdio).
     #[cfg_attr(not(feature = "dev-mcp"), allow(dead_code))]
     testing: bool,
+    /// Over HTTP.
+    remote: bool,
 }
 
 fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
@@ -695,7 +672,7 @@ impl ServerHandler for EditorServer {
         };
         let (reply, receiver) = oneshot::channel();
         self.sender
-            .try_send(Request { command, reply })
+            .try_send(Request { command, reply, remote: self.remote })
             .map_err(|e| ErrorData::internal_error(format!("editor queue unavailable: {e}"), None))?;
         let response = tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(300), receiver) => result

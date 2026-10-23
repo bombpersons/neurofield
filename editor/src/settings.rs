@@ -16,6 +16,10 @@ pub struct Settings {
     pub mode: ViewMode,
     /// Creatures in full colour, as the game draws them.
     pub full_colour: bool,
+    /// The agent server (Tools > Agents): whether it runs, its port and token.
+    pub agents_on: bool,
+    pub agents_port: u16,
+    pub agents_token: String,
     /// Whether `save` writes them; not for runs driven by the developer MCP, which
     /// start from the defaults and leave the user's settings alone.
     #[serde(skip)]
@@ -24,7 +28,16 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), dock: crate::ui::default_dock(), mode: ViewMode::Plain, full_colour: true, persist: true }
+        Settings {
+            recent: Vec::new(),
+            dock: crate::ui::default_dock(),
+            mode: ViewMode::Plain,
+            full_colour: true,
+            agents_on: false,
+            agents_port: 7801,
+            agents_token: String::new(),
+            persist: true,
+        }
     }
 }
 
