@@ -168,13 +168,19 @@ fn main() {
     app.world_mut().resource_mut::<EguiGlobalSettings>().auto_create_primary_context = false;
     app.add_plugins(mcp::EditorMcpPlugin { stdio: mcp, headless });
     let atlas = view3d::atlas_image(&textures);
-    let atlas = app.world_mut().resource_mut::<Assets<Image>>().add(atlas);
-    app.insert_resource(Atlas(atlas));
+    let steps = engine::world::tex::steps_rgb(&textures).map(|(w, h, rgb)| view3d::rgb_image(w, h, &rgb));
+    let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+    let atlas = images.add(atlas);
+    let steps = steps.map(|s| images.add(s));
+    app.insert_resource(Atlas(atlas, steps));
     app.run();
 }
 
 fn setup(atlas: Res<Atlas>, mut egui_textures: ResMut<EguiUserTextures>) {
     egui_textures.add_image(EguiTextureHandle::Strong(atlas.0.clone()));
+    if let Some(steps) = &atlas.1 {
+        egui_textures.add_image(EguiTextureHandle::Strong(steps.clone()));
+    }
 }
 
 /// Give egui psx-bevy's window camera (the one showing the screen), once it exists.

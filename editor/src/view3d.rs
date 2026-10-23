@@ -174,13 +174,19 @@ fn cut_level(level: &engine::world::level::Level, slice: i32) -> engine::world::
     l
 }
 
-/// The level texture atlas, for the Textures panel.
+/// The level texture atlas, for the Textures panel, and the level textures at each
+/// strangeness step (a row a slot), when they are loaded.
 #[derive(Resource)]
-pub struct Atlas(pub Handle<Image>);
+pub struct Atlas(pub Handle<Image>, pub Option<Handle<Image>>);
 
 /// The level texture atlas as an image, with nearest sampling.
 pub fn atlas_image(textures: &[tex::Texture]) -> Image {
     let (w, h, rgb) = tex::atlas_rgb(textures);
+    rgb_image(w, h, &rgb)
+}
+
+/// An RGB image with nearest sampling.
+pub fn rgb_image(w: u32, h: u32, rgb: &[u8]) -> Image {
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
     for c in rgb.chunks(3) {
         rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);

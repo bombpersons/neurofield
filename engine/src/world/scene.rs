@@ -205,7 +205,7 @@ pub(crate) fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 }
 
 /// A saturated colour of hue `h` (turns) at brightness `v`.
-pub(crate) fn hue(h: f32, sat: f32, v: f32) -> [f32; 3] {
+pub fn hue(h: f32, sat: f32, v: f32) -> [f32; 3] {
     [0.0, 1.0 / 3.0, 2.0 / 3.0].map(|o| {
         let k = (0.5 + 0.5 * ((h - o) * std::f32::consts::TAU).cos()).powf(1.5);
         v * (1.0 - sat + sat * k * 1.6)

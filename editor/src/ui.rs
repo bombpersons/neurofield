@@ -191,6 +191,7 @@ pub fn draw(
 ) -> Result {
     let ctx = contexts.ctx_mut()?.clone();
     let atlas_id = contexts.image_id(&atlas.0);
+    let steps_id = atlas.1.as_ref().and_then(|s| contexts.image_id(s));
     let s = &mut *ui_state;
     if !s.styled {
         compact(&ctx);
@@ -243,7 +244,7 @@ pub fn draw(
     let mut style = egui_dock::Style::from_egui(root.style());
     style.dock_area_padding = None;
     style.main_surface_border_stroke = egui::Stroke::NONE;
-    let mut viewer = Viewer { s, doc, built: &mut built, input: &mut input, cam: &mut cam, atlas: atlas_id, viewport_hovered: false };
+    let mut viewer = Viewer { s, doc, built: &mut built, input: &mut input, cam: &mut cam, atlas: atlas_id, steps: steps_id, viewport_hovered: false };
     DockArea::new(&mut dock)
         .style(style)
         .show_leaf_collapse_buttons(false)
@@ -724,6 +725,7 @@ struct Viewer<'a> {
     input: &'a mut ViewInput,
     cam: &'a mut EditorCam,
     atlas: Option<egui::TextureId>,
+    steps: Option<egui::TextureId>,
     viewport_hovered: bool,
 }
 
@@ -835,7 +837,7 @@ impl Viewer<'_> {
                 let default = l.surface;
                 area_properties(ui, &mut l.areas[i], default, &mut delete);
             }
-            _ => level_properties(ui, l),
+            _ => level_properties(ui, l, self.built.slice, self.steps),
         }
         if delete {
             delete_selected(self.s, self.doc);
@@ -1458,6 +1460,36 @@ fn area_properties(ui: &mut egui::Ui, a: &mut engine::world::level::Area, defaul
         ui.end_row();
     });
     ui.separator();
+    use engine::world::level::AreaStrange;
+    ui.horizontal(|ui| {
+        ui.label("strangeness");
+        let (mut kind, mut v) = match a.strangeness {
+            None => (0, 0.5),
+            Some(AreaStrange::Add(v)) => (1, v),
+            Some(AreaStrange::Pin(v)) => (2, v),
+        };
+        let was = kind;
+        egui::ComboBox::from_id_salt("area strange").selected_text(["as around it", "adds", "held at"][kind]).show_ui(ui, |ui| {
+            ui.selectable_value(&mut kind, 0, "as around it");
+            ui.selectable_value(&mut kind, 1, "adds").on_hover_text("Adds to the strangeness inside it");
+            ui.selectable_value(&mut kind, 2, "held at").on_hover_text("Holds the strangeness inside it at one value");
+        });
+        if kind != was && kind == 1 {
+            v = 0.3;
+        }
+        if kind > 0 {
+            let range = if kind == 1 { -1.0..=1.0 } else { 0.0..=1.0 };
+            ui.add(egui::Slider::new(&mut v, range).max_decimals(2));
+        }
+        a.strangeness = match kind {
+            1 => Some(AreaStrange::Add(v)),
+            2 => Some(AreaStrange::Pin(v.clamp(0.0, 1.0))),
+            _ => None,
+        };
+    })
+    .response
+    .on_hover_text("Fades out over a tile outside the area");
+    ui.separator();
     let mut own = a.surface.is_some();
     ui.checkbox(&mut own, "Its own surfaces").on_hover_text("Floor, wall and ceiling textures and tint for unpainted faces inside it");
     if own != a.surface.is_some() {
@@ -1480,7 +1512,7 @@ fn area_properties(ui: &mut egui::Ui, a: &mut engine::world::level::Area, defaul
     ui.add(egui::TextEdit::multiline(&mut a.notes).desired_rows(3).desired_width(f32::INFINITY));
 }
 
-fn level_properties(ui: &mut egui::Ui, l: &mut Level) {
+fn level_properties(ui: &mut egui::Ui, l: &mut Level, slice: i32, steps: Option<egui::TextureId>) {
     ui.heading("Level");
     egui::Grid::new("level").num_columns(2).show(ui, |ui| {
         ui.label("name");
@@ -1537,43 +1569,186 @@ fn level_properties(ui: &mut egui::Ui, l: &mut Level) {
     });
     ui.separator();
     ui.label(RichText::new("Strangeness").strong());
+    let open = l.columns.values().flatten();
+    let extent = open.fold(None, |e: Option<(i32, i32)>, r| Some(e.map_or((r.from, r.to), |(a, b)| (a.min(r.from), b.max(r.to)))));
     let st = &mut l.strangeness;
+    ui.label("by depth").on_hover_text(
+        "Strangeness at each layer. Drag a point, double-click to add one, right-click one to remove it. The dashed line is the slice.",
+    );
+    depth_curve(ui, st, extent.unwrap_or((0, 12)), slice);
+    ui.collapsing("points", |ui| {
+        let mut remove = None;
+        let n = st.depth.len();
+        for (i, p) in st.depth.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut p.0).speed(0.2).prefix("layer ").max_decimals(1));
+                ui.add(egui::Slider::new(&mut p.1, 0.0..=1.0));
+                if n > 1 && ui.small_button("x").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            st.depth.remove(i);
+        }
+        if ui.small_button("+ point").clicked() {
+            let last = st.depth.first().copied().unwrap_or((0.0, 0.0));
+            st.depth.insert(0, (last.0 - 16.0, last.1));
+        }
+    });
+    if !ui.ctx().egui_is_using_pointer() {
+        st.depth.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
     egui::Grid::new("strange").num_columns(2).show(ui, |ui| {
         ui.label("noise");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut st.noise.0).speed(0.005).prefix("strength ").range(0.0..=1.0));
-            ui.add(egui::DragValue::new(&mut st.noise.1).speed(0.01).prefix("scale ").range(0.05..=4.0));
+            ui.add(egui::DragValue::new(&mut st.noise.1).speed(0.01).prefix("scale ").range(0.05..=4.0))
+                .on_hover_text("Features per tile");
         });
         ui.end_row();
+        ui.label("seed");
+        ui.add(egui::DragValue::new(&mut st.seed)).on_hover_text("For the noise and the lights' strange colours");
+        ui.end_row();
+    });
+    ui.label(RichText::new("How it looks").strong());
+    egui::Grid::new("strange look").num_columns(2).show(ui, |ui| {
         ui.label("fog");
         ui.horizontal(|ui| colour_edit(ui, &mut st.fog));
         ui.end_row();
         ui.label("ambient");
         ui.horizontal(|ui| colour_edit(ui, &mut st.ambient));
         ui.end_row();
-        ui.label("seed");
-        ui.add(egui::DragValue::new(&mut st.seed));
+        ui.label("sun");
+        ui.horizontal(|ui| colour_edit(ui, &mut st.sun));
         ui.end_row();
-    });
-    ui.label("depth curve: strangeness by layer");
-    let mut remove = None;
-    for (i, p) in st.depth.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut p.0).speed(0.2).prefix("layer "));
-            ui.add(egui::Slider::new(&mut p.1, 0.0..=1.0));
-            if ui.small_button("x").clicked() {
-                remove = Some(i);
-            }
+        ui.label("light hues").on_hover_text("The colours lights without their own strange colour drift toward");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let (a, b) = &mut st.light_hues;
+                ui.add(egui::DragValue::new(a).speed(0.005).range(0.0..=1.0).prefix("from "));
+                ui.add(egui::DragValue::new(b).speed(0.005).range(*a..=*a + 1.0).prefix("to "));
+            });
+            hue_strip(ui, st.light_hues);
         });
+        ui.end_row();
+        for (name, hint, r) in [
+            ("textures morph", "The strangeness where textures start to morph, and where they are fully strange", &mut st.morph),
+            ("colours turn", "Where lights, ambient and sun start turning to their strange colours, and finish", &mut st.lurid),
+            ("fog turns", "Where the fog starts taking on its strange colour, and finishes", &mut st.fog_ramp),
+        ] {
+            ui.label(name).on_hover_text(hint);
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut r.0).speed(0.005).range(0.0..=1.0).prefix("from ").max_decimals(2));
+                let lo = r.0;
+                ui.add(egui::DragValue::new(&mut r.1).speed(0.005).range(lo..=1.0).prefix("to ").max_decimals(2));
+            });
+            ui.end_row();
+        }
+    });
+    if let Some(steps) = steps {
+        morph_strip(ui, steps, l.surface.wall, st.morph);
+    }
+}
+
+/// The depth curve as a graph: strangeness across, layers up the side (high at the
+/// top), with the level's extent shaded and the slice marked.
+fn depth_curve(ui: &mut egui::Ui, st: &mut engine::world::level::Strangeness, extent: (i32, i32), slice: i32) {
+    let (rect, bg) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(320.0), 150.0), egui::Sense::click());
+    let lo = st.depth.iter().map(|p| p.0).fold(extent.0.min(slice) as f32, f32::min) - 4.0;
+    let hi = st.depth.iter().map(|p| p.0).fold(extent.1.max(slice) as f32, f32::max) + 4.0;
+    let inner = rect.shrink2(egui::vec2(8.0, 6.0));
+    let to_screen = |layer: f32, v: f32| egui::pos2(inner.left() + v * inner.width(), inner.bottom() - (layer - lo) / (hi - lo) * inner.height());
+    let from_screen = |p: egui::Pos2| (lo + (inner.bottom() - p.y) / inner.height() * (hi - lo), ((p.x - inner.left()) / inner.width()).clamp(0.0, 1.0));
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(18, 18, 22));
+    // The level's layers, and a tile's grid.
+    let band = egui::Rect::from_x_y_ranges(inner.x_range(), to_screen(extent.1 as f32, 0.0).y..=to_screen(extent.0 as f32, 0.0).y);
+    painter.rect_filled(band, 0.0, Color32::from_rgb(30, 30, 38));
+    let grid = egui::Stroke::new(1.0, Color32::from_rgb(40, 40, 48));
+    for k in ((lo / 4.0).ceil() as i32)..=((hi / 4.0).floor() as i32) {
+        let y = to_screen(k as f32 * 4.0, 0.0).y;
+        painter.hline(inner.x_range(), y, if k % 4 == 0 { egui::Stroke::new(1.0, Color32::from_rgb(55, 55, 65)) } else { grid });
+    }
+    for v in [0.25, 0.5, 0.75] {
+        painter.vline(to_screen(0.0, v).x, inner.y_range(), grid);
+    }
+    let y = to_screen(slice as f32, 0.0).y;
+    painter.add(egui::Shape::dashed_line(&[egui::pos2(inner.left(), y), egui::pos2(inner.right(), y)], egui::Stroke::new(1.0, Color32::from_rgb(120, 200, 255)), 4.0, 3.0));
+    // The curve, coloured as the overlay colours it.
+    let rows = inner.height() as usize;
+    let at = |i: usize| lo + (hi - lo) * i as f32 / rows as f32;
+    for i in 0..rows {
+        let (a, b) = (at(i), at(i + 1));
+        let (va, vb) = (st.depth_at(a), st.depth_at(b));
+        let h = crate::view3d::heat((va + vb) / 2.0);
+        let c = Color32::from_rgb((h[0] * 255.0) as u8, (h[1] * 255.0) as u8, (h[2] * 255.0) as u8);
+        painter.line_segment([to_screen(a, va), to_screen(b, vb)], egui::Stroke::new(2.0, c));
+    }
+    // The points.
+    let mut remove = None;
+    let n = st.depth.len();
+    for i in 0..n {
+        let p = to_screen(st.depth[i].0, st.depth[i].1);
+        let r = ui.interact(egui::Rect::from_center_size(p, egui::vec2(12.0, 12.0)), ui.id().with(("depth point", i)), egui::Sense::click_and_drag());
+        if r.dragged() {
+            if let Some(m) = r.interact_pointer_pos() {
+                let (layer, v) = from_screen(m);
+                // Points keep their order.
+                let below = if i > 0 { st.depth[i - 1].0 + 0.5 } else { f32::MIN };
+                let above = if i + 1 < n { st.depth[i + 1].0 - 0.5 } else { f32::MAX };
+                st.depth[i] = ((layer.clamp(below, above) * 2.0).round() / 2.0, (v * 100.0).round() / 100.0);
+            }
+        }
+        if r.secondary_clicked() && n > 1 {
+            remove = Some(i);
+        }
+        let r = r.on_hover_text(format!("layer {:.1}: {:.2}", st.depth[i].0, st.depth[i].1));
+        let fill = if r.hovered() || r.dragged() { Color32::WHITE } else { Color32::from_rgb(220, 220, 230) };
+        painter.circle(to_screen(st.depth[i].0, st.depth[i].1), 4.0, fill, egui::Stroke::new(1.0, Color32::BLACK));
     }
     if let Some(i) = remove {
         st.depth.remove(i);
     }
-    if ui.small_button("+ point").clicked() {
-        let last = st.depth.last().copied().unwrap_or((0.0, 0.0));
-        st.depth.push((last.0 - 16.0, last.1));
+    if bg.double_clicked() {
+        if let Some(m) = bg.interact_pointer_pos() {
+            let (layer, v) = from_screen(m);
+            st.depth.push(((layer * 2.0).round() / 2.0, (v * 100.0).round() / 100.0));
+            st.depth.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
     }
-    st.depth.sort_by(|a, b| a.0.total_cmp(&b.0));
+}
+
+/// A strip of the hues from `from` to `to` (turns).
+fn hue_strip(ui: &mut egui::Ui, (from, to): (f32, f32)) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(140.0, 8.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let n = 28;
+    for i in 0..n {
+        let c = engine::world::scene::hue(from + (to - from) * (i as f32 + 0.5) / n as f32, 0.85, 1.0).map(|c| (c.min(1.0) * 255.0) as u8);
+        let w = rect.width() / n as f32;
+        let r = egui::Rect::from_min_size(rect.min + egui::vec2(i as f32 * w, 0.0), egui::vec2(w + 0.5, rect.height()));
+        painter.rect_filled(r, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+    }
+}
+
+/// Texture `slot` at each step of its morph, under the strangeness each step shows at.
+fn morph_strip(ui: &mut egui::Ui, steps: egui::TextureId, slot: u8, (a, b): (f32, f32)) {
+    use engine::world::tex::{STRANGE_SLOTS, STRANGE_STEPS};
+    ui.label(format!("texture {slot} as it morphs")).on_hover_text("The level's wall texture; each step under the strangeness it shows at");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for k in 0..STRANGE_STEPS {
+            let (w, h) = (STRANGE_STEPS as f32, STRANGE_SLOTS as f32);
+            let uv = egui::Rect::from_min_size(egui::pos2(k as f32 / w, slot as f32 / h), egui::vec2(1.0 / w, 1.0 / h));
+            ui.vertical(|ui| {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(steps, egui::vec2(30.0, 30.0))).uv(uv));
+                // Step k shows once the texture has morphed (k - 0.5) / (steps - 1) of the way.
+                let at = if k == 0 { 0.0 } else { a + (b - a) * (k as f32 - 0.5) / (STRANGE_STEPS - 1) as f32 };
+                ui.label(RichText::new(format!("{at:.2}")).size(9.0).weak());
+            });
+        }
+    });
 }
 
 /// Problems worth fixing before playing, each with where to look.

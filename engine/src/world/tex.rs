@@ -308,6 +308,27 @@ pub fn make_all() -> Vec<Texture> {
 }
 
 /// RGB8 atlas of all textures (256 wide), laid out as on their page.
+/// The level textures at every strangeness step, one slot to a row and one step
+/// to a column, once `load_strange` has run.
+pub fn steps_rgb(base: &[Texture]) -> Option<(u32, u32, Vec<u8>)> {
+    STRANGE.get()?;
+    let (w, h) = (STRANGE_STEPS * SIZE, STRANGE_SLOTS * SIZE);
+    let mut out = vec![0u8; w * h * 3];
+    for slot in 0..STRANGE_SLOTS {
+        for step in 0..STRANGE_STEPS {
+            let id = if step == 0 { slot as u8 } else { STRANGE_BASE + ((step - 1) * STRANGE_SLOTS + slot) as u8 };
+            let tex = level_texture(base, id)?;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let o = ((slot * SIZE + y) * w + step * SIZE + x) * 3;
+                    out[o..o + 3].copy_from_slice(&tex.pal[tex.idx[y * SIZE + x] as usize]);
+                }
+            }
+        }
+    }
+    Some((w as u32, h as u32, out))
+}
+
 pub fn atlas_rgb(texs: &[Texture]) -> (u32, u32, Vec<u8>) {
     let (w, h) = (4 * SIZE, ROWS * SIZE);
     let mut out = vec![0u8; w * h * 3];

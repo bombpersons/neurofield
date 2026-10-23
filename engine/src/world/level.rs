@@ -204,6 +204,16 @@ fn default_light_hues() -> (f32, f32) {
     (0.0, 1.0)
 }
 
+impl Strangeness {
+    /// The depth curve's strangeness at `layer`.
+    pub fn depth_at(&self, layer: f32) -> f32 {
+        if self.depth.is_empty() {
+            return 0.0;
+        }
+        crate::world::scene::curve(&self.depth, layer)
+    }
+}
+
 impl Default for Strangeness {
     fn default() -> Self {
         Strangeness {
