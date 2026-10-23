@@ -94,28 +94,38 @@ does now.
 
 Strangeness at a point is built in layers, each tunable in the editor:
 
-1. **A depth curve.** Strangeness against depth (layer), edited as a curve with
-   points you can drag. A dungeon can stay grounded for its first few floors,
-   then slide. This is the main dial for the whole dungeon.
+1. **A depth curve.** Strangeness against depth (layer), drawn as a graph in
+   Properties over the level's layers with the slice marked: drag a point,
+   double-click to add one, right-click to remove one. A dungeon can stay
+   grounded for its first few floors, then slide. This is the main dial for the
+   whole dungeon.
 2. **Noise.** Its strength and scale, so the depth curve isn't perfectly flat
    on each floor.
 3. **Painted aura.** Offsets stored on a **lattice of grid points**: one point
    every tile across the ground and every tile up, at cell corners. It's sparse
    and unset points are 0. Between points it's interpolated smoothly
    (trilinear, then smoothstep), so painting with a soft brush gives soft
-   auras. Paint pushes up (an infected room) or down (a spared one).
-4. **Area overrides.** An area can add to, or pin, strangeness inside it.
+   auras. Paint pushes up (an infected room) or down (a spared one). Offsets
+   stay within −1..1.
+4. **Area overrides.** An area can add to, or pin (hold at a value),
+   strangeness inside it, fading out over a tile outside so a pinned room
+   doesn't jump at its walls. Adds come before pins.
 
 The sum is clamped to 0–1. Everything that uses strangeness now uses this field
 instead of the generated one: triangle column 34, texture steps, fog colour,
 and light colour.
 
 **How strangeness looks** is tunable too, per dungeon:
-- the strange fog colour range;
-- the hue range the lights drift toward;
-- the strangeness at which the texture morph starts and ends.
+- the fog, ambient and sun colours where it is fully strange;
+- the hue range lights drift toward (a light can also have its own strange colour);
+- the strangeness where the textures start and finish morphing (`morph`), where
+  lights, ambient and sun start and finish turning (`lurid`), and the same for
+  the fog (`fog_ramp`).
 
-Defaults come from what datagen does now.
+Defaults come from what datagen does, so generated levels look as they always
+have. Properties shows the level's wall texture at each morph step, under the
+strangeness it appears at. The network itself is told the strangeness as it is
+(triangle column 34); the look settings change only how the renderer draws it.
 
 
 ### Areas
@@ -212,6 +222,8 @@ Level(
         noise: (0.12, 0.8),                                // strength, features per tile
         fog: (0.45, 0.05, 0.6), ambient: (0.5, 0.15, 0.45), sun: (0.2, 0.9, 0.6),
         seed: 1,
+        morph: (0.0, 1.0), lurid: (0.15, 0.85), fog_ramp: (0.2, 0.9),  // (start, end)
+        light_hues: (0.0, 1.0),                                      // turns round the colour wheel
     ),
     // Open layers of each column (x, z), bottom first.
     columns: {
@@ -222,7 +234,7 @@ Level(
     },
     paint: { ((0, 4, 2), Wall(W)): 6 },          // (cell (x, layer, z), face): texture slot
     strange_points: { (12, 1, 2): 0.8 },          // lattice (x, up, z) in tiles: offset
-    areas: [ Area(name: "entry hall", label: "room", boxes: [((0, 0, 0), (6, 12, 6))]) ],
+    areas: [ Area(name: "entry hall", label: "room", boxes: [((0, 0, 0), (6, 12, 6))], strangeness: Some(Pin(0.1))) ],
     lights: [ PointLight(pos: (768.0, -640.0, 768.0), colour: (1.0, 0.8, 0.6), radius: 768.0) ],
     entities: [
         Entity(id: 1, kind: PlayerStart, pos: (384.0, 0.0, 384.0), yaw: 0.0),
@@ -318,13 +330,13 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 |---|---|
 | File | New, Open, Open recent, Save, Save as, Revert, Screenshot, Quit |
 | Edit | Undo, Redo, Cut, Copy, Paste, Duplicate, Delete, Select all, Select none, Preferences |
-| View | Each window on or off, Reset layout, viewport mode (plain / PS1 / neural), Grid, Strangeness overlay, Links, Lights, Height slice up/down |
+| View | Each window on or off, Reset layout, viewport mode (plain / PS1 / neural), Grid, Strangeness overlay (blue where grounded, through teal and yellow, to magenta; also the viewport's *Strange* toggle), Links, Lights, Height slice up/down |
 | Tools | One entry per tool, with its shortcut |
 | Play | Play, Play from here |
 
 **Status bar**, left to right:
 - the current tool's hint;
-- the hovered cell and face;
+- the hovered cell and face, its texture and the strangeness there;
 - the selection size;
 - the number of triangles in view out of 512;
 - FPS;
@@ -335,9 +347,9 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 | Window | What it does |
 |---|---|
 | Viewport | The see-through hole onto the 3D view, with view toggles in its corner |
-| Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. Room, Carve and Slope work in it too: Room and Carve open (or with Shift fill) the **plan height** layers above the slice, set in the Tools window. Pan with the right or middle button. |
+| Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. Room, Carve, Slope and Strangeness work in it too: Room and Carve open (or with Shift fill) the **plan height** layers above the slice, set in the Tools window, and the Strangeness brush reaches that high. With the overlay on, open cells are coloured by strangeness. Pan with the right or middle button. |
 | Tools | The tool palette |
-| Properties | Whatever is selected: an entity, an area (name, label, its own surfaces, notes) or a light (position, colour, radius, strange colour); otherwise the level. |
+| Properties | Whatever is selected: an entity, an area (name, label, strangeness, its own surfaces, notes) or a light (position, colour, radius, strange colour); otherwise the level, with its strangeness (see Strangeness). |
 | Entities | An outliner grouped by kind, with a filter box (matching labels or kind names). Click to select, double-click to frame it. Add... puts one where the camera looks. |
 | Textures | The slot palette with previews for the level's texture set. Click one to paint with it (this switches to the Paint tool). |
 | Areas | A list of areas. Select one to highlight it in both views, double-click to frame it. *New area from the selected faces* makes one boxing the selected faces' cells, floor to ceiling. |
@@ -351,8 +363,13 @@ The layout is saved between sessions.
   baked vertex colours, plus gizmos. It's fast, and it's the default for
   editing.
 - **PS1:** datagen's software renderer, as the game draws it now.
-- **Neural:** the trained network. It's slow on the laptop, so it's for
-  checking things, not for editing.
+- **Neural:** the trained network, found through `neurofield.ron` and loaded
+  the first time the mode is chosen. It runs on a worker thread that always
+  draws the newest view, so editing stays smooth however slow a frame is (about
+  10 ms on an RX 580, seconds on a CPU); the status bar says how long frames
+  take and on what. The frame fills the middle of the view as the PS1 screen
+  would, with the tools' outlines and entity markers drawn over it. Without a
+  model the editor says so and stays in Plain.
 
 In every mode creatures are drawn in full colour as the game draws them (the
 **Flesh** toggle, also in the View menu). Sculpting one takes 30–400 ms, so each
@@ -384,7 +401,7 @@ progress.
 | Carve / Fill | C | A single-cell brush. Click to open the cell behind a face, Shift-click to fill the cell in front of it. A drag stays on the plane it started on, so it can't dig away under itself. |
 | Slope | S | Click near a floor's edge to make a ramp or stairs climbing away from it. Dragging on across the floor makes a flight: each column rises by the rise from the last, keeping the first one's headroom, carving through rock and raising floors in the way. Shift-click takes a slope off. The scroll wheel sets the rise, Tab switches between ramp and stairs. |
 | Paint | B | Click faces to paint them (a wall's whole height in that column, or the whole selection if you click in it). Drag paints along the surface. Shift-click fills the joined faces on the same plane that share a texture. Ctrl-click picks up a face's texture (Alt is taken by orbiting). Painting a face its default leaves it unpainted in the file. Rotating the texture (`[` and `]`) waits on paint gaining a rotation in the format. |
-| Strangeness | X | A brush over the lattice, with a radius (in tiles), a strength and a falloff. Click adds, Shift-click removes, Ctrl-click smooths. The overlay tints the view by strangeness while this tool is active. |
+| Strangeness | X | A brush over the lattice, with a radius (in tiles), a strength and a falloff. Click or drag adds, Shift takes off, Ctrl smooths. In one stroke a point moves at most the strength (times the falloff) however often the brush passes, so going over a patch evens it out; stroke again to go further. In the 3D view it is a ball round the point under the pointer; in the plan, a column from the slice up the plan height. The overlay tints the view and the plan by strangeness while this tool is active. |
 | Entity | E | Pick a kind in the Tools window, then click a floor to place it, and drag on to move it. Placement snaps to cell centres (Ctrl: exactly where you point), and doors to the middle of the nearest cell edge, facing into the cell you clicked so they open into it. Tab turns the next one a quarter (R is the Room tool). The pointer shows where it will go. There's only one player start: placing another moves it. Works in the plan too, at the slice. |
 | Light | L | Click to place a point light just off a face. Drag to lift it further off. Select picks lights by their markers, in the 3D view or the plan, where their radius shows as a circle. |
 
@@ -477,7 +494,7 @@ unless given a file, and never save the person's settings.
 | Tool | |
 |---|---|
 | `editor_status` | Tool, drag under way, selection, the face under the pointer, the status message, unsaved changes, undo depth, camera, view toggles, and where each panel is. |
-| `editor_level` | A summary (bounds, entities, areas), or the entities, lights, areas, cells (each column's open runs), painted faces or settings as JSON, or all of it as RON. |
+| `editor_level` | A summary (bounds, entities, areas), or the entities, lights, areas, cells (each column's open runs), painted faces, settings or strangeness (settings, painted lattice points, area overrides) as JSON, or all of it as RON. |
 | `editor_locate` | Where an entity, light, world point, cell face or plan tile is on screen, with what a click there would hit. |
 | `editor_camera` | Point the 3D view at a world point or an entity. |
 | `editor_screenshot` | A PNG of the window, one panel, or a rectangle. |
@@ -495,7 +512,8 @@ or a pick, and their mouse and keyboard keep working throughout.
 | `level_add_entity`, `level_edit_entity`, `level_delete_entity` | Entities on a cell's floor (doors on one of its edges) or at a point. Kinds by name, with fields to change their defaults. Edits merge fields in; deleting drops links to it. |
 | `level_link` | A door or chest to its key (which locks it), or a lever to a door. |
 | `level_add_light`, `level_edit_light`, `level_delete_light` | Point lights. |
-| `level_add_area`, `level_edit_area`, `level_delete_area` | Named areas made of boxes of cells. |
+| `level_add_area`, `level_edit_area`, `level_delete_area` | Named areas made of boxes of cells, which can add to or pin strangeness. |
+| `level_strange` | Paint strangeness on the lattice: a ball, a column over a disc, or a box of points; add, set, smooth or clear. |
 | `level_settings` | Name, texture set, ambient, fog, sun, default surface, strangeness. |
 | `editor_undo` | Undo or redo, the person's steps and agents' alike. |
 | `editor_open`, `editor_save` | Open a file or a new level (refused over unsaved changes unless told to discard them), save. |

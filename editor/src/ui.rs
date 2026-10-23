@@ -1514,6 +1514,7 @@ fn area_properties(ui: &mut egui::Ui, a: &mut engine::world::level::Area, defaul
         }
         if kind > 0 {
             let range = if kind == 1 { -1.0..=1.0 } else { 0.0..=1.0 };
+            ui.spacing_mut().slider_width = 80.0;
             ui.add(egui::Slider::new(&mut v, range).max_decimals(2));
         }
         a.strangeness = match kind {

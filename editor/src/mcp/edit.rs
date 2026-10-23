@@ -5,7 +5,7 @@
 
 use super::{dir_of, face_of, level_path};
 use crate::doc::Doc;
-use crate::tools::{add_entity, entity_kinds, fill, has_face, make_link, paint, place_at, stairs, Link, Sel};
+use crate::tools::{add_entity, entity_kinds, fill, has_face, lattice_near, make_link, paint, place_at, set_point, stairs, Brush, Link, Sel};
 use crate::ui::Ui;
 use crate::view3d::EditorCam;
 use engine::world::level::{Area, AreaStrange, CeilingKind, Dir, EntityKind, Level, PointLight, SlopeDef, SlopeKind, Strangeness, Sun, Surface};
@@ -70,6 +70,7 @@ pub enum Edit {
     EditArea(IndexEdit),
     DeleteArea(IndexArgs),
     Settings(SetArgs),
+    Strange(StrangeArgs),
     Undo(UndoArgs),
     Open(OpenArgs),
     Save(SaveArgs),
@@ -213,6 +214,42 @@ pub struct AreaArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct StrangeArgs {
+    /// Lattice coordinates [x, up, z] in tiles.
+    centre: Option<[f32; 3]>,
+    #[serde(default = "two")]
+    radius: f32,
+    /// Lowest and highest up reached above a disc, instead of a ball.
+    column: Option<[f32; 2]>,
+    /// Or a box of lattice points, inclusive.
+    min: Option<[i32; 3]>,
+    max: Option<[i32; 3]>,
+    #[serde(default = "add")]
+    mode: String,
+    #[serde(default = "tenths3")]
+    amount: f32,
+    #[serde(default = "half")]
+    softness: f32,
+}
+
+fn two() -> f32 {
+    2.0
+}
+
+fn add() -> String {
+    "add".into()
+}
+
+fn tenths3() -> f32 {
+    0.3
+}
+
+fn half() -> f32 {
+    0.5
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetArgs {
     set: Map<String, Value>,
 }
@@ -266,6 +303,7 @@ pub fn parse(name: &str, value: Value) -> Option<Result<Edit, String>> {
         "level_edit_area" => de(value).map(Edit::EditArea),
         "level_delete_area" => de(value).map(Edit::DeleteArea),
         "level_settings" => de(value).map(Edit::Settings),
+        "level_strange" => de(value).map(Edit::Strange),
         "editor_undo" => de(value).map(Edit::Undo),
         "editor_open" => de(value).map(Edit::Open),
         "editor_save" => de(value).map(Edit::Save),
@@ -526,6 +564,62 @@ fn change(edit: Edit, ui: &mut Ui, l: &mut Level) -> Result<(String, Value), Str
             merged(&Settings::of(l), a.set)?.apply(l);
             (format!("changed {}", keys.join(", ")), none)
         }
+        Edit::Strange(a) => {
+            let near: Vec<((i32, i32, i32), f32)> = match (a.centre, a.min, a.max) {
+                (Some(c), None, None) => {
+                    if !(0.25..=32.0).contains(&a.radius) {
+                        return Err("radius is 0.25..32 tiles".into());
+                    }
+                    let brush = Brush { radius: a.radius, strength: 1.0, softness: a.softness };
+                    lattice_near(c, a.radius, a.column.map(|[lo, hi]| (lo, hi))).into_iter().map(|(p, d)| (p, brush.falloff(d))).collect()
+                }
+                (None, Some(lo), Some(hi)) => {
+                    if (0..3).any(|i| hi[i] < lo[i]) {
+                        return Err("max must not be below min (both are inclusive)".into());
+                    }
+                    if (0..3).map(|i| (hi[i] - lo[i] + 1) as i64).product::<i64>() > MAX_CELLS {
+                        return Err(format!("more than {MAX_CELLS} points at once"));
+                    }
+                    let mut v = Vec::new();
+                    for x in lo[0]..=hi[0] {
+                        for y in lo[1]..=hi[1] {
+                            for z in lo[2]..=hi[2] {
+                                v.push(((x, y, z), 1.0));
+                            }
+                        }
+                    }
+                    v
+                }
+                _ => return Err("give centre (with radius, and column for a column) or min and max".into()),
+            };
+            let at = |l: &Level, p: (i32, i32, i32)| l.strange_points.get(&p).copied().unwrap_or(0.0);
+            let new: Vec<_> = near
+                .iter()
+                .map(|&(p, f)| {
+                    let v = at(l, p);
+                    let to = match a.mode.as_str() {
+                        "add" => Ok(v + a.amount * f),
+                        "set" => Ok(v + (a.amount - v) * f),
+                        "clear" => Ok(v * (1.0 - f)),
+                        "smooth" => {
+                            let (x, y, z) = p;
+                            let n = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+                            let mean = n.iter().map(|o| at(l, (x + o.0, y + o.1, z + o.2))).sum::<f32>() / 6.0;
+                            Ok(v + (mean - v) * (a.amount * f).clamp(0.0, 1.0))
+                        }
+                        m => Err(format!("mode {m}: add, set, smooth or clear")),
+                    }?;
+                    Ok((p, to))
+                })
+                .collect::<Result<_, String>>()?;
+            let mut changed = 0;
+            for (p, v) in new {
+                let before = at(l, p);
+                set_point(l, p, v);
+                changed += (at(l, p) != before) as usize;
+            }
+            (format!("{} strangeness at {changed} points", a.mode), json!({"changed": changed, "points": l.strange_points.len()}))
+        }
         Edit::Undo(_) | Edit::Open(_) | Edit::Save(_) => unreachable!("handled in apply"),
     })
 }
@@ -613,6 +707,7 @@ pub fn tools() -> Vec<(&'static str, &'static str, Value)> {
         ("level_edit_area", "Change an area by index: set merges into it (name, label, boxes, surface, notes, strangeness: {\"Add\": v}, {\"Pin\": v} or null).", index_set),
         ("level_delete_area", "Delete an area by index; later areas move down one.", index),
         ("level_settings", "Change the level's settings: set merges into name, textures (grounded, mid, deep or strange), ambient, fog [near, far] in tiles, sun {dir, colour} or null, surface (default paint and tint), strangeness. editor_level part settings shows them.", json!({"type": "object", "properties": {"set": set}, "required": ["set"], "additionalProperties": false})),
+        ("level_strange", "Paint strangeness: offsets on a lattice of points one tile apart, [x, up, z] in tiles (up is layers / 4; a floor at layer 8 is up 2), added to the depth curve and noise (level_settings strangeness) and smooth between points. Either a ball (centre, radius in tiles, softness 0 hard edge .. 1 fading from the centre), a column over a disc (centre x and z, radius, column [lowest up, highest up]) or a box of points (min, max, inclusive). mode add adds amount (negative takes off), set moves points toward amount, smooth eases them toward their neighbours, clear takes them back to nothing. Offsets stay within -1..1; the strangeness itself is clamped to 0..1. editor_level part strangeness shows them.", json!({"type": "object", "properties": {"centre": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "radius": {"type": "number", "default": 2.0}, "column": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "min": cell, "max": cell, "mode": {"type": "string", "enum": ["add", "set", "smooth", "clear"], "default": "add"}, "amount": {"type": "number", "default": 0.3}, "softness": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5}}, "additionalProperties": false})),
         ("editor_undo", "Undo (or with redo: true, redo) steps of the editor's history, the person's edits and agents' alike.", json!({"type": "object", "properties": {"redo": {"type": "boolean", "default": false}, "steps": {"type": "integer", "minimum": 1, "maximum": 200, "default": 1}}, "additionalProperties": false})),
         ("editor_open", "Open a level file (a path, or a name in the levels folder), or start a new one (new: true; demo: true for the demo level). Refused while there are unsaved changes unless discard: true.", json!({"type": "object", "properties": {"path": {"type": "string"}, "new": {"type": "boolean"}, "demo": {"type": "boolean"}, "discard": {"type": "boolean"}}, "additionalProperties": false})),
         ("editor_save", "Save the level: to its file, or to path (a .ron path, or a name in the levels folder).", json!({"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": false})),
