@@ -24,8 +24,9 @@ bevy = { version = "=0.20.0", default-features = false, features = [
 bevy_render = { version = "=0.20.0", default-features = false, features = ["gles"] }
 bevy_input = { version = "=0.20.0", features = ["serialize"] }
 bevy_egui = "0.43.1"
-rmcp = { version = "=3.5.1", features = ["transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-std"] }
+# stdio for psx-bevy's game MCP and the editor's; HTTP for the editor's.
+rmcp = { version = "=3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-std", "net"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["alloc"] }
 ron = "0.12"

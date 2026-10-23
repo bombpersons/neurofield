@@ -14,11 +14,14 @@ rfd = "0.17"
 ron.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rmcp = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-image = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+# The editor's MCP server (src/mcp): stdio with --mcp, HTTP with --mcp-listen.
+rmcp.workspace = true
+tokio.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+image.workspace = true
+base64.workspace = true
 
 [features]
-# The editor's own developer MCP (src/mcp.rs): run with --mcp [--headless --software].
-dev-mcp = ["dep:rmcp", "dep:tokio", "dep:image", "dep:base64"]
+# The MCP's testing tools (mouse and keyboard input, widgets), on stdio only:
+# run with --mcp [--headless --software].
+dev-mcp = []

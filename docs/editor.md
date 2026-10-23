@@ -437,32 +437,69 @@ The editor reports:
 - views where the triangle budget overflows badly (sampled along walkable
   cells).
 
-## Developer MCP
+## MCP
 
-A developer build drives the editor from scripts, so agents and tests can use it
-as a person does without touching the desktop's real mouse and keyboard:
+The editor serves MCP tools, so agents can build levels on their own or help
+someone build theirs. Two transports serve the same tools:
 
 ```bash
-cargo run -p editor --features dev-mcp -- --mcp --headless --software --size 1280x800
+# An agent starts the editor itself and talks over stdio (stdout carries nothing else).
+cargo run -p editor -- --mcp --headless --software --size 1280x800
+# An agent joins an editor someone has open, over HTTP.
+cargo run -p editor -- --mcp-listen 127.0.0.1:7801 levels/demo.ron
 ```
 
-`--mcp` serves JSON-RPC tools on stdio (stdout carries nothing else).
 `--headless` runs without an OS window: the window is only a size and the editor
-draws into an image. Without it there's a normal window, but only injected input
-reaches the panels. MCP runs start from the default layout, open the demo level
-unless given a file, and never save the user's settings.
+draws into an image. Over HTTP only local addresses are served, and every request
+needs `Authorization: Bearer <token>`. The token is printed at startup, or set with
+`--mcp-token`. To add it to Claude Code:
+
+```bash
+claude mcp add --transport http neurofield-editor http://127.0.0.1:7801/mcp --header "Authorization: Bearer TOKEN"
+```
+
+Runs started with `--mcp` begin from the default layout, open the demo level
+unless given a file, and never save the person's settings.
+
+**Reading and viewing.**
+
+| Tool | |
+|---|---|
+| `editor_status` | Tool, drag under way, selection, the face under the pointer, the status message, unsaved changes, undo depth, camera, view toggles, and where each panel is. |
+| `editor_level` | A summary (bounds, entities, areas), or the entities, lights, areas, cells (each column's open runs), painted faces or settings as JSON, or all of it as RON. |
+| `editor_locate` | Where an entity, light, world point, cell face or plan tile is on screen, with what a click there would hit. |
+| `editor_camera` | Point the 3D view at a world point or an entity. |
+| `editor_screenshot` | A PNG of the window, one panel, or a rectangle. |
+
+**Editing.** Each call is one undo step, and the status bar says what it did
+("agent: ..."). Edits are refused while the person is part way through a drag
+or a pick, and their mouse and keyboard keep working throughout.
+
+| Tool | |
+|---|---|
+| `level_box` | Open (or fill) a box of cells: rooms, corridors, pits. |
+| `level_stairs` | Stairs or a ramp from a floor, climbing a direction. |
+| `level_sky` | Open a column to the sky, or roof it. |
+| `level_paint` | Paint faces with a texture slot, or fill across a plane. |
+| `level_add_entity`, `level_edit_entity`, `level_delete_entity` | Entities on a cell's floor (doors on one of its edges) or at a point. Kinds by name, with fields to change their defaults. Edits merge fields in; deleting drops links to it. |
+| `level_link` | A door or chest to its key (which locks it), or a lever to a door. |
+| `level_add_light`, `level_edit_light`, `level_delete_light` | Point lights. |
+| `level_add_area`, `level_edit_area`, `level_delete_area` | Named areas made of boxes of cells. |
+| `level_settings` | Name, texture set, ambient, fog, sun, default surface, strangeness. |
+| `editor_undo` | Undo or redo, the person's steps and agents' alike. |
+| `editor_open`, `editor_save` | Open a file or a new level (refused over unsaved changes unless told to discard them), save. |
+
+**Testing** (developer builds, `--features dev-mcp`, on stdio only). While these
+are served, only injected input reaches the panels, so moving the real mouse
+over the window changes nothing.
 
 | Tool | |
 |---|---|
 | `editor_input` | Mouse and keyboard, a frame at a time, through egui and the 3D camera's input: `move`, `click`, `double_click`, `press`, `release`, `drag`, `wheel`, `key` (`"Ctrl+Z"`, `"Tab"`, `"F5"`), `key_down`, `key_up`, `hold`, `text`, `wait`. Clicks and drags can hold modifiers (`with: ["Ctrl"]`). Positions are window pixels. Answers once the editor has seen the last step. |
 | `editor_widgets` | The widgets drawn last frame (from egui's accessibility tree), by text, hint, role or panel: rectangle and centre to click, toggled and disabled states. Widgets scrolled out of sight are left out. |
-| `editor_locate` | Where an entity, light, world point, cell face or plan tile is on screen: in the 3D view (with the face a click there would hit, and any panel covering it) and in the plan. |
-| `editor_status` | Tool, drag under way, selection, the face under the pointer, the status message, unsaved changes, undo depth, camera, view toggles, and where each panel is. |
-| `editor_level` | The level's entities, lights or areas as JSON, or all of it as RON. |
-| `editor_setup` | Open a file or a new (demo) level, point the camera, resize the window. |
-| `editor_screenshot` | A PNG of the window, one panel, or a rectangle. |
+| `editor_window` | Resize the window. |
 
-Native file dialogs don't work headless: open levels with `editor_setup` instead.
+Native file dialogs don't work headless: use `editor_open` and `editor_save`.
 The game has its own MCP, psx-bevy's, for gameplay (see Play above).
 
 ## Training on hand-built levels

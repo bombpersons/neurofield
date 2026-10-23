@@ -142,7 +142,7 @@ impl Ui {
         self.plan_for = None;
     }
 
-    fn levels_dir(&self) -> PathBuf {
+    pub(crate) fn levels_dir(&self) -> PathBuf {
         self.config.levels.clone().unwrap_or_else(|| PathBuf::from("levels"))
     }
 }
@@ -1074,7 +1074,7 @@ fn egui_colour(c: Color) -> Color32 {
     Color32::from_rgb((s.red * 255.0) as u8, (s.green * 255.0) as u8, (s.blue * 255.0) as u8)
 }
 
-fn kind_name(k: &EntityKind) -> &'static str {
+pub(crate) fn kind_name(k: &EntityKind) -> &'static str {
     match k {
         EntityKind::PlayerStart => "PlayerStart",
         EntityKind::Creature { .. } => "Creature",
