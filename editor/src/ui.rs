@@ -103,6 +103,43 @@ pub struct Ui {
     pub(crate) agents: crate::mcp::Agents,
     /// The Neural view mode's network and its latest frame.
     pub neural: crate::neural::NeuralView,
+    /// The Issues window's checks, as of the level they were run on.
+    pub(crate) issues: Issues,
+}
+
+/// The checks' results for one version of the level; the triangle budget is
+/// counted in the background and joins them when done.
+#[derive(Default)]
+pub(crate) struct Issues {
+    pub version: u64,
+    pub list: Vec<crate::checks::Issue>,
+    budget: Option<Task<Vec<crate::checks::Issue>>>,
+}
+
+impl Issues {
+    /// Check the level again when it has changed and nothing is being dragged.
+    fn update(&mut self, level: &Level, built: &Built, idle: bool) {
+        if let Some(task) = &mut self.budget {
+            if let Some(more) = block_on(poll_once(task)) {
+                self.list.extend(more);
+                self.list.sort_by_key(|i| (i.group, i.severity));
+                self.budget = None;
+            }
+        }
+        if self.version == built.version || !idle {
+            return;
+        }
+        self.version = built.version;
+        let (list, budget) = crate::checks::check(level, built.whole());
+        self.list = list;
+        // A newer count replaces one still running.
+        self.budget = budget.map(|b| AsyncComputeTaskPool::get().spawn(async move { b.run() }));
+    }
+
+    /// The triangle budget is still being counted.
+    pub fn counting(&self) -> bool {
+        self.budget.is_some()
+    }
 }
 
 pub(crate) struct PlanView {
@@ -138,6 +175,7 @@ impl Ui {
             screen: None,
             agents,
             neural: Default::default(),
+            issues: Default::default(),
         }
     }
 
@@ -242,6 +280,8 @@ pub fn draw(
 
     shortcuts(&ctx, s, doc, &mut built, &mut input, &cam);
     poll_dialogs(s, doc);
+    let idle = !s.tools.busy() && !ctx.egui_is_using_pointer();
+    s.issues.update(&doc.level, &built, idle);
 
     let mut root = egui::Ui::new(
         ctx.clone(),
@@ -757,7 +797,11 @@ impl TabViewer for Viewer<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        let n = self.s.issues.list.len();
+        match tab {
+            Tab::Issues if n > 0 => format!("Issues ({n})").into(),
+            _ => tab.title().into(),
+        }
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
@@ -1007,14 +1051,49 @@ impl Viewer<'_> {
     }
 
     fn issues(&mut self, ui: &mut egui::Ui) {
-        let issues = validate(&self.doc.level, self.built.whole());
-        if issues.is_empty() {
-            ui.label(RichText::new("No problems found.").color(Color32::LIGHT_GREEN));
+        use crate::checks::Severity;
+        let issues = &self.s.issues;
+        if issues.list.is_empty() {
+            let text = if issues.counting() { "No problems found yet." } else { "No problems found." };
+            ui.label(RichText::new(text).color(Color32::LIGHT_GREEN));
         }
-        for (text, at) in issues {
-            let r = ui.selectable_label(false, format!("! {text}"));
-            if let (true, Some(p)) = (r.clicked(), at) {
-                self.input.frame_request = Some(p);
+        let mut picked = None;
+        let mut i = 0;
+        while i < issues.list.len() {
+            let group = issues.list[i].group;
+            let n = issues.list[i..].iter().take_while(|x| x.group == group).count();
+            let errors = issues.list[i..i + n].iter().filter(|x| x.severity == Severity::Error).count();
+            let head = match errors {
+                0 => RichText::new(format!("{} ({n})", group.title())).strong(),
+                _ => RichText::new(format!("{} ({n})", group.title())).strong().color(ERROR),
+            };
+            egui::CollapsingHeader::new(head).id_salt(group.name()).default_open(true).show(ui, |ui| {
+                for (k, issue) in issues.list[i..i + n].iter().enumerate() {
+                    let (mark, colour) = match issue.severity {
+                        Severity::Error => ("✖", ERROR),
+                        Severity::Warning => ("⚠", WARNING),
+                    };
+                    let job = RichText::new(format!("{mark} {}", issue.text)).color(colour);
+                    let r = ui.selectable_label(false, job);
+                    let r = if issue.at.is_some() { r.on_hover_text("Click to look; it is shown in the plan too") } else { r };
+                    if r.clicked() {
+                        picked = Some(i + k);
+                    }
+                }
+            });
+            i += n;
+        }
+        if issues.counting() {
+            ui.label(RichText::new("counting triangles along the walkable floor…").weak());
+        }
+        if let Some(k) = picked {
+            let issue = self.s.issues.list[k].clone();
+            if let Some(id) = issue.entity {
+                self.s.sel = Sel::Entity(id);
+            }
+            if let Some(p) = issue.at {
+                self.input.frame_request = Some(to_view(p) + Vec3::Y * 0.5);
+                self.s.plan.centre = egui::vec2(p[0] / TF, p[2] / TF);
             }
         }
     }
@@ -1173,6 +1252,10 @@ fn egui_colour(c: Color) -> Color32 {
     let s = c.to_srgba();
     Color32::from_rgb((s.red * 255.0) as u8, (s.green * 255.0) as u8, (s.blue * 255.0) as u8)
 }
+
+/// Issues that stop the level playing as meant, and ones worth a look.
+const ERROR: Color32 = Color32::from_rgb(255, 110, 100);
+const WARNING: Color32 = Color32::from_rgb(240, 200, 90);
 
 pub(crate) fn kind_name(k: &EntityKind) -> &'static str {
     match k {
@@ -1785,48 +1868,4 @@ fn morph_strip(ui: &mut egui::Ui, steps: egui::TextureId, slot: u8, (a, b): (f32
             });
         }
     });
-}
-
-/// Problems worth fixing before playing, each with where to look.
-fn validate(l: &Level, scene: &engine::world::scene::Scene) -> Vec<(String, Option<Vec3>)> {
-    let mut out = Vec::new();
-    let starts: Vec<_> = l.entities.iter().filter(|e| e.kind == EntityKind::PlayerStart).collect();
-    match starts.len() {
-        0 => out.push(("no player start".to_string(), None)),
-        1 => {}
-        n => out.push((format!("{n} player starts; Play uses the first"), Some(to_view(starts[1].pos)))),
-    }
-    if let Some(s) = starts.first() {
-        match scene.node_at(s.pos[0], s.pos[1], s.pos[2]) {
-            None => out.push(("the player start is inside rock".into(), Some(to_view(s.pos)))),
-            Some(n) => {
-                let reach: std::collections::HashSet<_> = scene.reachable(n).into_iter().map(|e| e.0).collect();
-                let all = scene.floor_cells();
-                let lost: Vec<_> = all.iter().filter(|c| !reach.contains(c)).collect();
-                if !lost.is_empty() {
-                    let c = lost[0];
-                    let f = scene.node_floor(*c, [(c.0 as f32 + 0.5) * TF, (c.1 as f32 + 0.5) * TF]);
-                    out.push((
-                        format!("{} of {} floor cells can't be reached from the start", lost.len(), all.len()),
-                        Some(to_view([(c.0 as f32 + 0.5) * TF, f, (c.1 as f32 + 0.5) * TF]) + Vec3::Y * 0.5),
-                    ));
-                }
-            }
-        }
-    }
-    for e in &l.entities {
-        if e.kind != EntityKind::PlayerStart && scene.node_at(e.pos[0], e.pos[1], e.pos[2]).is_none() {
-            out.push((format!("{} #{} is inside rock", kind_name(&e.kind), e.id), Some(to_view(e.pos))));
-        }
-        let key = match &e.kind {
-            EntityKind::Door { key, .. } | EntityKind::Chest { key, .. } => *key,
-            _ => None,
-        };
-        if let Some(k) = key {
-            if !l.entities.iter().any(|o| o.id == k && matches!(o.kind, EntityKind::Key { .. })) {
-                out.push((format!("{} #{} needs key #{k}, which isn't a key", kind_name(&e.kind), e.id), Some(to_view(e.pos))));
-            }
-        }
-    }
-    out
 }

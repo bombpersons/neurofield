@@ -353,7 +353,7 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 | Entities | An outliner grouped by kind, with a filter box (matching labels or kind names). Click to select, double-click to frame it. Add... puts one where the camera looks. |
 | Textures | The slot palette with previews for the level's texture set. Click one to paint with it (this switches to the Paint tool). |
 | Areas | A list of areas. Select one to highlight it in both views, double-click to frame it. *New area from the selected faces* makes one boxing the selected faces' cells, floor to ceiling. |
-| Issues | Validation results. Click one to jump to it. |
+| Issues | Validation results, grouped, errors in red and warnings in amber; the tab shows how many. Click one to fly there, select its entity and centre the plan on it. |
 
 The layout is saved between sessions.
 
@@ -442,17 +442,29 @@ held, door states and the last message.
 
 ### Validation (Issues window)
 
-The editor reports:
-- steps taller than `MAX_STEP` between neighbouring walkable cells, which are
-  only a problem where they cut a path;
-- open cells that can't be reached from `PlayerStart`;
-- a missing `PlayerStart`, or more than one;
-- doors not sitting between two open cells;
-- locked doors and chests whose key doesn't exist, or can't be reached
-  without passing through that door;
-- creatures that don't fit in their space;
-- views where the triangle budget overflows badly (sampled along walkable
-  cells).
+The checks (`editor/src/checks.rs`) run again whenever the level changes and
+nothing is being dragged. The walk from `PlayerStart` is solved with the doors:
+a locked door opens once its key, or a lever that moves it, has been reached,
+and the walk goes again until nothing more opens. The editor reports:
+- a missing `PlayerStart`, or more than one, or one inside rock;
+- places that can't be reached, each with what cuts it off: a locked door, or
+  the lowest step taller than `MAX_STEP` between it and somewhere reached. An
+  empty place is a warning (a pit's floor may be meant to be out of reach); one
+  holding a key, lever or chest is an error;
+- doors not sitting between two open cells, or over a step too tall to climb;
+- locked doors whose key is behind the door itself or can't be reached, locked
+  doors with neither key nor lever, chests whose key can't be reached, keys
+  that point at something that isn't a key, and levers that move something
+  that isn't a door;
+- entities inside rock;
+- creatures pressed against the ceiling (so shrunk to fit) or reaching into the
+  walls;
+- views that see far more triangles (half as many again) than the network's
+  512: sampled from up to 160 walkable cells, four ways round at eye height,
+  counted in the background since it takes a moment.
+
+Errors stop the level playing as meant; warnings are worth a look. Agents get
+the same list from `editor_level` with `part: issues`.
 
 ## MCP
 
@@ -494,7 +506,7 @@ unless given a file, and never save the person's settings.
 | Tool | |
 |---|---|
 | `editor_status` | Tool, drag under way, selection, the face under the pointer, the status message, unsaved changes, undo depth, camera, view toggles, and where each panel is. |
-| `editor_level` | A summary (bounds, entities, areas), or the entities, lights, areas, cells (each column's open runs), painted faces, settings or strangeness (settings, painted lattice points, area overrides) as JSON, or all of it as RON. |
+| `editor_level` | A summary (bounds, entities, areas), or the entities, lights, areas, cells (each column's open runs), painted faces, settings or strangeness (settings, painted lattice points, area overrides) as JSON, the Issues window's checks (`issues`), or all of it as RON. |
 | `editor_locate` | Where an entity, light, world point, cell face or plan tile is on screen, with what a click there would hit. |
 | `editor_camera` | Point the 3D view at a world point or an entity. |
 | `editor_screenshot` | A PNG of the window, one panel, or a rectangle. |

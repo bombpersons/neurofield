@@ -13,6 +13,7 @@
 //! without an OS window (`--size 1280x800`), and `--software` picks a software
 //! renderer. Developer builds (`--features dev-mcp`) add testing tools on stdio.
 
+mod checks;
 mod doc;
 mod flesh;
 mod mcp;

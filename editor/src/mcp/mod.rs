@@ -128,6 +128,7 @@ enum Part {
     Paint,
     Settings,
     Strangeness,
+    Issues,
     Ron,
 }
 
@@ -327,7 +328,7 @@ fn serve(
         let result = match command {
             Command::Status => Ok(status(&ui, &doc.0, &built, &cam, windows.single().ok(), headless.is_some(), frame.0)),
             Command::Locate(args) => locate(&ui, &doc, &built, &cam, &args),
-            Command::Level(args) => level(&doc, args.part),
+            Command::Level(args) => level(&doc, &built, args.part),
             Command::Camera(args) => camera(&doc, &mut cam, args),
             Command::Edit(e) => edit::apply(e, &mut ui, &mut doc.0, &mut cam),
             Command::Screenshot(args) => {
@@ -490,7 +491,7 @@ fn locate(ui: &Ui, doc: &Document, built: &Built, cam: &EditorCam, a: &LocateArg
     Ok(out)
 }
 
-fn level(doc: &Document, part: Part) -> Result<Value, String> {
+fn level(doc: &Document, built: &Built, part: Part) -> Result<Value, String> {
     let l = &doc.0.level;
     let j = |v: Result<Value, serde_json::Error>| v.map_err(|e| e.to_string());
     Ok(match part {
@@ -525,6 +526,20 @@ fn level(doc: &Document, part: Part) -> Result<Value, String> {
             "points": l.strange_points.iter().map(|(&(x, y, z), &v)| json!([[x, y, z], v])).collect::<Vec<_>>(),
             "areas": l.areas.iter().enumerate().filter_map(|(i, a)| Some(json!({"index": i, "name": a.name, "strangeness": a.strangeness?}))).collect::<Vec<_>>(),
         }),
+        Part::Issues => {
+            // The view's scene, unless an edit since hasn't reached it yet.
+            let fresh;
+            let scene = if built.version == doc.0.version { built.whole() } else {
+                fresh = l.to_scene();
+                &fresh
+            };
+            let issues = crate::checks::check_all(l, scene);
+            json!({"issues": issues.iter().map(|i| json!({
+                "group": i.group.name(),
+                "severity": match i.severity { crate::checks::Severity::Error => "error", crate::checks::Severity::Warning => "warning" },
+                "text": i.text, "at": i.at, "entity": i.entity,
+            })).collect::<Vec<_>>()})
+        }
         Part::Ron => json!({"ron": l.to_ron()}),
     })
 }
@@ -602,7 +617,7 @@ fn view_tools() -> Vec<(&'static str, &'static str, Value)> {
     let triple = |t: &str| json!({"type": "array", "items": {"type": t}, "minItems": 3, "maxItems": 3});
     vec![
         ("editor_status", "The editor's state: file, unsaved changes, undo depth, the tool and any drag under way, selection, the face under the pointer, the status message, camera, view toggles, counts, where each panel and the plan map are, and the window.", json!({"type": "object", "properties": {}, "additionalProperties": false})),
-        ("editor_level", "Read the level being edited. part: summary (default: bounds, entity list, area names), entities, lights, areas, cells (each column's open runs of layers), paint (painted faces), settings (name, textures, ambient, fog, sun, surface, strangeness), strangeness (its settings, the painted lattice points [[x, up, z], offset], and areas that add to or pin it), or ron (the whole file).", json!({"type": "object", "properties": {"part": {"type": "string", "enum": ["summary", "entities", "lights", "areas", "cells", "paint", "settings", "strangeness", "ron"], "default": "summary"}}, "additionalProperties": false})),
+        ("editor_level", "Read the level being edited. part: summary (default: bounds, entity list, area names), entities, lights, areas, cells (each column's open runs of layers), paint (painted faces), settings (name, textures, ambient, fog, sun, surface, strangeness), strangeness (its settings, the painted lattice points [[x, up, z], offset], and areas that add to or pin it), issues (the Issues window's checks: group start, reach, doors, keys, entities, creatures or budget; severity error or warning; text; where to look, world units; the entity), or ron (the whole file).", json!({"type": "object", "properties": {"part": {"type": "string", "enum": ["summary", "entities", "lights", "areas", "cells", "paint", "settings", "strangeness", "issues", "ron"], "default": "summary"}}, "additionalProperties": false})),
         ("editor_locate", "Where something is on screen: in the 3D view (with what a click there would hit, and the panel covering it, if any) and in the plan. Give one of entity (id), light (index), point (world units, y down), cell [x, layer, z] with face (floor, ceiling, n, e, s, w), or tile [x, z] (at the plan's slice).", json!({"type": "object", "properties": {"entity": {"type": "integer"}, "light": {"type": "integer"}, "point": triple("number"), "cell": triple("integer"), "face": {"type": "string", "enum": ["floor", "ceiling", "n", "e", "s", "w"]}, "tile": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}}, "additionalProperties": false})),
         ("editor_camera", "Point the 3D view: look at a world point or an entity from distance tiles away, and/or set yaw and pitch (radians; yaw 0 looks toward world +z, pitch up). Moves the view of whoever is using the editor.", json!({"type": "object", "properties": {"look_at": triple("number"), "entity": {"type": "integer"}, "distance": {"type": "number"}, "yaw": {"type": "number"}, "pitch": {"type": "number"}}, "additionalProperties": false})),
         ("editor_screenshot", "PNG of the editor as rendered: the whole window, one panel (its tab title, e.g. Viewport), or a rectangle [x, y, w, h].", json!({"type": "object", "properties": {"panel": {"type": "string"}, "rect": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}, "additionalProperties": false})),

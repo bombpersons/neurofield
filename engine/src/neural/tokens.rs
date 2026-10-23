@@ -52,8 +52,15 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-/// Camera-space triangle tokens for view `v` over a scene's raw triangle features `tris`.
-pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
+/// How many of the triangles `tris` view `v` would see, before `MAX_TRIS` cuts them off.
+pub fn visible(tris: &[f32], v: &[f32]) -> usize {
+    cull(tris, v).len()
+}
+
+/// (min z, camera-space vertices, normal, raw index) for every triangle that
+/// survives culling, in the scene's order.
+#[allow(clippy::type_complexity)]
+fn cull(tris: &[f32], v: &[f32]) -> Vec<(f32, [[f32; 3]; 3], [f32; 3], usize)> {
     let pos = [v[1], v[2], v[3]];
     let r = [[v[4], v[5], v[6]], [v[7], v[8], v[9]], [v[10], v[11], v[12]]];
     let h = v[13];
@@ -61,8 +68,7 @@ pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
     let near = h / 2.0 / 256.0;
     let k = 160.0 / h * 1.05;
 
-    // (min z, camera-space vertices, normal, raw index) for every triangle that survives culling.
-    let mut kept: Vec<(f32, [[f32; 3]; 3], [f32; 3], usize)> = Vec::new();
+    let mut kept = Vec::new();
     for (i, t) in tris.chunks_exact(RAW).enumerate() {
         let p = [0, 1, 2].map(|j| {
             let d = sub([t[3 * j], t[3 * j + 1], t[3 * j + 2]], pos);
@@ -91,6 +97,14 @@ pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
         }
         kept.push((zmin, p, n, i));
     }
+    kept
+}
+
+/// Camera-space triangle tokens for view `v` over a scene's raw triangle features `tris`.
+pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
+    let h = v[13];
+    let near = h / 2.0 / 256.0;
+    let mut kept = cull(tris, v);
     kept.sort_by(|a, b| a.0.total_cmp(&b.0));
     kept.truncate(MAX_TRIS);
 

@@ -508,9 +508,16 @@ impl Scene {
     /// floors on either side of the shared edge, so stairs and ramps pass and ledges
     /// don't, and needs headroom across it.
     pub fn can_step(&self, a: Node, b: Node) -> bool {
+        self.rise(a, b).is_some_and(|r| r <= MAX_STEP)
+    }
+
+    /// How far the floor climbs or drops across the edge from span `a` to span `b`
+    /// in the next column, where there is headroom to cross it at all; `None` where
+    /// a prop or a low ceiling is in the way.
+    pub fn rise(&self, a: Node, b: Node) -> Option<f32> {
         let (sa, sb) = (self.span(a), self.span(b));
         if sa.blocked || sb.blocked {
-            return false;
+            return None;
         }
         let (ax, az) = ((a.0 as f32 + 0.5) * TF, (a.1 as f32 + 0.5) * TF);
         let (dx, dz) = ((b.0 - a.0) as f32, (b.1 - a.1) as f32);
@@ -518,7 +525,7 @@ impl Scene {
         let (pa, pb) = ([ex - dx, ez - dz], [ex + dx, ez + dz]);
         let (fa, fb) = (sa.floor(a.0, a.1, pa), sb.floor(b.0, b.1, pb));
         let top = |s: &Span, n: Node, p| if s.sky { f32::MIN } else { s.ceiling(n.0, n.1, p) };
-        (fa - fb).abs() <= MAX_STEP && fa.min(fb) - top(sa, a, pa).max(top(sb, b, pb)) >= 0.75 * TF
+        (fa.min(fb) - top(sa, a, pa).max(top(sb, b, pb)) >= 0.75 * TF).then(|| (fa - fb).abs())
     }
 
     /// Spans one step away from `n`.
