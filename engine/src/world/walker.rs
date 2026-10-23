@@ -130,10 +130,12 @@ impl Walker {
     /// Can the body stand at (x, z) coming from floor height `from`? The centre may
     /// move at most a step up or down; the corners of the body only need floor that
     /// isn't steeper than 45° from it, so steep stairs pass but walls and pits don't.
+    /// Closed doors are in the way.
     fn free(scene: &Scene, x: f32, z: f32, from: f32) -> Option<f32> {
         let fy = scene.walkable_y(x, from, z)?;
         let reach = MAX_STEP + RADIUS * std::f32::consts::SQRT_2;
         let ok = (fy - from).abs() <= MAX_STEP
+            && !scene.door_blocks(x, z, fy, RADIUS)
             && [(-RADIUS, -RADIUS), (RADIUS, -RADIUS), (-RADIUS, RADIUS), (RADIUS, RADIUS)]
                 .iter()
                 .all(|&(dx, dz)| scene.walkable_y(x + dx, fy, z + dz).is_some_and(|f| (f - fy).abs() <= reach));

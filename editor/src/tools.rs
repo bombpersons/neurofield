@@ -8,7 +8,11 @@ use crate::pick::{self, Hit, Ray, LAYER};
 use crate::view3d::{Built, EditorCam, ViewInput};
 use bevy::prelude::*;
 use bevy_egui::egui;
-use engine::world::level::{Area, CeilingKind, Dir, Face, Level, PointLight, SlopeDef, SlopeKind, Surface};
+use engine::world::creature::Kind;
+use engine::world::level::{
+    Area, CeilingKind, Dir, Entity, EntityKind, Face, Hinge, Level, PointLight, PropShape, SlopeDef, SlopeKind, Surface,
+};
+use engine::world::scene::{Scene, STEP};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,14 +63,14 @@ impl Tool {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Tool::Select => "click a face or entity, shift adds, drag a box of faces; Delete removes an entity",
+            Tool::Select => "click a face or entity, shift adds, drag a box of faces, drag an entity to move it; Delete removes it",
             Tool::Room => "drag a rectangle on a floor, move up or down for the height, click; ctrl makes it an area",
             Tool::PushPull => "drag a face (or the selected faces) in or out",
             Tool::Carve => "click or drag to carve a cell, shift to fill one",
             Tool::Slope => "click near a floor's edge to climb away from it, drag for a flight; wheel: rise, Tab: ramp or stairs",
             Tool::Paint => "click or drag to paint faces (the selection, if you click in it), shift-click fills the plane, ctrl-click picks up a face's texture",
             Tool::Strange => "brush strangeness on, shift to take it off, ctrl to smooth",
-            Tool::Place => "click to place the chosen entity",
+            Tool::Place => "click a floor to place the chosen entity (doors go on the nearest edge), drag to move it; ctrl: don't snap, Tab: turn",
             Tool::Light => "click a face to put a light by it, drag to lift it off",
         }
     }
@@ -74,9 +78,8 @@ impl Tool {
     /// The milestone that brings it (docs/editor.md), for tools not built yet.
     pub fn coming(self) -> Option<u32> {
         match self {
-            Tool::Select | Tool::Room | Tool::PushPull | Tool::Carve | Tool::Slope | Tool::Paint | Tool::Light => None,
-            Tool::Place => Some(5),
             Tool::Strange => Some(6),
+            _ => None,
         }
     }
 }
@@ -92,6 +95,27 @@ pub enum Sel {
     /// Lights and areas by their index in the level.
     Light(usize),
     Area(usize),
+}
+
+/// A link being picked in the view or the plan: the next entity clicked becomes
+/// the key of door (or chest) `Key`, or a target of lever `Target`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    Key(u32),
+    Target(u32),
+}
+
+/// The kinds the Entity tool places, with their names.
+pub fn entity_kinds() -> Vec<(&'static str, EntityKind)> {
+    vec![
+        ("Player start", EntityKind::PlayerStart),
+        ("Creature", EntityKind::Creature { kind: Kind::Humanoid, size: 1.0, seed: 1 }),
+        ("Door", EntityKind::Door { width: 1, height: 8, hinge: Hinge::Left, open: false, locked: false, key: None }),
+        ("Key", EntityKind::Key { name: "key".into() }),
+        ("Chest", EntityKind::Chest { locked: false, key: None, contents: Vec::new() }),
+        ("Prop", EntityKind::Prop { shape: PropShape::Box, size: [80.0, 120.0, 80.0], tex: 2, tint: [0.8, 0.75, 0.7] }),
+        ("Lever", EntityKind::Lever { targets: Vec::new() }),
+    ]
 }
 
 /// A drag or click under way.
@@ -110,6 +134,8 @@ pub enum Op {
     Paint { cell: [i32; 3], face: Face },
     /// Light: lifting light `index` off the face at `origin` along `normal`.
     Light { index: usize, origin: Vec3, normal: Vec3 },
+    /// Moving entity `id` over the floors, once the pointer has left `from` (screen).
+    Move { id: u32, from: egui::Pos2, moving: bool },
 }
 
 pub struct Tools {
@@ -125,6 +151,10 @@ pub struct Tools {
     pub ceiling: CeilingKind,
     /// The texture slot Paint puts on.
     pub slot: u8,
+    /// The Entity tool's kind (an index into `entity_kinds`) and facing, radians.
+    pub place: usize,
+    pub yaw: f32,
+    pub link: Option<Link>,
     /// Something finished on a press: wait for the button to come up.
     swallow: bool,
     /// The plan's Room rectangle, from its first corner.
@@ -143,6 +173,9 @@ impl Default for Tools {
             kind: SlopeKind::Stairs,
             ceiling: CeilingKind::Follow,
             slot: 0,
+            place: 1,
+            yaw: 0.0,
+            link: None,
             swallow: false,
             plan_start: None,
         }
@@ -161,8 +194,9 @@ impl Tools {
     /// Stop whatever is under way, putting the level back. False if nothing was.
     pub fn cancel(&mut self, doc: &mut Doc) -> bool {
         self.plan_start = None;
+        let linking = self.link.take().is_some();
         match std::mem::replace(&mut self.op, Op::Idle) {
-            Op::Idle => return false,
+            Op::Idle => return linking,
             Op::RoomHeight { before, .. } | Op::Push { before, .. } | Op::Slope { before, .. } => doc.level = before,
             // A light being placed goes again.
             Op::Light { index, .. } if index < doc.level.lights.len() => _ = doc.level.lights.remove(index),
@@ -180,6 +214,8 @@ impl Tools {
             kind: self.kind,
             ceiling: self.ceiling,
             slot: self.slot,
+            place: self.place,
+            yaw: self.yaw,
             ..Tools::default()
         };
     }
@@ -362,6 +398,21 @@ impl Tools {
                 }
                 if up { Op::Idle } else { Op::Light { index, origin, normal } }
             }
+            (Op::Move { id, from, mut moving }, _) => {
+                let p = ctx.pointer_latest_pos().unwrap_or(from);
+                moving |= (p - from).length() > 4.0;
+                let e = doc.level.entities.iter().find(|e| e.id == id).cloned();
+                if let (true, Some(h), Some(e)) = (moving, self.hover, e) {
+                    if let Some((pos, yaw)) = place_on(&built.scene, &h, &e.kind, e.yaw, mods.ctrl) {
+                        let e = doc.level.entities.iter_mut().find(|e| e.id == id).unwrap();
+                        if e.pos != pos || e.yaw != yaw {
+                            e.pos = pos;
+                            e.yaw = yaw;
+                        }
+                    }
+                }
+                if up { Op::Idle } else { Op::Move { id, from, moving } }
+            }
             (op, _) => op,
         };
         self.outlines(doc, built, ray, *sel);
@@ -382,22 +433,36 @@ impl Tools {
         message: &mut String,
     ) -> Op {
         let Some(r) = ray else { return Op::Idle };
+        let p = ctx.pointer_latest_pos().unwrap_or_default();
+        // The entity or light marker near the pointer.
+        let near = {
+            let to_view = crate::view3d::to_view;
+            let entities = doc.level.entities.iter().map(|e| (Sel::Entity(e.id), to_view(e.pos) + Vec3::Y * 0.15));
+            let lights = doc.level.lights.iter().enumerate().map(|(i, l)| (Sel::Light(i), to_view(l.pos)));
+            entities
+                .chain(lights)
+                .filter_map(|(s, v)| Some((s, (pick::project(cam, screen, v)? - p).length())))
+                .filter(|&(_, d)| d < 10.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(s, _)| s)
+        };
+        if let Some(link) = self.link.take() {
+            match near {
+                Some(Sel::Entity(id)) => *message = make_link(&mut doc.level, link, id),
+                _ => *message = "no entity there: link cancelled".into(),
+            }
+            self.swallow = true;
+            return Op::Idle;
+        }
         match self.tool {
             Tool::Select => {
-                // An entity or light marker near the pointer first.
-                let p = ctx.pointer_latest_pos().unwrap_or_default();
-                let to_view = crate::view3d::to_view;
-                let entities = doc.level.entities.iter().map(|e| (Sel::Entity(e.id), to_view(e.pos) + Vec3::Y * 0.15));
-                let lights = doc.level.lights.iter().enumerate().map(|(i, l)| (Sel::Light(i), to_view(l.pos)));
-                let near = entities
-                    .chain(lights)
-                    .filter_map(|(s, v)| Some((s, (pick::project(cam, screen, v)? - p).length())))
-                    .filter(|&(_, d)| d < 10.0)
-                    .min_by(|a, b| a.1.total_cmp(&b.1));
-                if let Some((s, _)) = near {
+                if let Some(s) = near {
                     *sel = s;
                     self.faces.clear();
-                    return Op::Idle;
+                    return match s {
+                        Sel::Entity(id) => Op::Move { id, from: p, moving: false },
+                        _ => Op::Idle,
+                    };
                 }
                 *sel = Sel::None;
                 if !mods.shift {
@@ -491,6 +556,18 @@ impl Tools {
                 *sel = Sel::Light(index);
                 Op::Light { index, origin: h.point, normal }
             }
+            Tool::Place => {
+                let kind = entity_kinds()[self.place].1.clone();
+                let placed = self.hover.and_then(|h| place_on(&built.scene, &h, &kind, self.yaw, mods.ctrl));
+                let Some((pos, yaw)) = placed else {
+                    *message = "entities go on floors".into();
+                    self.swallow = true;
+                    return Op::Idle;
+                };
+                let id = add_entity(&mut doc.level, kind, pos, yaw);
+                *sel = Sel::Entity(id);
+                Op::Move { id, from: p, moving: true }
+            }
             _ => Op::Idle,
         }
     }
@@ -507,6 +584,11 @@ impl Tools {
             outline(lines, pick::quad(l, c, f), SELECTED);
         }
         match sel {
+            Sel::Entity(id) => {
+                if let Some(e) = l.entities.iter().find(|e| e.id == id) {
+                    ghost(lines, &e.kind, e.pos, e.yaw, SELECTED);
+                }
+            }
             Sel::Area(i) => {
                 for &(lo, hi) in l.areas.get(i).map_or(&[][..], |a| &a.boxes) {
                     cuboid(lines, lo, hi, SELECTED);
@@ -600,6 +682,12 @@ impl Tools {
                             cuboid(lines, lo, hi, HOVER);
                         }
                     }
+                    Tool::Place => {
+                        let kind = &entity_kinds()[self.place].1;
+                        if let Some((pos, yaw)) = place_on(&built.scene, &h, kind, self.yaw, false) {
+                            ghost(lines, kind, pos, yaw, HOVER);
+                        }
+                    }
                     Tool::Slope if h.face == Face::Floor => {
                         let q = pick::quad(l, h.cell, h.face);
                         outline(lines, q, HOVER);
@@ -627,8 +715,11 @@ impl Tools {
         tile: Option<egui::Vec2>,
         slice: i32,
         doc: &mut Doc,
+        scene: &Scene,
+        sel: &mut Sel,
         message: &mut String,
     ) -> Option<((i32, i32), (i32, i32))> {
+        const TF: f32 = crate::view3d::TF;
         let cell = tile.map(|t| (t.x.floor() as i32, t.y.floor() as i32));
         let (primary_down, primary_pressed) = r.ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
         match self.tool {
@@ -658,6 +749,21 @@ impl Tools {
                         doc.level.close(x, z, slice, slice + self.height);
                     } else {
                         doc.level.open(x, z, slice, slice + self.height);
+                    }
+                }
+                None
+            }
+            Tool::Place => {
+                let t = tile?;
+                if r.clicked() {
+                    let kind = entity_kinds()[self.place].1.clone();
+                    let y = -(slice * STEP) as f32 - 8.0;
+                    match place_at(scene, &kind, [t.x * TF, y, t.y * TF], self.yaw, mods.ctrl) {
+                        Some((pos, yaw)) => {
+                            let id = add_entity(&mut doc.level, kind, pos, yaw);
+                            *sel = Sel::Entity(id);
+                        }
+                        None => *message = "nothing open at the slice there".into(),
                     }
                 }
                 None
@@ -715,6 +821,24 @@ impl Tools {
                 })
                 .response
                 .on_hover_text("Pick one in the Textures window, or ctrl-click a face");
+            }
+            Tool::Place => {
+                ui.horizontal_wrapped(|ui| {
+                    for (i, (name, kind)) in entity_kinds().iter().enumerate() {
+                        let c = crate::view3d::entity_colour(kind).to_srgba();
+                        let c = egui::Color32::from_rgb((c.red * 255.0) as u8, (c.green * 255.0) as u8, (c.blue * 255.0) as u8);
+                        ui.selectable_value(&mut self.place, i, egui::RichText::new(*name).color(c));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("facing");
+                    let mut deg = self.yaw.to_degrees().round();
+                    if ui.add(egui::DragValue::new(&mut deg).speed(1.0).suffix("°")).changed() {
+                        self.yaw = deg.to_radians();
+                    }
+                })
+                .response
+                .on_hover_text("Tab turns it a quarter; doors face into the cell you click in, and open into it");
             }
             Tool::Select | Tool::PushPull if !self.faces.is_empty() => {
                 ui.horizontal(|ui| {
@@ -782,6 +906,124 @@ fn cuboid(lines: &mut Vec<(Vec3, Vec3, Color)>, lo: [i32; 3], hi: [i32; 3], c: C
             lines.push((bottom[i], top[i], c));
         }
     }
+}
+
+/// Where an entity of `kind` goes for the pointer on `h`, and its facing: see `place_at`.
+pub fn place_on(scene: &Scene, h: &Hit, kind: &EntityKind, yaw: f32, free: bool) -> Option<([f32; 3], f32)> {
+    if h.face != Face::Floor {
+        return None;
+    }
+    place_at(scene, kind, crate::view3d::to_world(h.point), yaw, free)
+}
+
+/// Where an entity of `kind` goes for world point `p` and its facing: on the floor
+/// at the middle of the cell (or right at `p` if `free`), facing `yaw`. Doors go
+/// on the middle of the cell's nearest edge instead, facing into the cell (so
+/// they open into it).
+pub fn place_at(scene: &Scene, kind: &EntityKind, p: [f32; 3], yaw: f32, free: bool) -> Option<([f32; 3], f32)> {
+    const TF: f32 = crate::view3d::TF;
+    let (x, z) = ((p[0] / TF).floor(), (p[2] / TF).floor());
+    let (cx, cz) = ((x + 0.5) * TF, (z + 0.5) * TF);
+    // The floor of the cell, near the pointer's height.
+    let floor = |px: f32, pz: f32| scene.floor_y(px, p[1] - 8.0, pz);
+    if let EntityKind::Door { width, .. } = kind {
+        let (fx, fz) = (p[0] / TF - x - 0.5, p[2] / TF - z - 0.5);
+        let (dx, dz) = if fx.abs() > fz.abs() { (fx.signum(), 0.0) } else { (0.0, fz.signum()) };
+        // Forward is (-sin, cos): back into the cell, the way it swings open.
+        let yaw = dx.atan2(-dz);
+        // A wider door spreads to the right from this edge.
+        let shift = (*width - 1).max(0) as f32 * 0.5 * TF;
+        let (ex, ez) = (cx + dx * TF / 2.0 + yaw.cos() * shift, cz + dz * TF / 2.0 + yaw.sin() * shift);
+        let fy = floor(cx, cz)?;
+        return Some(([ex, fy, ez], yaw));
+    }
+    let (px, pz) = if free { (p[0], p[2]) } else { (cx, cz) };
+    Some(([px, floor(px, pz)?, pz], yaw))
+}
+
+/// Add an entity, or move the player start if there is one already (there's
+/// only ever one). Returns its id.
+pub fn add_entity(l: &mut Level, kind: EntityKind, pos: [f32; 3], yaw: f32) -> u32 {
+    if kind == EntityKind::PlayerStart {
+        if let Some(e) = l.entities.iter_mut().find(|e| e.kind == EntityKind::PlayerStart) {
+            e.pos = pos;
+            e.yaw = yaw;
+            return e.id;
+        }
+    }
+    let id = l.next_id();
+    l.entities.push(Entity { id, kind, pos, yaw });
+    id
+}
+
+/// Make `link` to entity `to`, if it's the right kind. Says what happened.
+pub fn make_link(l: &mut Level, link: Link, to: u32) -> String {
+    let kind = |id: u32| l.entities.iter().find(|e| e.id == id).map(|e| e.kind.clone());
+    match (link, kind(to)) {
+        (Link::Key(from), Some(EntityKind::Key { name })) => {
+            if let Some(e) = l.entities.iter_mut().find(|e| e.id == from) {
+                if let EntityKind::Door { key, locked, .. } | EntityKind::Chest { key, locked, .. } = &mut e.kind {
+                    *key = Some(to);
+                    *locked = true;
+                }
+            }
+            format!("#{from} now opens with {name} (#{to})")
+        }
+        (Link::Target(from), Some(EntityKind::Door { .. })) => {
+            if let Some(EntityKind::Lever { targets }) = l.entities.iter_mut().find(|e| e.id == from).map(|e| &mut e.kind) {
+                if !targets.contains(&to) {
+                    targets.push(to);
+                }
+            }
+            format!("lever #{from} now works door #{to}")
+        }
+        (Link::Key(_), _) => "that isn't a key: link cancelled".into(),
+        (Link::Target(_), _) => "that isn't a door: link cancelled".into(),
+    }
+}
+
+/// The links between entities as lines from one position to another: keys to
+/// what they open, levers to their doors.
+pub fn links(l: &Level) -> Vec<([f32; 3], [f32; 3], Color)> {
+    let at = |id: u32| l.entities.iter().find(|e| e.id == id).map(|e| e.pos);
+    let mut out = Vec::new();
+    for e in &l.entities {
+        match &e.kind {
+            EntityKind::Door { key: Some(k), .. } | EntityKind::Chest { key: Some(k), .. } => {
+                out.extend(at(*k).map(|p| (p, e.pos, Color::srgb(1.0, 0.9, 0.2))));
+            }
+            EntityKind::Lever { targets } => {
+                out.extend(targets.iter().filter_map(|&t| at(t)).map(|p| (e.pos, p, Color::srgb(0.4, 0.8, 1.0))));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// An entity's outline at `pos` facing `yaw`: a door's leaf in its doorway,
+/// otherwise a box on the floor and an arrow the way it faces.
+fn ghost(lines: &mut Vec<(Vec3, Vec3, Color)>, kind: &EntityKind, pos: [f32; 3], yaw: f32, c: Color) {
+    let base = crate::view3d::to_view(pos);
+    // World x/z directions in the view's axes (its z is the world's -z).
+    let (s, co) = yaw.sin_cos();
+    let fwd = Vec3::new(-s, 0.0, -co);
+    let right = Vec3::new(co, 0.0, -s);
+    if let EntityKind::Door { width, height, .. } = kind {
+        let (w, h) = (*width as f32 * 0.5, *height as f32 * LAYER);
+        let q = [base - right * w, base + right * w, base + right * w + Vec3::Y * h, base - right * w + Vec3::Y * h];
+        outline(lines, q, c);
+        lines.push((base, base + fwd * 0.3, c));
+        return;
+    }
+    let (r, h) = (0.2, 0.4);
+    let q = [base - right * r - fwd * r, base + right * r - fwd * r, base + right * r + fwd * r, base - right * r + fwd * r];
+    outline(lines, q.map(|v| v + Vec3::Y * 0.01), c);
+    outline(lines, q.map(|v| v + Vec3::Y * h), c);
+    for v in q {
+        lines.push((v, v + Vec3::Y * h, c));
+    }
+    lines.push((base + Vec3::Y * 0.01, base + Vec3::Y * 0.01 + fwd * 0.45, c));
 }
 
 /// How far off a face a new light starts, in tiles.
@@ -1130,5 +1372,53 @@ mod tests {
         assert_eq!(edge_dir(0.9, 0.4), Dir::W);
         assert_eq!(edge_dir(0.5, 0.05), Dir::S);
         assert_eq!(edge_dir(0.5, 0.97), Dir::N);
+    }
+
+    #[test]
+    fn entities_snap_to_cells_and_doors_to_edges() {
+        let mut l = room();
+        push(&mut l, &[([2, 0, 1], Face::Floor)], 2);
+        let scene = l.to_scene();
+        let tf = crate::view3d::TF;
+        let creature = &entity_kinds()[1].1;
+        // Near a corner of cell (2, 1), whose floor is two layers up.
+        let (pos, yaw) = place_at(&scene, creature, [2.1 * tf, -200.0, 1.9 * tf], 0.5, false).unwrap();
+        assert_eq!(pos, [2.5 * tf, -128.0, 1.5 * tf]);
+        assert_eq!(yaw, 0.5);
+        let (pos, _) = place_at(&scene, creature, [2.1 * tf, -200.0, 1.9 * tf], 0.5, true).unwrap();
+        assert_eq!([pos[0], pos[2]], [2.1 * tf, 1.9 * tf]);
+        // A door near the east edge of (0, 0) sits on it facing back west, into the cell.
+        let door = &entity_kinds()[2].1;
+        let (pos, yaw) = place_at(&scene, door, [0.9 * tf, -10.0, 0.4 * tf], 0.0, false).unwrap();
+        assert_eq!(pos, [tf, 0.0, 0.5 * tf]);
+        assert!((-yaw.sin() + 1.0).abs() < 1e-6 && yaw.cos().abs() < 1e-6, "{yaw}");
+        // Near the north edge: facing south (+z).
+        let (pos, yaw) = place_at(&scene, door, [0.5 * tf, -10.0, 0.1 * tf], 0.0, false).unwrap();
+        assert_eq!(pos, [0.5 * tf, 0.0, 0.0]);
+        assert!((yaw.cos() - 1.0).abs() < 1e-6, "{yaw}");
+        // Nothing to stand on in the rock.
+        assert!(place_at(&scene, creature, [6.5 * tf, -10.0, 6.5 * tf], 0.0, false).is_none());
+    }
+
+    #[test]
+    fn one_player_start_and_links_of_the_right_kind() {
+        let mut l = room();
+        let a = add_entity(&mut l, EntityKind::PlayerStart, [1.0; 3], 0.0);
+        let b = add_entity(&mut l, EntityKind::PlayerStart, [2.0; 3], 1.0);
+        assert_eq!(a, b);
+        assert_eq!(l.entities.iter().filter(|e| e.kind == EntityKind::PlayerStart).count(), 1);
+        let door = add_entity(&mut l, entity_kinds()[2].1.clone(), [0.0; 3], 0.0);
+        let key = add_entity(&mut l, entity_kinds()[3].1.clone(), [0.0; 3], 0.0);
+        let lever = add_entity(&mut l, entity_kinds()[6].1.clone(), [0.0; 3], 0.0);
+        assert!(make_link(&mut l, Link::Key(door), lever).contains("isn't a key"));
+        make_link(&mut l, Link::Key(door), key);
+        let d = l.entities.iter().find(|e| e.id == door).unwrap();
+        assert!(matches!(d.kind, EntityKind::Door { key: Some(k), locked: true, .. } if k == key));
+        assert!(make_link(&mut l, Link::Target(lever), key).contains("isn't a door"));
+        make_link(&mut l, Link::Target(lever), door);
+        make_link(&mut l, Link::Target(lever), door);
+        let v = l.entities.iter().find(|e| e.id == lever).unwrap();
+        assert_eq!(v.kind, EntityKind::Lever { targets: vec![door] });
+        assert_eq!(links(&l).len(), 2);
     }
 }

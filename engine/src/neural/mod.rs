@@ -91,6 +91,12 @@ impl Level {
         tri_features(&self.scene, &mut self.tris);
     }
 
+    /// Redo the features of the doors, keys and levers after they moved.
+    pub fn things_moved(&mut self) {
+        self.tris.truncate(self.scene.tris.len() * features::TRI_FEATURES);
+        features::thing_tri_features(&self.scene, &mut self.tris);
+    }
+
     /// The network's inputs for the walker's current view.
     pub fn tokens(&self) -> tokens::Tokens {
         let mut v = Vec::new();

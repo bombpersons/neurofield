@@ -157,7 +157,7 @@ pub fn force_strangeness(base: Option<f32>) {
     FORCE_STRANGE.store(base.unwrap_or(f32::NAN).to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+pub(crate) fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -280,6 +280,8 @@ pub struct Scene {
     pub strange: Strange,
     /// Hand-built levels: texture slot of single faces, by cell (x, layer, z).
     pub(crate) paint: std::collections::HashMap<([i32; 3], crate::world::level::Face), u8>,
+    /// Hand-built levels: doors, keys and levers, drawn from their own parts.
+    pub things: crate::world::things::Things,
 }
 
 /// Position and orientation of one view. Angles use the GTE's 4096 = 360°.
@@ -598,6 +600,7 @@ impl Scene {
             lights,
             strange,
             paint: Default::default(),
+            things: Default::default(),
         };
         scene.build_level();
         if !scene.outdoor {
@@ -711,6 +714,16 @@ impl Scene {
             }
         }
         self.tris = tris;
+        let mut parts = std::mem::take(&mut self.things.parts);
+        for p in &mut parts {
+            for t in &mut p.tris {
+                for v in &mut t.v {
+                    v.col = self.shade(v.p, t.n, t.tint);
+                }
+            }
+            p.version += 1;
+        }
+        self.things.parts = parts;
         let lights: Vec<_> = self.flesh.light_at.iter().map(|&c| self.light_sh(c)).collect();
         self.flesh.lights = lights;
     }
@@ -869,6 +882,7 @@ impl Scene {
                 sun: [0.0; 3],
             },
             paint: Default::default(),
+            things: Default::default(),
         }
     }
 

@@ -12,27 +12,41 @@ pub const TRI_FEATURES: usize = 35;
 pub const PART_FEATURES: usize = 49;
 pub const VIEW_FEATURES: usize = 26;
 
-/// Per-triangle features as written to `tris.npy`, appended to `out`.
+/// Per-triangle features as written to `tris.npy`, appended to `out`: the
+/// level's, then those of its doors, keys and levers (`thing_tri_features`).
 pub fn tri_features(scene: &Scene, out: &mut Vec<f32>) {
     for t in &scene.tris {
-        for v in &t.v {
-            out.extend(v.p.map(|c| c as f32 / T as f32));
-        }
-        let (u0, v0) = tex::uv_origin(t.tex);
-        for v in &t.v {
-            out.push((v.uv[0] - u0) as f32 / tex::SIZE as f32);
-            out.push((v.uv[1] - v0) as f32 / tex::SIZE as f32);
-        }
-        out.push(t.tex as f32);
-        for v in &t.v {
-            out.extend(v.col.map(|c| c as f32 / 255.0));
-        }
-        for v in &t.v {
-            out.extend(v.alb.map(|c| c as f32 / 255.0));
-        }
-        let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
-        out.push(scene.strangeness(centre));
+        one_tri(scene, t, out);
     }
+    thing_tri_features(scene, out);
+}
+
+/// Features of the triangles of the scene's moving things alone: these come
+/// last, so a door's move only redoes this tail.
+pub fn thing_tri_features(scene: &Scene, out: &mut Vec<f32>) {
+    for t in scene.part_tris() {
+        one_tri(scene, t, out);
+    }
+}
+
+fn one_tri(scene: &Scene, t: &crate::world::scene::Tri, out: &mut Vec<f32>) {
+    for v in &t.v {
+        out.extend(v.p.map(|c| c as f32 / T as f32));
+    }
+    let (u0, v0) = tex::uv_origin(t.tex);
+    for v in &t.v {
+        out.push((v.uv[0] - u0) as f32 / tex::SIZE as f32);
+        out.push((v.uv[1] - v0) as f32 / tex::SIZE as f32);
+    }
+    out.push(t.tex as f32);
+    for v in &t.v {
+        out.extend(v.col.map(|c| c as f32 / 255.0));
+    }
+    for v in &t.v {
+        out.extend(v.alb.map(|c| c as f32 / 255.0));
+    }
+    let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
+    out.push(scene.strangeness(centre));
 }
 
 /// Per-part features of the scene's creatures as written to `parts.npy`, appended to `out`.

@@ -344,6 +344,12 @@ pub fn gizmos(mut g: Gizmos, built: Res<Built>, doc: Res<crate::Document>) {
         let f = Vec3::new(-e.yaw.sin(), 0.0, -e.yaw.cos()) * 0.35;
         g.line(p + Vec3::Y * 0.05, p + Vec3::Y * 0.05 + f, colour);
     }
+    // Links, a little off the floor, with a tick at the far end.
+    for (a, b, c) in crate::tools::links(level) {
+        let (a, b) = (to_view(a) + Vec3::Y * 0.2, to_view(b) + Vec3::Y * 0.2);
+        g.line(a, b, c);
+        g.line(b, b + Vec3::Y * 0.15, c);
+    }
     for l in &level.lights {
         let p = to_view(l.pos);
         let c = Color::srgb(l.colour[0].min(1.0), l.colour[1].min(1.0), l.colour[2].min(1.0));

@@ -4,7 +4,7 @@
 
 use crate::doc::Doc;
 use crate::settings::Settings;
-use crate::tools::{Sel, Tool, Tools};
+use crate::tools::{links, Link, Sel, Tool, Tools};
 use crate::view3d::{entity_colour, to_view, to_world, Built, EditorCam, ViewInput, ViewMode};
 use crate::Document;
 use bevy::prelude::*;
@@ -92,6 +92,8 @@ pub struct Ui {
     plan_for: Option<Option<PathBuf>>,
     fps: f32,
     plan: PlanView,
+    /// The Entities outliner's filter.
+    filter: String,
 }
 
 struct PlanView {
@@ -119,6 +121,7 @@ impl Ui {
             plan_for: None,
             fps: 60.0,
             plan: PlanView { centre: egui::vec2(8.0, 8.0), zoom: 18.0 },
+            filter: String::new(),
         }
     }
 
@@ -282,7 +285,10 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
     if pressed(Key::Home) {
         input.frame_request = Some(level_centre(&doc.level));
     }
-    if pressed(Key::Tab) && s.tools.tool == Tool::Slope {
+    if pressed(Key::Tab) && s.tools.tool == Tool::Place {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        s.tools.yaw = ((s.tools.yaw / quarter).round() + 1.0).rem_euclid(4.0) * quarter;
+    } else if pressed(Key::Tab) && s.tools.tool == Tool::Slope {
         s.tools.kind = match s.tools.kind {
             SlopeKind::Stairs => SlopeKind::Ramp,
             SlopeKind::Ramp => SlopeKind::Stairs,
@@ -598,9 +604,11 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
 fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorCam, sculpting: usize) {
     ui.horizontal(|ui| {
         let t = s.tools.tool;
-        let hint = match t.coming() {
-            None => format!("{}: {}", t.name(), t.hint()),
-            Some(m) => format!("{}: arrives in milestone {m}", t.name()),
+        let hint = match (s.tools.link, t.coming()) {
+            (Some(Link::Key(_)), _) => "Link: click the key it opens with, in the 3D view or the plan (Esc cancels)".into(),
+            (Some(Link::Target(_)), _) => "Link: click a door for the lever to work (Esc cancels)".into(),
+            (None, None) => format!("{}: {}", t.name(), t.hint()),
+            (None, Some(m)) => format!("{}: arrives in milestone {m}", t.name()),
         };
         ui.label(hint);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -746,8 +754,13 @@ impl Viewer<'_> {
         let mut delete = false;
         match self.s.sel {
             Sel::Entity(id) if l.entities.iter().any(|e| e.id == id) => {
+                let named = |want: fn(&EntityKind) -> bool| -> Vec<(u32, String)> {
+                    l.entities.iter().filter(|e| want(&e.kind)).map(|e| (e.id, entity_label(e))).collect()
+                };
+                let keys = named(|k| matches!(k, EntityKind::Key { .. }));
+                let doors = named(|k| matches!(k, EntityKind::Door { .. }));
                 let e = l.entities.iter_mut().find(|e| e.id == id).unwrap();
-                entity_properties(ui, e, &mut delete);
+                entity_properties(ui, e, &keys, &doors, &mut self.s.tools.link, &mut delete);
             }
             Sel::Light(i) if i < l.lights.len() => light_properties(ui, i, &mut l.lights[i], &mut delete),
             Sel::Area(i) if i < l.areas.len() => {
@@ -764,19 +777,21 @@ impl Viewer<'_> {
     fn entities(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("Add...", |ui| {
-                for (name, kind) in new_kinds() {
+                for (name, kind) in crate::tools::entity_kinds() {
                     if ui.button(name).clicked() {
                         let at = self.focus_on_floor();
-                        let id = self.doc.level.next_id();
-                        self.doc.level.entities.push(LevelEntity { id, kind, pos: at, yaw: 0.0 });
+                        let id = crate::tools::add_entity(&mut self.doc.level, kind, at, 0.0);
                         self.s.sel = Sel::Entity(id);
                         ui.close();
                     }
                 }
             })
             .response
-            .on_hover_text("at the point the camera is looking at");
+            .on_hover_text("at the point the camera is looking at (or place them with the Entity tool, E)");
+            ui.add(egui::TextEdit::singleline(&mut self.s.filter).hint_text("filter").desired_width(f32::INFINITY));
         });
+        let filter = self.s.filter.to_lowercase();
+        let shown = |label: &str| filter.is_empty() || label.to_lowercase().contains(&filter);
         ui.separator();
         let kinds = ["PlayerStart", "Creature", "Door", "Key", "Chest", "Prop", "Lever"];
         for k in kinds {
@@ -787,6 +802,7 @@ impl Viewer<'_> {
                 .iter()
                 .filter(|e| kind_name(&e.kind) == k)
                 .map(|e| (e.id, entity_label(e), egui_colour(entity_colour(&e.kind))))
+                .filter(|(_, label, _)| shown(label) || shown(k))
                 .collect();
             if items.is_empty() {
                 continue;
@@ -811,6 +827,7 @@ impl Viewer<'_> {
             .iter()
             .enumerate()
             .map(|(i, l)| format!("light {i} ({:.1}, {:.1}, {:.1})", l.pos[0] / TF, -l.pos[1] / TF, l.pos[2] / TF))
+            .filter(|label| shown(label))
             .collect();
         if !lights.is_empty() {
             egui::CollapsingHeader::new(format!("Light ({})", lights.len())).default_open(true).show(ui, |ui| {
@@ -907,7 +924,7 @@ impl Viewer<'_> {
         });
         let (rect, r) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let pv = &mut self.s.plan;
-        let edits = matches!(self.s.tools.tool, Tool::Room | Tool::Carve | Tool::Slope);
+        let edits = matches!(self.s.tools.tool, Tool::Room | Tool::Carve | Tool::Slope | Tool::Place);
         if r.dragged_by(egui::PointerButton::Secondary)
             || r.dragged_by(egui::PointerButton::Middle)
             || (!edits && r.dragged_by(egui::PointerButton::Primary))
@@ -946,9 +963,17 @@ impl Viewer<'_> {
             };
             painter.rect_filled(cell.shrink(0.5), 0.0, colour);
         }
+        for (a, b, c) in links(&self.doc.level) {
+            let (a, b) = (to_screen(a[0] / TF, a[2] / TF), to_screen(b[0] / TF, b[2] / TF));
+            painter.add(egui::Shape::dashed_line(&[a, b], egui::Stroke::new(1.0, egui_colour(c)), 4.0, 3.0));
+        }
         for e in &self.doc.level.entities {
             let p = to_screen(e.pos[0] / TF, e.pos[2] / TF);
             let c = egui_colour(entity_colour(&e.kind));
+            if let EntityKind::Door { width, .. } = e.kind {
+                let along = egui::vec2(e.yaw.cos(), e.yaw.sin()) * width as f32 * 0.5 * pv.zoom;
+                painter.line_segment([p - along, p + along], egui::Stroke::new(3.0, c));
+            }
             let rad = if self.s.sel == Sel::Entity(e.id) { 5.0 } else { 3.5 };
             painter.circle_filled(p, rad, c);
             if self.s.sel == Sel::Entity(e.id) {
@@ -972,9 +997,11 @@ impl Viewer<'_> {
         }
         // The tool, at the tile under the pointer.
         let (centre, zoom) = (pv.centre, pv.zoom);
+        let to_screen = move |x: f32, z: f32| rect.center() + (egui::vec2(x, z) - centre) * zoom;
         let tile = r.hover_pos().or(r.interact_pointer_pos()).map(|p| (p - rect.center()) / zoom + centre);
         let mods = ui.input(|i| i.modifiers);
-        if let Some((lo, hi)) = self.s.tools.plan(&r, mods, tile, slice, self.doc, &mut self.s.message) {
+        let s = &mut *self.s;
+        if let Some((lo, hi)) = s.tools.plan(&r, mods, tile, slice, self.doc, &self.built.scene, &mut s.sel, &mut s.message) {
             let to_screen = |x: f32, z: f32| rect.center() + (egui::vec2(x, z) - centre) * zoom;
             let area = egui::Rect::from_min_max(to_screen(lo.0 as f32, lo.1 as f32), to_screen(hi.0 as f32 + 1.0, hi.1 as f32 + 1.0));
             painter.rect_stroke(area, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(255, 140, 50)), egui::StrokeKind::Middle);
@@ -988,19 +1015,24 @@ impl Viewer<'_> {
         painter.circle_filled(p, 3.0, Color32::from_rgb(120, 200, 255));
 
         if let Some(pos) = r.interact_pointer_pos() {
-            let tile = (pos - rect.center()) / pv.zoom + pv.centre;
-            if r.clicked() && !edits {
-                // Pick the nearest entity within a few pixels.
+            let tile = (pos - rect.center()) / zoom + centre;
+            let linking = self.s.tools.link.is_some();
+            if r.clicked() && (!edits || linking) {
                 // The nearest entity or light within a few pixels.
                 let l = &self.doc.level;
                 let entities = l.entities.iter().map(|e| (Sel::Entity(e.id), e.pos));
                 let lights = l.lights.iter().enumerate().map(|(i, light)| (Sel::Light(i), light.pos));
-                self.s.sel = entities
+                let near = entities
                     .chain(lights)
                     .map(|(s, p)| (s, (to_screen(p[0] / TF, p[2] / TF) - pos).length()))
                     .filter(|&(_, d)| d < 8.0)
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map_or(Sel::None, |(s, _)| s);
+                match (self.s.tools.link.take(), near) {
+                    (Some(link), Sel::Entity(id)) => self.s.message = crate::tools::make_link(&mut self.doc.level, link, id),
+                    (Some(_), _) => self.s.message = "no entity there: link cancelled".into(),
+                    (None, near) => self.s.sel = near,
+                }
             }
             if r.double_clicked() {
                 let y = slice as f32 * STEP as f32 / TF + 0.6;
@@ -1037,18 +1069,6 @@ fn entity_label(e: &LevelEntity) -> String {
     }
 }
 
-fn new_kinds() -> Vec<(&'static str, EntityKind)> {
-    vec![
-        ("Player start", EntityKind::PlayerStart),
-        ("Creature", EntityKind::Creature { kind: Kind::Humanoid, size: 1.0, seed: 1 }),
-        ("Door", EntityKind::Door { width: 1, height: 8, hinge: Hinge::Left, open: false, locked: false, key: None }),
-        ("Key", EntityKind::Key { name: "key".into() }),
-        ("Chest", EntityKind::Chest { locked: false, key: None, contents: Vec::new() }),
-        ("Prop", EntityKind::Prop { shape: PropShape::Box, size: [80.0, 120.0, 80.0], tex: 2, tint: [0.8, 0.75, 0.7] }),
-        ("Lever", EntityKind::Lever { targets: Vec::new() }),
-    ]
-}
-
 fn colour_edit(ui: &mut egui::Ui, c: &mut [f32; 3]) {
     // Colours can go above 1 (bright lights); the picker shows them clamped. It
     // also rounds what it shows, so only take its colour when it is changed.
@@ -1061,26 +1081,70 @@ fn colour_edit(ui: &mut egui::Ui, c: &mut [f32; 3]) {
     }
 }
 
-fn ids_edit(ui: &mut egui::Ui, ids: &mut Vec<u32>) {
-    let mut text = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
-    if ui.text_edit_singleline(&mut text).changed() {
-        *ids = text.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+/// The button that picks a link by clicking an entity in the view or the plan.
+fn pick_button(ui: &mut egui::Ui, pending: &mut Option<Link>, link: Link) {
+    let on = *pending == Some(link);
+    let r = ui.selectable_label(on, "⌖").on_hover_text("Pick it: click it in the 3D view or the plan (Esc cancels)");
+    if r.clicked() {
+        *pending = if on { None } else { Some(link) };
     }
 }
 
-fn key_edit(ui: &mut egui::Ui, key: &mut Option<u32>) {
-    let mut has = key.is_some();
-    ui.checkbox(&mut has, "needs key");
-    if has {
-        let mut k = key.unwrap_or(0);
-        ui.add(egui::DragValue::new(&mut k).prefix("#"));
-        *key = Some(k);
-    } else {
-        *key = None;
-    }
+/// A lever's target doors: each with a button to drop it, and a way to add more.
+fn targets_edit(ui: &mut egui::Ui, me: u32, targets: &mut Vec<u32>, doors: &[(u32, String)], pending: &mut Option<Link>) {
+    ui.vertical(|ui| {
+        let mut drop = None;
+        for (i, t) in targets.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let name = doors.iter().find(|d| d.0 == *t).map_or(format!("#{t} (not a door)"), |d| d.1.clone());
+                ui.label(name);
+                if ui.small_button("×").on_hover_text("Drop this target").clicked() {
+                    drop = Some(i);
+                }
+            });
+        }
+        if let Some(i) = drop {
+            targets.remove(i);
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("add target").selected_text("add a door").show_ui(ui, |ui| {
+                let mut add = None;
+                for (id, name) in doors.iter().filter(|d| !targets.contains(&d.0)) {
+                    if ui.selectable_label(false, name).clicked() {
+                        add = Some(*id);
+                    }
+                }
+                targets.extend(add);
+            });
+            pick_button(ui, pending, Link::Target(me));
+        });
+    });
 }
 
-fn entity_properties(ui: &mut egui::Ui, e: &mut LevelEntity, delete: &mut bool) {
+/// The key a door or chest opens with: one of the level's keys, or none.
+fn key_edit(ui: &mut egui::Ui, me: u32, key: &mut Option<u32>, keys: &[(u32, String)], pending: &mut Option<Link>) {
+    let shown = match key {
+        None => "no key".to_string(),
+        Some(k) => keys.iter().find(|x| x.0 == *k).map_or(format!("#{k} (missing)"), |x| x.1.clone()),
+    };
+    egui::ComboBox::from_id_salt("key").selected_text(shown).show_ui(ui, |ui| {
+        ui.selectable_value(key, None, "no key");
+        for (id, name) in keys {
+            ui.selectable_value(key, Some(*id), name);
+        }
+    });
+    pick_button(ui, pending, Link::Key(me));
+}
+
+fn entity_properties(
+    ui: &mut egui::Ui,
+    e: &mut LevelEntity,
+    keys: &[(u32, String)],
+    doors: &[(u32, String)],
+    link: &mut Option<Link>,
+    delete: &mut bool,
+) {
+    let me = e.id;
     ui.horizontal(|ui| {
         ui.heading(format!("{} #{}", kind_name(&e.kind), e.id));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1150,7 +1214,7 @@ fn entity_properties(ui: &mut egui::Ui, e: &mut LevelEntity, delete: &mut bool) 
                 ui.label("lock");
                 ui.horizontal(|ui| {
                     ui.checkbox(locked, "locked");
-                    key_edit(ui, key);
+                    key_edit(ui, me, key, keys, link);
                 });
                 ui.end_row();
             }
@@ -1163,7 +1227,7 @@ fn entity_properties(ui: &mut egui::Ui, e: &mut LevelEntity, delete: &mut bool) 
                 ui.label("lock");
                 ui.horizontal(|ui| {
                     ui.checkbox(locked, "locked");
-                    key_edit(ui, key);
+                    key_edit(ui, me, key, keys, link);
                 });
                 ui.end_row();
                 ui.label("contents");
@@ -1196,8 +1260,8 @@ fn entity_properties(ui: &mut egui::Ui, e: &mut LevelEntity, delete: &mut bool) 
                 ui.end_row();
             }
             EntityKind::Lever { targets } => {
-                ui.label("targets (ids)");
-                ids_edit(ui, targets);
+                ui.label("targets");
+                targets_edit(ui, me, targets, doors, link);
                 ui.end_row();
             }
         }

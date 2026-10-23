@@ -160,23 +160,35 @@ default but stored as floats), a yaw, and properties that depend on its kind:
 | `Lever` | `targets` (entity ids) |
 
 Links (key → door, lever → targets) are entity ids. The
-viewport draws them as lines, and the Properties window edits them with a
-picker. Creatures are grown from `kind`, `size` and `seed` by the same code as
+viewport and the plan draw them as lines (yellow from a key, blue from a lever).
+The Properties window edits them: a list of the level's keys for a door or chest,
+and the target doors of a lever with a button to drop each and a list to add more.
+The ⌖ button beside each picks the other end by clicking it in the 3D view or the
+plan. Linking a key to a door also locks it. Creatures are grown from `kind`, `size` and `seed` by the same code as
 `build_creatures`. The editor shows the result and has a *re-roll* button that
 picks a new seed.
 
 ### Doors
 
 Doors open and close in the game. A door is its own small mesh, a slab with a
-frame, not part of the wall:
-- **Opening:** it swings on its hinge or slides up over about half a second.
-  Its triangles are rebuilt each frame while it moves.
+frame, not part of the wall. The frame, and the wall above it up to the ceiling,
+are part of the level:
+- **Opening:** it swings a quarter turn on its hinge toward the way it faces, or
+  slides up, over about half a second. A swinging leaf reaches down to the floor it
+  swings over, and a sliding one to the lower floor.
+  Its triangles (a `Part` in `engine::world::things`) are rebuilt each frame while it
+  moves, apart from the level's, so only its own meshes and features are redone.
 - **Collision:** a closed or moving door blocks the doorway, and an open door
   doesn't.
-- **Use key:** with the doorway in reach, it toggles the door.
+  The frame's posts aren't solid.
+- **Use key:** E (or cross) with the doorway in reach (1.6 tiles) and in front
+  toggles the door, or pulls a lever in front, whichever is nearer.
 - **Locked doors:** these need their key. Walking over a key picks it up, the
   status line names the keys you hold, and a locked door you have no key for
-  rattles and stays shut. A lever toggles its target doors.
+  says so and stays shut; the first use with the key unlocks and opens it. A lever
+  toggles its target doors, locked or not, and its handle flips over.
+- Keys lie on a small plinth until picked up. Levers stand on the floor and
+  don't block the cell.
 
 Door states aren't saved in the level file: every play starts from each door's
 `open` setting.
@@ -326,7 +338,7 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 | Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. Room, Carve and Slope work in it too: Room and Carve open (or with Shift fill) the **plan height** layers above the slice, set in the Tools window. Pan with the right or middle button. |
 | Tools | The tool palette |
 | Properties | Whatever is selected: an entity, an area (name, label, its own surfaces, notes) or a light (position, colour, radius, strange colour); otherwise the level. |
-| Entities | An outliner grouped by kind, with a filter box. Click to select, double-click to frame it. |
+| Entities | An outliner grouped by kind, with a filter box (matching labels or kind names). Click to select, double-click to frame it. Add... puts one where the camera looks. |
 | Textures | The slot palette with previews for the level's texture set. Click one to paint with it (this switches to the Paint tool). |
 | Areas | A list of areas. Select one to highlight it in both views, double-click to frame it. *New area from the selected faces* makes one boxing the selected faces' cells, floor to ceiling. |
 | Issues | Validation results. Click one to jump to it. |
@@ -366,14 +378,14 @@ progress.
 
 | Tool | Key | What it does |
 |---|---|---|
-| Select | V | Click a cell face or entity. Shift adds to the selection, drag selects a box of faces on the plane where the drag started. Delete removes an entity. |
+| Select | V | Click a cell face or entity. Shift adds to the selection, drag selects a box of faces on the plane where the drag started. Drag an entity to move it over the floors (snapping as the Entity tool does). Delete removes an entity. |
 | Room | R | SketchUp-style. Drag a rectangle on the floor (or any horizontal face, or the grid at the slice where there is none), then move the mouse up to extrude it in layers, and click. That opens the box. Moving down instead digs it below the floor. Ctrl while clicking makes it an area too. |
 | Push/Pull | P | Drag a face, or the selected faces, along its normal. Floors and ceilings move by layers, walls by tiles. Pushing into rock opens it, pulling closes it. This is how you raise the ground or dig a pit. A floor keeps its slope as it moves. |
 | Carve / Fill | C | A single-cell brush. Click to open the cell behind a face, Shift-click to fill the cell in front of it. A drag stays on the plane it started on, so it can't dig away under itself. |
 | Slope | S | Click near a floor's edge to make a ramp or stairs climbing away from it. Dragging on across the floor makes a flight: each column rises by the rise from the last, keeping the first one's headroom, carving through rock and raising floors in the way. Shift-click takes a slope off. The scroll wheel sets the rise, Tab switches between ramp and stairs. |
 | Paint | B | Click faces to paint them (a wall's whole height in that column, or the whole selection if you click in it). Drag paints along the surface. Shift-click fills the joined faces on the same plane that share a texture. Ctrl-click picks up a face's texture (Alt is taken by orbiting). Painting a face its default leaves it unpainted in the file. Rotating the texture (`[` and `]`) waits on paint gaining a rotation in the format. |
 | Strangeness | X | A brush over the lattice, with a radius (in tiles), a strength and a falloff. Click adds, Shift-click removes, Ctrl-click smooths. The overlay tints the view by strangeness while this tool is active. |
-| Entity | E | Pick a kind in the Properties window, then click to place it. Placement snaps to cell centres, or to cell edges for doors. R rotates. |
+| Entity | E | Pick a kind in the Tools window, then click a floor to place it, and drag on to move it. Placement snaps to cell centres (Ctrl: exactly where you point), and doors to the middle of the nearest cell edge, facing into the cell you clicked so they open into it. Tab turns the next one a quarter (R is the Room tool). The pointer shows where it will go. There's only one player start: placing another moves it. Works in the plan too, at the slice. |
 | Light | L | Click to place a point light just off a face. Drag to lift it further off. Select picks lights by their markers, in the 3D view or the plan, where their radius shows as a circle. |
 
 Picking uses the triangles as drawn: the nearest one facing the camera under the
@@ -403,6 +415,13 @@ one doesn't lose work in the other. The game gains `--level-file` and
 `--start`, chunk streaming, and doors, keys and levers. It also gets a use
 key, and in the egui panel a strangeness slider that offsets the field, as
 now.
+
+The game runs its walk on psx-bevy's shell tick, so a developer build
+(`--features dev-mcp`) can be driven by its MCP: `game --mcp --headless --software
+--level-file … --view raster`, then `game_step` with pad buttons (up/down walk,
+left/right turn, l2/r2 strafe, cross uses), `game_screenshot` of the rasteriser's
+screen, and `game_query {"resources":["Report"]}` for the walker's position, keys
+held, door states and the last message.
 
 ### Validation (Issues window)
 

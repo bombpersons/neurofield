@@ -14,6 +14,7 @@ pub mod scene;
 pub mod sculpt;
 pub mod skin;
 pub mod tex;
+pub mod things;
 pub mod walker;
 
 use rng::Rng;

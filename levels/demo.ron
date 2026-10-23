@@ -146,5 +146,9 @@ Level(
         Entity(id: 1, kind: PlayerStart, pos: (384.0, 0.0, 384.0), yaw: 0.0),
         Entity(id: 2, kind: Creature(kind: Humanoid, size: 1.0, seed: 5), pos: (1152.0, 0.0, 128.0), yaw: 2.5),
         Entity(id: 3, kind: Prop(shape: Pillar, size: (80.0, 0.0, 80.0), tex: 7, tint: (0.8, 0.75, 0.7)), pos: (128.0, 0.0, 1152.0), yaw: 0.3),
+        Entity(id: 4, kind: Door(width: 1, height: 8, hinge: Left, open: false, locked: true, key: Some(5)), pos: (1536.0, 0.0, 640.0), yaw: 1.5707964),
+        Entity(id: 5, kind: Key(name: "iron key"), pos: (384.0, 0.0, 896.0), yaw: 0.0),
+        Entity(id: 6, kind: Door(width: 1, height: 8, hinge: Up, open: false, locked: false, key: None), pos: (2560.0, -1024.0, 640.0), yaw: 1.5707964),
+        Entity(id: 7, kind: Lever(targets: [6]), pos: (1408.0, 0.0, 307.2), yaw: 1.5707964),
     ],
 )

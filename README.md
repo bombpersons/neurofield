@@ -138,7 +138,10 @@ Mouse to look, WASD to walk and strafe, Tab for the auto-walk, Space to switch t
 the rasteriser, B for both side by side, H to hide the panel, N for a new level.
 Esc frees the mouse to use the panel (click the view to look again; Esc again quits).
 A gamepad works too: left stick to walk, right stick to look, d-pad to walk and turn.
-`--level-file levels/x.ron` plays a hand-built level instead.
+`--level-file levels/x.ron` plays a hand-built level instead; E (or cross) opens
+doors and pulls levers, and walking over a key picks it up.
+A developer build (`--features dev-mcp`) can be driven headless through psx-bevy's
+MCP with `--mcp --headless --software` (see docs/editor.md, Play).
 For now the network's frame comes back to the CPU and goes up again as a texture.
 
 ## Level editor (`editor/`)

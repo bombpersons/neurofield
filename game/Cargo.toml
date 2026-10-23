@@ -9,3 +9,7 @@ bevy.workspace = true
 bevy_egui.workspace = true
 psx-bevy.workspace = true
 engine = { path = "../engine" }
+
+[features]
+# psx-bevy's developer MCP: run with --mcp [--headless --software].
+dev-mcp = ["psx-bevy/dev-mcp"]

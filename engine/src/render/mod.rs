@@ -253,13 +253,43 @@ impl Gfx<'_> {
 
 /// Spawn `scene` as meshes: the level and any PS1-pipeline creatures one mesh
 /// per texture, each texture chosen at the strangeness where the triangle is,
-/// and full-colour creatures for the flesh pass. Returns the entities, to
-/// despawn when the scene goes.
+/// the moving things (`spawn_thing`), and full-colour creatures for the flesh
+/// pass. Returns the entities, to despawn when the scene goes.
 pub fn spawn(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene) -> Vec<Entity> {
     let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view } = gfx;
     let (mut out, level) = spawn_psx(commands, meshes, images, materials, textures, scene, torch);
     let occluder = occluders.add(flesh::OccluderMaterial::default());
     out.extend(flesh::spawn(commands, meshes, images, flesh, occluder, &level, scene, view));
+    for i in 0..scene.things.parts.len() {
+        out.extend(spawn_thing(commands, gfx, scene, i));
+    }
+    out
+}
+
+/// A mesh of one of the scene's moving parts (`Scene::things`), and which.
+#[derive(Component)]
+pub struct ThingPart(pub usize);
+
+/// Part `i` of the scene's moving things as meshes, one per texture, each
+/// also hiding creatures behind it in the flesh pass. All are tagged
+/// `ThingPart(i)`, so they can be despawned and spawned again when it moves.
+pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usize) -> Vec<Entity> {
+    let Gfx { meshes, images, materials, textures, torch, occluders, .. } = gfx;
+    let mut groups: HashMap<u8, Vec<&Tri>> = HashMap::new();
+    for t in &scene.things.parts[i].tris {
+        let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
+        groups.entry(tex::strange_variant(t.tex, scene.strangeness(centre)).0).or_default().push(t);
+    }
+    let mut out = Vec::new();
+    for (id, tris) in groups {
+        let Some(m) = textures.material(id, images, materials) else { continue };
+        let (e, mesh) = spawn_part(commands, meshes, &tris, m, torch);
+        commands.entity(e).insert(ThingPart(i));
+        out.push(e);
+        let occluder = occluders.add(flesh::OccluderMaterial::default());
+        let layer = bevy::camera::visibility::RenderLayers::layer(flesh::FLESH_LAYER);
+        out.push(commands.spawn((Mesh3d(mesh), MeshMaterial3d(occluder), layer, ThingPart(i))).id());
+    }
     out
 }
 

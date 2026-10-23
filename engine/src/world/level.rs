@@ -424,6 +424,23 @@ impl Level {
             pos: [0.5 * TF, 0.0, 4.5 * TF],
             yaw: 0.3,
         });
+        // A locked door at the foot of the stairs with its key in the hall, and a
+        // portcullis at the top that a lever by the stairs raises.
+        let west = std::f32::consts::FRAC_PI_2;
+        l.entities.push(Entity {
+            id: 4,
+            kind: EntityKind::Door { width: 1, height: 8, hinge: Hinge::Left, open: false, locked: true, key: Some(5) },
+            pos: [6.0 * TF, 0.0, 2.5 * TF],
+            yaw: west,
+        });
+        l.entities.push(Entity { id: 5, kind: EntityKind::Key { name: "iron key".into() }, pos: [1.5 * TF, 0.0, 3.5 * TF], yaw: 0.0 });
+        l.entities.push(Entity {
+            id: 6,
+            kind: EntityKind::Door { width: 1, height: 8, hinge: Hinge::Up, open: false, locked: false, key: None },
+            pos: [10.0 * TF, -16.0 * STEP as f32, 2.5 * TF],
+            yaw: west,
+        });
+        l.entities.push(Entity { id: 7, kind: EntityKind::Lever { targets: vec![6] }, pos: [5.5 * TF, 0.0, 1.2 * TF], yaw: west });
         // A band of different wall along the hall's west side, two layers high.
         for z in 0..6 {
             for layer in 4..6 {
@@ -458,7 +475,8 @@ impl Level {
         }
     }
 
-    /// The level as a scene: geometry, lights, strangeness, creatures and props.
+    /// The level as a scene: geometry, lights, strangeness, creatures, props, and
+    /// doors, keys and levers (`Scene::things`).
     pub fn to_scene(&self) -> Scene {
         let w = self.columns.keys().map(|k| k.0 + 1).max().unwrap_or(1);
         let d = self.columns.keys().map(|k| k.1 + 1).max().unwrap_or(1);
@@ -541,17 +559,15 @@ impl Level {
                     }
                     scene.span_mut(n).blocked = true;
                 }
-                // Stand-ins until doors, keys and chests get their own meshes.
+                // A stand-in until chests get their own mesh.
                 EntityKind::Chest { .. } => {
                     scene.add_box([x, floor, z], [0.3 * TF, 0.2 * TF], 0.35 * TF, e.yaw, 2, [0.7, 0.55, 0.4]);
                     scene.span_mut(n).blocked = true;
                 }
-                EntityKind::Key { .. } => {
-                    scene.add_box([x, floor - 0.3 * TF, z], [12.0, 4.0], 30.0, e.yaw, 5, [1.0, 0.85, 0.4]);
-                }
-                EntityKind::PlayerStart | EntityKind::Door { .. } | EntityKind::Lever { .. } => {}
+                EntityKind::PlayerStart | EntityKind::Door { .. } | EntityKind::Key { .. } | EntityKind::Lever { .. } => {}
             }
         }
+        scene.build_things(&self.entities);
         scene
     }
 }
@@ -597,15 +613,29 @@ fn span_of(r: &Run, room: usize) -> Span {
 mod tests {
     use super::*;
 
-    /// Walking by hand (as in the game) up the steep stairs and back down.
+    /// Walking by hand (as in the game) up the steep stairs and back down, once
+    /// the doors on the way are open.
     #[test]
     fn player_climbs_stairs() {
         crate::world::flesh::set_psx(true);
-        let scene = Level::demo().to_scene();
+        let mut scene = Level::demo().to_scene();
         let mut rng = Rng::new(1);
         // In the hall by the foot of the stairs, facing east up them.
         let east = -std::f32::consts::FRAC_PI_2;
-        let mut w = crate::world::walker::Walker::at(&scene, [5.5 * TF, 0.0, 2.5 * TF], east, &mut rng).unwrap();
+        let at = [5.5 * TF, 0.0, 2.5 * TF];
+        let mut w = crate::world::walker::Walker::at(&scene, at, east, &mut rng).unwrap();
+        for _ in 0..50 {
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        }
+        assert!(w.x < 6.0 * TF, "the locked door is in the way: x {}", w.x);
+        assert_eq!(scene.use_thing(at, east, &[]).as_deref(), Some("locked"));
+        let keys = scene.take_pickups([1.5 * TF, 0.0, 3.5 * TF]);
+        assert_eq!(scene.use_thing(at, east, &keys).as_deref(), Some("unlocked with the iron key"));
+        // The lever, to the north, raises the portcullis at the top.
+        assert!(scene.use_thing(at, std::f32::consts::PI, &keys).unwrap().contains("lever"));
+        for _ in 0..30 {
+            scene.tick_things(0.1);
+        }
         for _ in 0..200 {
             w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
         }
