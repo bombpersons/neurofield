@@ -142,6 +142,9 @@ fn main() {
         parts: Vec::new(),
         hidden: Vec::new(),
         lines: Vec::new(),
+        overlay: false,
+        brushing: false,
+        tinted: false,
     })
     .insert_resource(flesh::Sculpts::default())
     .add_systems(Startup, setup)

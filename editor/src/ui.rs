@@ -226,6 +226,7 @@ pub fn draw(
     s.panels.clear();
     s.plan.rect = None;
     s.screen = Some(ctx.viewport_rect());
+    built.brushing = s.tools.tool == Tool::Strange;
 
     shortcuts(&ctx, s, doc, &mut built, &mut input, &cam);
     poll_dialogs(s, doc);
@@ -606,6 +607,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             ui.checkbox(&mut built.show_grid, "Grid");
             ui.checkbox(&mut built.cut, "Cut above the slice");
             ui.checkbox(&mut built.show_entities, "Entity markers");
+            ui.checkbox(&mut built.overlay, "Strangeness overlay").on_hover_text("Tint the 3D view and the plan by strangeness (always on with the Strangeness tool)");
             ui.checkbox(&mut built.full_colour, "Full-colour creatures");
             s.settings.full_colour = built.full_colour;
             ui.separator();
@@ -688,7 +690,8 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
                     f => format!("{f:?}").to_lowercase(),
                 };
                 let tex = crate::tools::face_tex(&doc.level, h.cell, h.face);
-                ui.label(format!("cell ({x}, {l}, {z}) {face}, texture {tex}"));
+                let strange = built.whole().strangeness(to_world(h.point));
+                ui.label(format!("cell ({x}, {l}, {z}) {face}, texture {tex}, strangeness {strange:.2}"));
                 ui.separator();
             }
             if sculpting > 0 {
@@ -780,6 +783,9 @@ impl Viewer<'_> {
             ui.toggle_value(&mut b.show_grid, "Grid");
             ui.toggle_value(&mut b.cut, "Cut").on_hover_text("Hide everything more than a tile above the slice (PgUp/PgDn)");
             ui.toggle_value(&mut b.show_entities, "Markers");
+            ui.add_enabled_ui(!b.brushing, |ui| ui.toggle_value(&mut b.overlay, "Strange"))
+                .response
+                .on_hover_text("Tint by strangeness: blue grounded, through teal and yellow, to magenta (always on with the Strangeness tool)");
             ui.toggle_value(&mut b.full_colour, "Flesh")
                 .on_hover_text("Creatures in full colour, as the game draws them (sculpted in the background)");
             self.s.settings.full_colour = b.full_colour;
@@ -987,7 +993,7 @@ impl Viewer<'_> {
         let (rect, r) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let pv = &mut self.s.plan;
         pv.rect = Some(rect);
-        let edits = matches!(self.s.tools.tool, Tool::Room | Tool::Carve | Tool::Slope | Tool::Place);
+        let edits = matches!(self.s.tools.tool, Tool::Room | Tool::Carve | Tool::Slope | Tool::Place | Tool::Strange);
         if r.dragged_by(egui::PointerButton::Secondary)
             || r.dragged_by(egui::PointerButton::Middle)
             || (!edits && r.dragged_by(egui::PointerButton::Primary))
@@ -1023,6 +1029,16 @@ impl Viewer<'_> {
                 }
                 None if runs.iter().any(|r| r.to <= slice) => Color32::from_rgb(45, 45, 55),
                 None => Color32::from_rgb(30, 30, 36),
+            };
+            // The overlay colours open cells by strangeness a little above their floor.
+            let colour = match here {
+                Some(r) if self.built.overlay_on() => {
+                    let y = -((r.from.max(slice - 3) * STEP) as f32) - TF * 0.5;
+                    let h = crate::view3d::heat(self.built.whole().strangeness([(x as f32 + 0.5) * TF, y, (z as f32 + 0.5) * TF]));
+                    let k = colour.r() as f32 / 190.0;
+                    Color32::from_rgb((h[0] * 255.0 * k) as u8, (h[1] * 255.0 * k) as u8, (h[2] * 255.0 * k) as u8)
+                }
+                _ => colour,
             };
             painter.rect_filled(cell.shrink(0.5), 0.0, colour);
         }
@@ -1068,6 +1084,17 @@ impl Viewer<'_> {
             let to_screen = |x: f32, z: f32| rect.center() + (egui::vec2(x, z) - centre) * zoom;
             let area = egui::Rect::from_min_max(to_screen(lo.0 as f32, lo.1 as f32), to_screen(hi.0 as f32 + 1.0, hi.1 as f32 + 1.0));
             painter.rect_stroke(area, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(255, 140, 50)), egui::StrokeKind::Middle);
+        }
+        if self.s.tools.tool == Tool::Strange {
+            if let Some(t) = tile.filter(|_| r.hovered() || self.s.tools.busy()) {
+                let b = self.s.tools.brush;
+                let c = Color32::from_rgb(255, 240, 130);
+                painter.circle_stroke(to_screen(t.x, t.y), b.radius * zoom, egui::Stroke::new(1.5, c));
+                let inner = b.radius * (1.0 - b.softness);
+                if inner > 0.05 {
+                    painter.circle_stroke(to_screen(t.x, t.y), inner * zoom, egui::Stroke::new(1.0, c.gamma_multiply(0.5)));
+                }
+            }
         }
         // The camera, and which way it looks.
         let c = to_world(self.cam.pos);

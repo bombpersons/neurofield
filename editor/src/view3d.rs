@@ -116,6 +116,11 @@ pub struct Built {
     pub hidden: Vec<u64>,
     /// Outlines from the current tool, drawn over the level.
     pub lines: Vec<(Vec3, Vec3, Color)>,
+    /// The strangeness overlay: switched on, or on because the Strangeness tool is.
+    pub overlay: bool,
+    pub brushing: bool,
+    /// Whether `scene` was built tinted by strangeness.
+    pub tinted: bool,
 }
 
 /// With the cut on, how many layers above the slice still show: a tile of wall.
@@ -126,6 +131,33 @@ impl Built {
     pub fn whole(&self) -> &Scene {
         self.full.as_ref().unwrap_or(&self.scene)
     }
+
+    /// The view is tinted by strangeness.
+    pub fn overlay_on(&self) -> bool {
+        self.overlay || self.brushing
+    }
+}
+
+/// The overlay's colour for strangeness `s`: blue where grounded, through teal and
+/// yellow, to magenta where it is fully strange. RGB 0..1.
+pub fn heat(s: f32) -> [f32; 3] {
+    const STOPS: [[f32; 3]; 4] = [[0.12, 0.24, 0.8], [0.16, 0.75, 0.67], [0.95, 0.82, 0.24], [0.95, 0.2, 0.86]];
+    let t = s.clamp(0.0, 1.0) * 3.0;
+    let i = (t.floor() as usize).min(2);
+    let f = t - i as f32;
+    [0, 1, 2].map(|c| STOPS[i][c] + (STOPS[i + 1][c] - STOPS[i][c]) * f)
+}
+
+/// Colour the level by strangeness instead of its light, keeping its textures.
+fn tint(scene: &mut Scene) {
+    let mut tris = std::mem::take(&mut scene.tris);
+    for t in &mut tris {
+        for v in &mut t.v {
+            let h = heat(scene.strangeness(v.p.map(|c| c as f32)));
+            v.col = h.map(|c| (c * 160.0) as u8);
+        }
+    }
+    scene.tris = tris;
 }
 
 /// The level with everything from `CUT_ABOVE` layers above `slice` filled in, and
@@ -176,10 +208,12 @@ pub fn rebuild(
     mut gfx: engine::render::Gfx,
 ) {
     let cut_at = built.cut.then_some(built.slice);
-    let changed = built.version != doc.0.version || built.version == 0 || built.cut_at != cut_at;
+    let tinted = built.overlay_on();
+    let changed = built.version != doc.0.version || built.version == 0 || built.cut_at != cut_at || built.tinted != tinted;
     if changed {
         built.version = doc.0.version.max(1);
         built.cut_at = cut_at;
+        built.tinted = tinted;
         match cut_at {
             Some(slice) => {
                 built.scene = cut_level(&doc.0.level, slice).to_scene();
@@ -189,6 +223,9 @@ pub fn rebuild(
                 built.scene = doc.0.level.to_scene();
                 built.full = None;
             }
+        }
+        if tinted {
+            tint(&mut built.scene);
         }
         built.shapes = built.scene.creatures.iter().map(|c| c.shape_hash()).collect();
         built.changed_at = time.elapsed_secs_f64();

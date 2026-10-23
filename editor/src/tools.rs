@@ -13,7 +13,7 @@ use engine::world::level::{
     Area, CeilingKind, Dir, Entity, EntityKind, Face, Hinge, Level, PointLight, PropShape, SlopeDef, SlopeKind, Surface,
 };
 use engine::world::scene::{Scene, STEP};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -69,7 +69,7 @@ impl Tool {
             Tool::Carve => "click or drag to carve a cell, shift to fill one",
             Tool::Slope => "click near a floor's edge to climb away from it, drag for a flight; wheel: rise, Tab: ramp or stairs",
             Tool::Paint => "click or drag to paint faces (the selection, if you click in it), shift-click fills the plane, ctrl-click picks up a face's texture",
-            Tool::Strange => "brush strangeness on, shift to take it off, ctrl to smooth",
+            Tool::Strange => "drag to brush strangeness on, shift takes it off, ctrl smooths",
             Tool::Place => "click a floor to place the chosen entity (doors go on the nearest edge), drag to move it; ctrl: don't snap, Tab: turn",
             Tool::Light => "click a face to put a light by it, drag to lift it off",
         }
@@ -77,10 +77,7 @@ impl Tool {
 
     /// The milestone that brings it (docs/editor.md), for tools not built yet.
     pub fn coming(self) -> Option<u32> {
-        match self {
-            Tool::Strange => Some(6),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -141,6 +138,130 @@ pub enum Op {
     Light { index: usize, origin: Vec3, normal: Vec3 },
     /// Moving entity `id` over the floors, once the pointer has left `from` (screen).
     Move { id: u32, from: egui::Pos2, moving: bool },
+    /// Strangeness: a brush stroke from the lattice as it was (`before`), with how
+    /// far it has pushed each point so far; in the plan if `plan`.
+    Strange { stroke: Stroke, before: BTreeMap<(i32, i32, i32), f32>, reached: HashMap<(i32, i32, i32), f32>, plan: bool },
+}
+
+/// What a strangeness stroke does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stroke {
+    Add,
+    Remove,
+    Smooth,
+}
+
+/// The Strangeness tool's brush.
+#[derive(Clone, Copy, Debug)]
+pub struct Brush {
+    /// In tiles.
+    pub radius: f32,
+    /// The most one stroke moves a point.
+    pub strength: f32,
+    /// 0: full strength out to the edge; 1: fading all the way from the centre.
+    pub softness: f32,
+}
+
+impl Brush {
+    /// The share of the strength that reaches `d` tiles from the centre.
+    pub fn falloff(&self, d: f32) -> f32 {
+        let t = d / self.radius.max(0.01);
+        let hard = 1.0 - self.softness.clamp(0.0, 1.0);
+        if t > 1.0 {
+            0.0
+        } else if t <= hard {
+            1.0
+        } else {
+            let u = (t - hard) / (1.0 - hard);
+            1.0 - u * u * (3.0 - 2.0 * u)
+        }
+    }
+}
+
+/// Lattice points (x, up, z in tiles) within `radius` of `centre`, with their
+/// distance: a ball, or with `column` (lowest and highest up), a column that
+/// reaches every point in that range above a disc.
+pub fn lattice_near(centre: [f32; 3], radius: f32, column: Option<(f32, f32)>) -> Vec<((i32, i32, i32), f32)> {
+    let (y0, y1) = column.unwrap_or((centre[1] - radius, centre[1] + radius));
+    let mut out = Vec::new();
+    for x in (centre[0] - radius).ceil() as i32..=(centre[0] + radius).floor() as i32 {
+        for z in (centre[2] - radius).ceil() as i32..=(centre[2] + radius).floor() as i32 {
+            for y in y0.ceil() as i32..=y1.floor() as i32 {
+                let dy = if column.is_some() { 0.0 } else { y as f32 - centre[1] };
+                let d = ((x as f32 - centre[0]).powi(2) + dy * dy + (z as f32 - centre[2]).powi(2)).sqrt();
+                if d <= radius {
+                    out.push(((x, y, z), d));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Set a lattice point, kept tidy: three decimals, within -1..1, gone at 0.
+pub fn set_point(l: &mut Level, p: (i32, i32, i32), v: f32) {
+    let v = (v.clamp(-1.0, 1.0) * 1000.0).round() / 1000.0;
+    if v == 0.0 {
+        l.strange_points.remove(&p);
+    } else {
+        l.strange_points.insert(p, v);
+    }
+}
+
+/// One frame of a strangeness stroke at `centre` (lattice coordinates). Adding and
+/// taking off push each point at most `strength` (times the falloff) from where
+/// it was when the stroke began, so going over a place again evens it out;
+/// smoothing eases points toward their neighbours. Returns the points changed.
+#[allow(clippy::too_many_arguments)]
+pub fn brush_stroke(
+    l: &mut Level,
+    brush: &Brush,
+    stroke: Stroke,
+    centre: [f32; 3],
+    column: Option<(f32, f32)>,
+    before: &BTreeMap<(i32, i32, i32), f32>,
+    reached: &mut HashMap<(i32, i32, i32), f32>,
+) -> usize {
+    let mut changed = 0;
+    let near = lattice_near(centre, brush.radius, column);
+    let smoothed: Vec<_> = if stroke == Stroke::Smooth {
+        let at = |p: (i32, i32, i32)| l.strange_points.get(&p).copied().unwrap_or(0.0);
+        near.iter()
+            .map(|&((x, y, z), d)| {
+                let n = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+                let mean = n.iter().map(|o| at((x + o.0, y + o.1, z + o.2))).sum::<f32>() / 6.0;
+                let v = at((x, y, z));
+                ((x, y, z), v + (mean - v) * (brush.falloff(d) * brush.strength).min(1.0) * 0.5)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for (p, v) in smoothed {
+        if l.strange_points.get(&p).copied().unwrap_or(0.0) != v {
+            set_point(l, p, v);
+            changed += 1;
+        }
+    }
+    if stroke == Stroke::Smooth {
+        return changed;
+    }
+    let sign = if stroke == Stroke::Add { 1.0 } else { -1.0 };
+    for (p, d) in near {
+        let want = brush.strength * brush.falloff(d);
+        let got = reached.entry(p).or_insert(0.0);
+        if want > *got + 1e-4 {
+            *got = want;
+            set_point(l, p, before.get(&p).copied().unwrap_or(0.0) + sign * want);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Lattice coordinates of a point in view space (tiles, y up).
+pub fn lattice_of(v: Vec3) -> [f32; 3] {
+    [v.x, v.y, -v.z]
 }
 
 impl Op {
@@ -157,6 +278,7 @@ impl Op {
             Op::Paint { .. } => "paint",
             Op::Light { .. } => "light",
             Op::Move { .. } => "move",
+            Op::Strange { .. } => "strangeness",
         }
     }
 }
@@ -182,6 +304,7 @@ pub struct Tools {
     swallow: bool,
     /// The plan's Room rectangle, from its first corner.
     plan_start: Option<(i32, i32)>,
+    pub brush: Brush,
 }
 
 impl Default for Tools {
@@ -201,6 +324,7 @@ impl Default for Tools {
             link: None,
             swallow: false,
             plan_start: None,
+            brush: Brush { radius: 2.0, strength: 0.3, softness: 0.6 },
         }
     }
 }
@@ -221,6 +345,7 @@ impl Tools {
         match std::mem::replace(&mut self.op, Op::Idle) {
             Op::Idle => return linking,
             Op::RoomHeight { before, .. } | Op::Push { before, .. } | Op::Slope { before, .. } => doc.level = before,
+            Op::Strange { before, .. } => doc.level.strange_points = before,
             // A light being placed goes again.
             Op::Light { index, .. } if index < doc.level.lights.len() => _ = doc.level.lights.remove(index),
             _ => {}
@@ -239,6 +364,7 @@ impl Tools {
             slot: self.slot,
             place: self.place,
             yaw: self.yaw,
+            brush: self.brush,
             ..Tools::default()
         };
     }
@@ -437,6 +563,13 @@ impl Tools {
                 }
                 if up { Op::Idle } else { Op::Move { id, from, moving } }
             }
+            (Op::Strange { stroke, before, mut reached, plan: false }, _) => {
+                if let Some(h) = self.hover {
+                    brush_stroke(&mut doc.level, &self.brush, stroke, lattice_of(h.point), None, &before, &mut reached);
+                }
+                *message = strange_message(stroke, &before, &doc.level);
+                if up { Op::Idle } else { Op::Strange { stroke, before, reached, plan: false } }
+            }
             (op, _) => op,
         };
         self.outlines(doc, built, ray, *sel);
@@ -591,7 +724,24 @@ impl Tools {
                 *sel = Sel::Entity(id);
                 Op::Move { id, from: p, moving: true }
             }
-            _ => Op::Idle,
+            Tool::Strange => {
+                let Some(h) = self.hover else { return Op::Idle };
+                let stroke = self.stroke(mods);
+                let before = doc.level.strange_points.clone();
+                let mut reached = HashMap::new();
+                brush_stroke(&mut doc.level, &self.brush, stroke, lattice_of(h.point), None, &before, &mut reached);
+                Op::Strange { stroke, before, reached, plan: false }
+            }
+        }
+    }
+
+    fn stroke(&self, mods: egui::Modifiers) -> Stroke {
+        if mods.ctrl {
+            Stroke::Smooth
+        } else if mods.shift {
+            Stroke::Remove
+        } else {
+            Stroke::Add
         }
     }
 
@@ -668,6 +818,12 @@ impl Tools {
                     outline(lines, pick::quad(l, c, f), DRAWING);
                 }
             }
+            Op::Strange { plan: false, .. } => {
+                if let Some(h) = self.hover {
+                    let (_, n) = pick::plane(h.cell, h.face);
+                    circle(lines, h.point + n * 0.02, n, self.brush.radius, DRAWING);
+                }
+            }
             Op::Idle => {
                 let Some(h) = self.hover else {
                     // The Room tool can start on the slice's grid.
@@ -709,6 +865,15 @@ impl Tools {
                         let kind = &entity_kinds()[self.place].1;
                         if let Some((pos, yaw)) = place_on(&built.scene, &h, kind, self.yaw, false) {
                             ghost(lines, kind, pos, yaw, HOVER);
+                        }
+                    }
+                    Tool::Strange => {
+                        let (_, n) = pick::plane(h.cell, h.face);
+                        let c = h.point + n * 0.02;
+                        circle(lines, c, n, self.brush.radius, HOVER);
+                        let inner = self.brush.radius * (1.0 - self.brush.softness);
+                        if inner > 0.05 {
+                            circle(lines, c, n, inner, HOVER.with_alpha(0.5));
                         }
                     }
                     Tool::Slope if h.face == Face::Floor => {
@@ -791,6 +956,29 @@ impl Tools {
                 }
                 None
             }
+            Tool::Strange => {
+                let column = (slice as f32 * STEP as f32 / TF, (slice + self.height) as f32 * STEP as f32 / TF);
+                let at = |t: egui::Vec2| [t.x, 0.0, t.y];
+                let starting = (primary_pressed && r.hovered()) || r.drag_started_by(egui::PointerButton::Primary);
+                if starting && matches!(self.op, Op::Idle) {
+                    if let Some(t) = tile {
+                        let stroke = self.stroke(mods);
+                        let before = doc.level.strange_points.clone();
+                        let mut reached = HashMap::new();
+                        brush_stroke(&mut doc.level, &self.brush, stroke, at(t), Some(column), &before, &mut reached);
+                        self.op = Op::Strange { stroke, before, reached, plan: true };
+                    }
+                } else if let Op::Strange { stroke, before, reached, plan: true } = &mut self.op {
+                    if let Some(t) = tile {
+                        brush_stroke(&mut doc.level, &self.brush, *stroke, at(t), Some(column), before, reached);
+                    }
+                    *message = strange_message(*stroke, before, &doc.level);
+                    if !primary_down {
+                        self.op = Op::Idle;
+                    }
+                }
+                None
+            }
             Tool::Slope => {
                 let (x, z) = cell?;
                 if r.clicked() {
@@ -863,6 +1051,25 @@ impl Tools {
                 .response
                 .on_hover_text("Tab turns it a quarter; doors face into the cell you click in, and open into it");
             }
+            Tool::Strange => {
+                let b = &mut self.brush;
+                egui::Grid::new("brush").num_columns(2).show(ui, |ui| {
+                    ui.label("radius");
+                    ui.add(egui::Slider::new(&mut b.radius, 0.5..=8.0).suffix(" tiles"));
+                    ui.end_row();
+                    ui.label("strength");
+                    ui.add(egui::Slider::new(&mut b.strength, 0.02..=1.0))
+                        .on_hover_text("The most one stroke moves strangeness; stroke again to go further");
+                    ui.end_row();
+                    ui.label("falloff");
+                    ui.add(egui::Slider::new(&mut b.softness, 0.0..=1.0)).on_hover_text("0: hard edge, 1: fading from the centre");
+                    ui.end_row();
+                    ui.label("plan height");
+                    ui.add(egui::DragValue::new(&mut self.height).range(1..=64).suffix(" layers"))
+                        .on_hover_text("How far above the slice the brush reaches in the plan view");
+                    ui.end_row();
+                });
+            }
             Tool::Select | Tool::PushPull if !self.faces.is_empty() => {
                 ui.horizontal(|ui| {
                     ui.label(format!("{} face{} selected", self.faces.len(), if self.faces.len() == 1 { "" } else { "s" }));
@@ -873,6 +1080,31 @@ impl Tools {
             }
             _ => {}
         }
+    }
+}
+
+/// What a stroke has done so far, for the status bar.
+fn strange_message(stroke: Stroke, before: &BTreeMap<(i32, i32, i32), f32>, l: &Level) -> String {
+    let n = l.strange_points.iter().filter(|(p, v)| before.get(p) != Some(v)).count()
+        + before.keys().filter(|p| !l.strange_points.contains_key(p)).count();
+    let what = match stroke {
+        Stroke::Add => "brushed on",
+        Stroke::Remove => "took off",
+        Stroke::Smooth => "smoothed",
+    };
+    format!("{what} strangeness at {n} point{}", if n == 1 { "" } else { "s" })
+}
+
+/// A circle of `radius` round `c`, square to `n`.
+fn circle(lines: &mut Vec<(Vec3, Vec3, Color)>, c: Vec3, n: Vec3, radius: f32, colour: Color) {
+    let u = n.any_orthonormal_vector();
+    let v = n.cross(u);
+    let at = |k: usize| {
+        let a = k as f32 / 32.0 * std::f32::consts::TAU;
+        c + (u * a.cos() + v * a.sin()) * radius
+    };
+    for k in 0..32 {
+        lines.push((at(k), at(k + 1), colour));
     }
 }
 
@@ -1421,6 +1653,47 @@ mod tests {
         assert!((yaw.cos() - 1.0).abs() < 1e-6, "{yaw}");
         // Nothing to stand on in the rock.
         assert!(place_at(&scene, creature, [6.5 * tf, -10.0, 6.5 * tf], 0.0, false).is_none());
+    }
+
+    /// A stroke moves each point at most its strength, however often it passes;
+    /// taking off brings points back to nothing, and they leave the file.
+    #[test]
+    fn strangeness_strokes_are_capped_and_tidy() {
+        let mut l = Level::new("t");
+        let b = Brush { radius: 2.0, strength: 0.4, softness: 0.5 };
+        let before = l.strange_points.clone();
+        let mut reached = HashMap::new();
+        for _ in 0..10 {
+            brush_stroke(&mut l, &b, Stroke::Add, [3.0, 1.0, 3.0], None, &before, &mut reached);
+        }
+        assert_eq!(l.strange_points.get(&(3, 1, 3)), Some(&0.4), "full strength at the centre, once");
+        let edge = l.strange_points.get(&(5, 1, 3)).copied().unwrap_or(0.0);
+        assert!(edge == 0.0, "nothing at the rim: {edge}");
+        let mid = l.strange_points[&(4, 1, 4)];
+        assert!(mid > 0.0 && mid < 0.4, "fading between: {mid}");
+        // A second stroke goes further.
+        let before = l.strange_points.clone();
+        brush_stroke(&mut l, &b, Stroke::Add, [3.0, 1.0, 3.0], None, &before, &mut HashMap::new());
+        assert_eq!(l.strange_points[&(3, 1, 3)], 0.8);
+        for _ in 0..2 {
+            let before = l.strange_points.clone();
+            brush_stroke(&mut l, &b, Stroke::Remove, [3.0, 1.0, 3.0], None, &before, &mut HashMap::new());
+        }
+        assert!(l.strange_points.is_empty(), "all gone: {:?}", l.strange_points);
+    }
+
+    /// In the plan the brush reaches a column of points; smoothing evens out a spike.
+    #[test]
+    fn strangeness_columns_and_smoothing() {
+        let mut l = Level::new("t");
+        let b = Brush { radius: 1.0, strength: 0.5, softness: 0.0 };
+        brush_stroke(&mut l, &b, Stroke::Add, [0.0, 0.0, 0.0], Some((0.0, 3.0)), &BTreeMap::new(), &mut HashMap::new());
+        assert_eq!(l.strange_points.len(), 5 * 4, "a cross of 5 columns, 4 points high");
+        let mut l = Level::new("t");
+        l.strange_points.insert((0, 0, 0), 1.0);
+        brush_stroke(&mut l, &b, Stroke::Smooth, [0.0, 0.0, 0.0], None, &BTreeMap::new(), &mut HashMap::new());
+        let peak = l.strange_points[&(0, 0, 0)];
+        assert!(peak < 1.0 && l.strange_points.get(&(1, 0, 0)).is_some_and(|&v| v > 0.0), "spread out: {:?}", l.strange_points);
     }
 
     #[test]
