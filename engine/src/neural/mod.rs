@@ -30,6 +30,22 @@ impl Network {
         Network { net }
     }
 
+    /// Like `load`, but saying what went wrong instead of panicking.
+    pub fn try_load(path: &Path) -> Result<Network, String> {
+        let net = GpuNet::load(path).map_err(|e| format!("loading {}: {e}", path.display()))?;
+        Ok(Network { net })
+    }
+
+    /// Like `render`, but saying what went wrong instead of panicking.
+    pub fn try_render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Result<Vec<f32>, String> {
+        self.net.render(t, dream)
+    }
+
+    /// Which adapter it runs on.
+    pub fn adapter(&self) -> &str {
+        &self.net.adapter
+    }
+
     /// The 320x240 frame, RGB floats (roughly 0..1), row by row.
     pub fn render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Vec<f32> {
         self.net.render(t, dream).expect("inference")

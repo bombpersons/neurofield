@@ -22,6 +22,8 @@ pub enum ViewMode {
     Plain,
     /// The PS1 look as the game shows it: 240 lines, the width following the window.
     Psx,
+    /// The trained network, drawn on a worker thread (see `crate::neural`).
+    Neural,
 }
 
 /// The editor's camera: a position and a heading, flown or orbited.
@@ -134,7 +136,7 @@ impl Built {
 
     /// The view is tinted by strangeness.
     pub fn overlay_on(&self) -> bool {
-        self.overlay || self.brushing
+        (self.overlay || self.brushing) && self.mode != ViewMode::Neural
     }
 }
 
@@ -330,6 +332,8 @@ pub fn apply_camera(cam: Res<EditorCam>, built: Res<Built>, mut view: ResMut<eng
         transform: Some(Transform::from_translation(cam.pos).with_rotation(cam.rotation())),
         // Editing wants to see the whole level.
         clear: built.mode == ViewMode::Plain,
+        // The network's frame covers it.
+        hidden: built.mode == ViewMode::Neural,
         ..engine::render::View::of(&built.scene, &c)
     });
 }
@@ -339,7 +343,7 @@ pub fn apply_camera(cam: Res<EditorCam>, built: Res<Built>, mut view: ResMut<eng
 pub fn screen_mode(built: Res<Built>, windows: Query<&Window>, mut screen: ResMut<PsxScreen>, mut look: ResMut<PsxLook>) {
     let Ok(w) = windows.single() else { return };
     let (height, on) = match built.mode {
-        ViewMode::Psx => (240, true),
+        ViewMode::Psx | ViewMode::Neural => (240, true),
         ViewMode::Plain => ((w.physical_height()).clamp(240, 1440), false),
     };
     if screen.height != height {

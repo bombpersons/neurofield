@@ -16,6 +16,7 @@
 mod doc;
 mod flesh;
 mod mcp;
+mod neural;
 mod pick;
 mod settings;
 mod tools;

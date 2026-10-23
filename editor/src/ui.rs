@@ -101,6 +101,8 @@ pub struct Ui {
     pub(crate) screen: Option<egui::Rect>,
     /// The agent server and its window (Tools > Agents).
     pub(crate) agents: crate::mcp::Agents,
+    /// The Neural view mode's network and its latest frame.
+    pub neural: crate::neural::NeuralView,
 }
 
 pub(crate) struct PlanView {
@@ -135,6 +137,7 @@ impl Ui {
             panels: Vec::new(),
             screen: None,
             agents,
+            neural: Default::default(),
         }
     }
 
@@ -228,6 +231,14 @@ pub fn draw(
     s.plan.rect = None;
     s.screen = Some(ctx.viewport_rect());
     built.brushing = s.tools.tool == Tool::Strange;
+    if built.mode == ViewMode::Neural {
+        s.neural.update(&ctx, &built, &cam, s.config.model.clone());
+        if let crate::neural::State::Failed(e) = &s.neural.state {
+            s.message = e.clone();
+            s.neural = Default::default();
+            built.mode = ViewMode::Plain;
+        }
+    }
 
     shortcuts(&ctx, s, doc, &mut built, &mut input, &cam);
     poll_dialogs(s, doc);
@@ -604,6 +615,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             ui.label("3D view (Tab)");
             ui.radio_value(&mut built.mode, ViewMode::Plain, "Plain");
             ui.radio_value(&mut built.mode, ViewMode::Psx, "PS1");
+            ui.radio_value(&mut built.mode, ViewMode::Neural, "Neural").on_hover_text(NEURAL_HINT);
             s.settings.mode = built.mode;
             ui.checkbox(&mut built.show_grid, "Grid");
             ui.checkbox(&mut built.cut, "Cut above the slice");
@@ -680,6 +692,18 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
             ui.separator();
             ui.label(format!("{} tris", built.scene.tris.len()));
             ui.separator();
+            if built.mode == ViewMode::Neural {
+                let n = &s.neural;
+                let text = match &n.state {
+                    crate::neural::State::Ready(adapter) => {
+                        format!("network {:.0} ms{}", n.ms, if n.pending() { ", drawing" } else { "" })
+                            + &if adapter.is_empty() { String::new() } else { format!(" on {adapter}") }
+                    }
+                    _ => "network loading".into(),
+                };
+                ui.label(text);
+                ui.separator();
+            }
             if !s.tools.faces.is_empty() {
                 ui.label(format!("{} face{}", s.tools.faces.len(), if s.tools.faces.len() == 1 { "" } else { "s" }));
                 ui.separator();
@@ -773,6 +797,14 @@ impl TabViewer for Viewer<'_> {
 impl Viewer<'_> {
     fn viewport(&mut self, ui: &mut egui::Ui) {
         let r = ui.allocate_rect(ui.max_rect(), egui::Sense::hover());
+        if self.built.mode == ViewMode::Neural {
+            let markers: Vec<_> = if self.built.show_entities {
+                self.doc.level.entities.iter().map(|e| (crate::tools::marker(e.pos), egui_colour(entity_colour(&e.kind)))).collect()
+            } else {
+                Vec::new()
+            };
+            crate::neural::draw(ui.painter(), ui.ctx().viewport_rect(), &self.s.neural, self.built, self.cam, &markers);
+        }
         self.viewport_hovered = r.hovered() || r.contains_pointer();
         // A strip of view toggles in the corner.
         let mut corner = ui.new_child(egui::UiBuilder::new().max_rect(r.rect.shrink(6.0)));
@@ -780,6 +812,7 @@ impl Viewer<'_> {
             let b = &mut *self.built;
             ui.selectable_value(&mut b.mode, ViewMode::Plain, "Plain");
             ui.selectable_value(&mut b.mode, ViewMode::Psx, "PS1");
+            ui.selectable_value(&mut b.mode, ViewMode::Neural, "Neural").on_hover_text(NEURAL_HINT);
             self.s.settings.mode = b.mode;
             ui.separator();
             ui.toggle_value(&mut b.show_grid, "Grid");
@@ -1133,6 +1166,8 @@ impl Viewer<'_> {
         }
     }
 }
+
+const NEURAL_HINT: &str = "The trained network, as the game draws it: slow without a good GPU, so for checking rather than editing";
 
 fn egui_colour(c: Color) -> Color32 {
     let s = c.to_srgba();
