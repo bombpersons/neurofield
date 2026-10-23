@@ -88,8 +88,9 @@ pub struct Ui {
     /// What to do once a Save As finishes.
     after_save: Option<After>,
     styled: bool,
-    /// The file the plan view was last centred for.
-    plan_for: Option<Option<PathBuf>>,
+    /// The file the plan view was last centred for, and whether the level was
+    /// empty then (so it centres again once something is built).
+    plan_for: Option<(Option<PathBuf>, bool)>,
     fps: f32,
     pub(crate) plan: PlanView,
     /// The Entities outliner's filter.
@@ -197,11 +198,28 @@ pub fn draw(
         built.full_colour = s.settings.full_colour;
         s.styled = true;
     }
-    if s.plan_for != Some(doc.0.path.clone()) {
-        let c = level_centre(&doc.0.level);
-        let w = to_world(c);
-        s.plan.centre = egui::vec2(w[0] / TF, w[2] / TF);
-        s.plan_for = Some(doc.0.path.clone());
+    let level_centre_tiles = |l: &Level| {
+        let w = to_world(level_centre(l));
+        egui::vec2(w[0] / TF, w[2] / TF)
+    };
+    let empty = doc.0.level.columns.is_empty();
+    match &s.plan_for {
+        Some((path, _)) if *path != doc.0.path => s.plan_for = None,
+        // Built on from empty (by an agent, say): bring it into view, unless it is
+        // in view already, as a room just drawn in the plan is.
+        Some((_, true)) if !empty && !s.tools.busy() => {
+            let c = level_centre_tiles(&doc.0.level);
+            let shown = s.plan.rect.is_some_and(|r| r.shrink(8.0).contains(r.center() + (c - s.plan.centre) * s.plan.zoom));
+            if !shown {
+                s.plan.centre = c;
+            }
+            s.plan_for = Some((doc.0.path.clone(), false));
+        }
+        _ => {}
+    }
+    if s.plan_for.is_none() {
+        s.plan.centre = level_centre_tiles(&doc.0.level);
+        s.plan_for = Some((doc.0.path.clone(), empty));
     }
     s.fps = s.fps * 0.95 + 0.05 / time.delta_secs().max(1e-4);
     let doc = &mut doc.0;
