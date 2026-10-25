@@ -348,7 +348,7 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 |---|---|
 | Viewport | The see-through hole onto the 3D view, with view toggles in its corner |
 | Plan | Top-down 2D, with pan and zoom. It shows the cells at the current height slice, plus entities and links. Room, Carve, Slope and Strangeness work in it too: Room and Carve open (or with Shift fill) the **plan height** layers above the slice, set in the Tools window, and the Strangeness brush reaches that high. With the overlay on, open cells are coloured by strangeness. Pan with the right or middle button. |
-| Tools | The tool palette |
+| Tools | The tools as a grid of icons (hover one for its name, shortcut and how to use it), then a row of entity kinds, then the current tool's settings. Click an entity kind to place it with the Entity tool, or drag it onto a floor in the 3D view or the plan. |
 | Properties | Whatever is selected: an entity, an area (name, label, strangeness, its own surfaces, notes) or a light (position, colour, radius, strange colour); otherwise the level, with its strangeness (see Strangeness). |
 | Entities | An outliner grouped by kind, with a filter box (matching labels or kind names). Click to select, double-click to frame it. Add... puts one where the camera looks. |
 | Textures | The slot palette with previews for the level's texture set. Click one to paint with it (this switches to the Paint tool). |
@@ -402,7 +402,7 @@ progress.
 | Slope | S | Click near a floor's edge to make a ramp or stairs climbing away from it. Dragging on across the floor makes a flight: each column rises by the rise from the last, keeping the first one's headroom, carving through rock and raising floors in the way. Shift-click takes a slope off. The scroll wheel sets the rise, Tab switches between ramp and stairs. |
 | Paint | B | Click faces to paint them (a wall's whole height in that column, or the whole selection if you click in it). Drag paints along the surface. Shift-click fills the joined faces on the same plane that share a texture. Ctrl-click picks up a face's texture (Alt is taken by orbiting). Painting a face its default leaves it unpainted in the file. Rotating the texture (`[` and `]`) waits on paint gaining a rotation in the format. |
 | Strangeness | X | A brush over the lattice, with a radius (in tiles), a strength and a falloff. Click or drag adds, Shift takes off, Ctrl smooths. In one stroke a point moves at most the strength (times the falloff) however often the brush passes, so going over a patch evens it out; stroke again to go further. In the 3D view it is a ball round the point under the pointer; in the plan, a column from the slice up the plan height. The overlay tints the view and the plan by strangeness while this tool is active. |
-| Entity | E | Pick a kind in the Tools window, then click a floor to place it, and drag on to move it. Placement snaps to cell centres (Ctrl: exactly where you point), and doors to the middle of the nearest cell edge, facing into the cell you clicked so they open into it. Tab turns the next one a quarter (R is the Room tool). The pointer shows where it will go. There's only one player start: placing another moves it. Works in the plan too, at the slice. |
+| Entity | E | Pick a kind from the Tools window's entity row (or 1–7 while the tool is on), then click a floor to place it, and drag on to move it. Placement snaps to cell centres (Ctrl: exactly where you point), and doors to the middle of the nearest cell edge, facing into the cell you clicked so they open into it. Tab turns the next one a quarter (R is the Room tool). The pointer shows where it will go. There's only one player start: placing another moves it. Works in the plan too, at the slice. |
 | Light | L | Click to place a point light just off a face. Drag to lift it further off. Select picks lights by their markers, in the 3D view or the plan, where their radius shows as a circle. |
 
 Picking uses the triangles as drawn: the nearest one facing the camera under the
@@ -410,6 +410,12 @@ pointer, turned into the open cell it bounds and which face of that cell it is. 
 click on a wall takes its whole height in that column; a floor or ceiling, one tile.
 Drags change the level as they go, so the view shows the result live; Esc or the
 right button puts it back, and the whole drag is one undo step.
+
+A right click (pressed and let go without flying) on the 3D view or the plan opens
+**Add here**: any entity kind, placed at the point clicked, snapped as the Entity
+tool snaps. A door's or chest's Properties have **Place its key**, and a
+door's **Place a lever**: each switches to the Entity tool with that kind, and the
+entity placed next comes linked to the door or chest (a key also locks it).
 
 ### Undo
 

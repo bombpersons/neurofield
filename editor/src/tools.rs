@@ -61,6 +61,22 @@ impl Tool {
         }
     }
 
+    /// Its button in the Tools window (a Phosphor icon).
+    pub fn icon(self) -> &'static str {
+        use egui_phosphor::regular as i;
+        match self {
+            Tool::Select => i::CURSOR,
+            Tool::Room => i::CUBE,
+            Tool::PushPull => i::ARROWS_OUT_LINE_VERTICAL,
+            Tool::Carve => i::SHOVEL,
+            Tool::Slope => i::STAIRS,
+            Tool::Paint => i::PAINT_BRUSH,
+            Tool::Strange => i::SPIRAL,
+            Tool::Place => i::MAP_PIN,
+            Tool::Light => i::LIGHTBULB,
+        }
+    }
+
     pub fn hint(self) -> &'static str {
         match self {
             Tool::Select => "click a face or entity, shift adds, drag a box of faces, drag an entity to move it; Delete removes it",
@@ -102,9 +118,38 @@ pub enum Link {
     Target(u32),
 }
 
+/// What the next entity placed is for, from a door's or chest's "Place its key"
+/// (`Key`, of that door or chest) or a door's "Place a lever" (`Lever`, for that door).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum For {
+    Key(u32),
+    Lever(u32),
+}
+
+/// The "Add here" menu, opened by a right click in the 3D view or the plan at
+/// `at` (screen), with the world point it adds at: none off the floor.
+pub struct Menu {
+    pub at: egui::Pos2,
+    pub p: Option<[f32; 3]>,
+}
+
 /// Where an entity at `pos` (world) is clicked in the 3D view (view space).
 pub fn marker(pos: [f32; 3]) -> Vec3 {
     crate::view3d::to_view(pos) + Vec3::Y * 0.15
+}
+
+/// An entity kind's icon, for its button, menu item and outliner row.
+pub fn entity_icon(kind: &EntityKind) -> &'static str {
+    use egui_phosphor::regular as i;
+    match kind {
+        EntityKind::PlayerStart => i::FLAG_PENNANT,
+        EntityKind::Creature { .. } => i::GHOST,
+        EntityKind::Door { .. } => i::DOOR,
+        EntityKind::Key { .. } => i::KEY,
+        EntityKind::Chest { .. } => i::TREASURE_CHEST,
+        EntityKind::Prop { .. } => i::PACKAGE,
+        EntityKind::Lever { .. } => i::JOYSTICK,
+    }
 }
 
 /// The kinds the Entity tool places, with their names.
@@ -300,6 +345,15 @@ pub struct Tools {
     pub place: usize,
     pub yaw: f32,
     pub link: Option<Link>,
+    /// What the next entity placed is for, linked to it once placed.
+    pub placing_for: Option<For>,
+    /// An entity being dragged from the Tools window's palette, to drop in the
+    /// 3D view or the plan.
+    pub dragging: bool,
+    pub menu: Option<Menu>,
+    /// Where a right press in the 3D view went down, and when: let go there soon
+    /// after (no flying) and it opens the menu.
+    right_press: Option<(egui::Pos2, f64)>,
     /// Something finished on a press: wait for the button to come up.
     swallow: bool,
     /// The plan's Room rectangle, from its first corner.
@@ -322,6 +376,10 @@ impl Default for Tools {
             place: 1,
             yaw: 0.0,
             link: None,
+            placing_for: None,
+            dragging: false,
+            menu: None,
+            right_press: None,
             swallow: false,
             plan_start: None,
             brush: Brush { radius: 2.0, strength: 0.3, softness: 0.6 },
@@ -341,7 +399,7 @@ impl Tools {
     /// Stop whatever is under way, putting the level back. False if nothing was.
     pub fn cancel(&mut self, doc: &mut Doc) -> bool {
         self.plan_start = None;
-        let linking = self.link.take().is_some();
+        let linking = self.link.take().is_some() | self.placing_for.take().is_some() | self.menu.take().is_some();
         match std::mem::replace(&mut self.op, Op::Idle) {
             Op::Idle => return linking,
             Op::RoomHeight { before, .. } | Op::Push { before, .. } | Op::Slope { before, .. } => doc.level = before,
@@ -376,6 +434,35 @@ impl Tools {
         }
     }
 
+    /// The Entity tool, placing `entity_kinds()[i]`.
+    pub fn arm(&mut self, i: usize, doc: &mut Doc) {
+        self.set_tool(Tool::Place, doc);
+        self.place = i;
+        self.placing_for = None;
+    }
+
+    /// The Entity tool, placing a key or lever linked to `f`'s door or chest.
+    pub fn arm_for(&mut self, f: For, doc: &mut Doc) {
+        let want = match f {
+            For::Key(_) => "Key",
+            For::Lever(_) => "Lever",
+        };
+        self.arm(entity_kinds().iter().position(|(name, _)| *name == want).unwrap(), doc);
+        self.placing_for = Some(f);
+    }
+
+    /// Adds the Entity tool's kind at `pos`, linked up if a door or chest asked for it.
+    fn put(&mut self, doc: &mut Doc, pos: [f32; 3], yaw: f32, message: &mut String) -> u32 {
+        let id = add_entity(&mut doc.level, entity_kinds()[self.place].1.clone(), pos, yaw);
+        if let Some(f) = self.placing_for.take() {
+            *message = match f {
+                For::Key(owner) => make_link(&mut doc.level, Link::Key(owner), id),
+                For::Lever(door) => make_link(&mut doc.level, Link::Target(id), door),
+            };
+        }
+        id
+    }
+
     /// The pointer in the 3D view, which fills `screen`: `over` when it is on the
     /// view and not on a panel. Draws its outlines into `built.lines`.
     #[allow(clippy::too_many_arguments)]
@@ -392,7 +479,7 @@ impl Tools {
         input: &mut ViewInput,
     ) {
         built.lines.clear();
-        let (pressed, released, down, mods, wheel, cancel) = ctx.input(|i| {
+        let (pressed, released, down, mods, wheel, cancel, right_up, now) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_released(),
@@ -400,12 +487,42 @@ impl Tools {
                 i.modifiers,
                 i.events.iter().map(|e| if let egui::Event::MouseWheel { delta, .. } = e { delta.y } else { 0.0 }).sum::<f32>(),
                 i.pointer.secondary_pressed(),
+                i.pointer.secondary_released(),
+                i.time,
             )
         });
-        let ray = ctx.pointer_latest_pos().map(|p| pick::ray(cam, screen, p));
+        let pointer = ctx.pointer_latest_pos();
+        let ray = pointer.map(|p| pick::ray(cam, screen, p));
         self.hover = if over { ray.and_then(|r| pick::pick(&built.scene, &doc.level, r)) } else { None };
         if cancel && self.cancel(doc) {
             *message = "cancelled".into();
+        } else if cancel && over {
+            self.right_press = pointer.map(|p| (p, now));
+        }
+        // A right click (not a fly) opens the "Add here" menu.
+        if right_up {
+            if let (Some((from, t)), Some(p)) = (self.right_press.take(), pointer) {
+                if (p - from).length() < 5.0 && now - t < 0.5 {
+                    let floor = self.hover.filter(|h| h.face == Face::Floor);
+                    self.menu = Some(Menu { at: p, p: floor.map(|h| crate::view3d::to_world(h.point)) });
+                }
+            }
+        }
+        // An entity dragged in from the palette lands where it is let go.
+        if self.dragging {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if released && over {
+                let kind = &entity_kinds()[self.place].1;
+                match self.hover.and_then(|h| place_on(&built.scene, &h, kind, self.yaw, mods.ctrl)) {
+                    Some((pos, yaw)) => *sel = Sel::Entity(self.put(doc, pos, yaw, message)),
+                    None => *message = "entities go on floors".into(),
+                }
+                self.dragging = false;
+            }
+        }
+        // A click away from the menu only closes it.
+        if pressed && self.menu.is_some() {
+            self.swallow = true;
         }
         if self.swallow {
             self.swallow = down;
@@ -720,7 +837,7 @@ impl Tools {
                     self.swallow = true;
                     return Op::Idle;
                 };
-                let id = add_entity(&mut doc.level, kind, pos, yaw);
+                let id = self.put(doc, pos, yaw, message);
                 *sel = Sel::Entity(id);
                 Op::Move { id, from: p, moving: true }
             }
@@ -909,7 +1026,21 @@ impl Tools {
     ) -> Option<((i32, i32), (i32, i32))> {
         const TF: f32 = crate::view3d::TF;
         let cell = tile.map(|t| (t.x.floor() as i32, t.y.floor() as i32));
-        let (primary_down, primary_pressed) = r.ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
+        let (primary_down, primary_pressed, released) =
+            r.ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed(), i.pointer.primary_released()));
+        let floor = |t: egui::Vec2| [t.x * TF, -(slice * STEP) as f32 - 8.0, t.y * TF];
+        if r.secondary_clicked() {
+            self.menu = r.ctx.pointer_latest_pos().map(|at| Menu { at, p: tile.map(floor) });
+        }
+        if self.dragging && released && r.contains_pointer() {
+            self.dragging = false;
+            let kind = &entity_kinds()[self.place].1;
+            match tile.and_then(|t| place_at(scene, kind, floor(t), self.yaw, mods.ctrl)) {
+                Some((pos, yaw)) => *sel = Sel::Entity(self.put(doc, pos, yaw, message)),
+                None => *message = "nothing open at the slice there".into(),
+            }
+            return None;
+        }
         match self.tool {
             Tool::Room => {
                 if r.drag_started_by(egui::PointerButton::Primary) || (primary_pressed && r.hovered() && self.plan_start.is_none()) {
@@ -944,13 +1075,9 @@ impl Tools {
             Tool::Place => {
                 let t = tile?;
                 if r.clicked() {
-                    let kind = entity_kinds()[self.place].1.clone();
-                    let y = -(slice * STEP) as f32 - 8.0;
-                    match place_at(scene, &kind, [t.x * TF, y, t.y * TF], self.yaw, mods.ctrl) {
-                        Some((pos, yaw)) => {
-                            let id = add_entity(&mut doc.level, kind, pos, yaw);
-                            *sel = Sel::Entity(id);
-                        }
+                    let kind = &entity_kinds()[self.place].1;
+                    match place_at(scene, kind, floor(t), self.yaw, mods.ctrl) {
+                        Some((pos, yaw)) => *sel = Sel::Entity(self.put(doc, pos, yaw, message)),
                         None => *message = "nothing open at the slice there".into(),
                     }
                 }
@@ -1034,12 +1161,10 @@ impl Tools {
                 .on_hover_text("Pick one in the Textures window, or ctrl-click a face");
             }
             Tool::Place => {
-                ui.horizontal_wrapped(|ui| {
-                    for (i, (name, kind)) in entity_kinds().iter().enumerate() {
-                        let c = crate::view3d::entity_colour(kind).to_srgba();
-                        let c = egui::Color32::from_rgb((c.red * 255.0) as u8, (c.green * 255.0) as u8, (c.blue * 255.0) as u8);
-                        ui.selectable_value(&mut self.place, i, egui::RichText::new(*name).color(c));
-                    }
+                ui.label(match self.placing_for {
+                    Some(For::Key(id)) => format!("placing the key to #{id}"),
+                    Some(For::Lever(id)) => format!("placing a lever for door #{id}"),
+                    None => format!("placing: {}", entity_kinds()[self.place].0),
                 });
                 ui.horizontal(|ui| {
                     ui.label("facing");

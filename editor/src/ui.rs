@@ -4,7 +4,7 @@
 
 use crate::doc::Doc;
 use crate::settings::Settings;
-use crate::tools::{links, Link, Sel, Tool, Tools};
+use crate::tools::{entity_icon, entity_kinds, links, For, Link, Sel, Tool, Tools};
 use crate::view3d::{entity_colour, to_view, to_world, Built, EditorCam, ViewInput, ViewMode};
 use crate::Document;
 use bevy::prelude::*;
@@ -195,6 +195,9 @@ impl Ui {
 
 fn compact(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(6.0, 3.0);
         s.spacing.button_padding = egui::vec2(5.0, 1.0);
@@ -302,6 +305,19 @@ pub fn draw(
         .show_inside(&mut root, &mut viewer);
     let hovered = viewer.viewport_hovered;
     s.settings.dock = dock;
+    add_here(&ctx, s, doc, &built);
+    if s.tools.dragging {
+        // The entity being dragged from the palette, under the pointer.
+        if let Some(p) = ctx.pointer_latest_pos() {
+            let (_, kind) = &entity_kinds()[s.tools.place];
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, "dragging".into()));
+            let font = egui::FontId::proportional(20.0);
+            painter.text(p + egui::vec2(10.0, 4.0), egui::Align2::LEFT_TOP, entity_icon(kind), font, egui_colour(entity_colour(kind)));
+        }
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            s.tools.dragging = false;
+        }
+    }
     // Floating panels sit over the viewport tab: the pointer is only the 3D view's
     // when no egui layer above the background wants it.
     input.hovered = hovered && !ctx.layer_id_at(ctx.pointer_hover_pos().unwrap_or_default()).is_some_and(|l| l.order != egui::Order::Background);
@@ -360,6 +376,13 @@ fn shortcuts(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &mut Built, 
     for t in Tool::ALL {
         if pressed(t.key()) && t.coming().is_none() {
             s.tools.set_tool(t, doc);
+        }
+    }
+    // With the Entity tool, 1 to 7 pick what it places.
+    const NUMBERS: [Key; 7] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7];
+    if s.tools.tool == Tool::Place {
+        if let Some(i) = NUMBERS.iter().position(|&k| pressed(k)) {
+            s.tools.arm(i, doc);
         }
     }
     if pressed(Key::PageUp) {
@@ -723,6 +746,11 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
         let hint = match (s.tools.link, t.coming()) {
             (Some(Link::Key(_)), _) => "Link: click the key it opens with, in the 3D view or the plan (Esc cancels)".into(),
             (Some(Link::Target(_)), _) => "Link: click a door for the lever to work (Esc cancels)".into(),
+            _ if s.tools.dragging => "Let go on a floor in the 3D view or the plan to place it".into(),
+            _ if s.tools.placing_for.is_some() => match s.tools.placing_for {
+                Some(For::Key(id)) => format!("Entity: click a floor for the key to #{id} (Esc cancels)"),
+                _ => "Entity: click a floor for the lever (Esc cancels)".into(),
+            },
             (None, None) => format!("{}: {}", t.name(), t.hint()),
             (None, Some(m)) => format!("{}: arrives in milestone {m}", t.name()),
         };
@@ -881,17 +909,50 @@ impl Viewer<'_> {
     }
 
     fn tools(&mut self, ui: &mut egui::Ui) {
-        for t in Tool::ALL {
-            let text = format!("{}  {:?}", t.name(), t.key());
-            let r = ui.add_enabled(t.coming().is_none(), egui::Button::selectable(self.s.tools.tool == t, text));
-            let r = match t.coming() {
-                Some(m) => r.on_disabled_hover_text(format!("{}; arrives in milestone {m}", t.hint())),
-                None => r.on_hover_text(t.hint()),
-            };
-            if r.clicked() {
-                self.s.tools.set_tool(t, self.doc);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+            for t in Tool::ALL {
+                let on = self.s.tools.tool == t;
+                let r = ui.add_enabled(t.coming().is_none(), icon_button(on, t.icon(), Color32::PLACEHOLDER));
+                r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, t.coming().is_none(), on, t.name()));
+                let tip = |ui: &mut egui::Ui| {
+                    ui.set_max_width(260.0);
+                    ui.strong(format!("{}  ({:?})", t.name(), t.key()));
+                    match t.coming() {
+                        Some(m) => ui.label(format!("{}; arrives in milestone {m}", t.hint())),
+                        None => ui.label(t.hint()),
+                    };
+                };
+                let r = if t.coming().is_some() { r.on_disabled_hover_ui(tip) } else { r.on_hover_ui(tip) };
+                if r.clicked() {
+                    self.s.tools.set_tool(t, self.doc);
+                }
             }
-        }
+        });
+        ui.add_space(2.0);
+        // Entities to place: click one for the Entity tool, or drag it into a view.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+            for (i, (name, kind)) in entity_kinds().iter().enumerate() {
+                let tools = &self.s.tools;
+                let on = tools.tool == Tool::Place && tools.place == i;
+                let b = icon_button(on, entity_icon(kind), egui_colour(entity_colour(kind))).sense(egui::Sense::click_and_drag());
+                let r = ui.add(b);
+                r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, *name));
+                let r = r.on_hover_ui(|ui| {
+                    ui.set_max_width(260.0);
+                    ui.strong(format!("{name}  ({})", i + 1));
+                    ui.label("click, then click a floor to place it; or drag it onto a floor in the 3D view or the plan");
+                });
+                if r.clicked() {
+                    self.s.tools.arm(i, self.doc);
+                }
+                if r.drag_started() {
+                    self.s.tools.arm(i, self.doc);
+                    self.s.tools.dragging = true;
+                }
+            }
+        });
         ui.separator();
         self.s.tools.options(ui);
     }
@@ -907,7 +968,11 @@ impl Viewer<'_> {
                 let keys = named(|k| matches!(k, EntityKind::Key { .. }));
                 let doors = named(|k| matches!(k, EntityKind::Door { .. }));
                 let e = l.entities.iter_mut().find(|e| e.id == id).unwrap();
-                entity_properties(ui, e, &keys, &doors, &mut self.s.tools.link, &mut delete);
+                let mut place = None;
+                entity_properties(ui, e, &keys, &doors, &mut self.s.tools.link, &mut place, &mut delete);
+                if let Some(f) = place {
+                    self.s.tools.arm_for(f, self.doc);
+                }
             }
             Sel::Light(i) if i < l.lights.len() => light_properties(ui, i, &mut l.lights[i], &mut delete),
             Sel::Area(i) if i < l.areas.len() => {
@@ -924,8 +989,8 @@ impl Viewer<'_> {
     fn entities(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("Add...", |ui| {
-                for (name, kind) in crate::tools::entity_kinds() {
-                    if ui.button(name).clicked() {
+                for (name, kind) in entity_kinds() {
+                    if ui.button(format!("{}  {name}", entity_icon(&kind))).clicked() {
                         let at = self.focus_on_floor();
                         let id = crate::tools::add_entity(&mut self.doc.level, kind, at, 0.0);
                         self.s.sel = Sel::Entity(id);
@@ -1191,7 +1256,10 @@ impl Viewer<'_> {
         // The tool, at the tile under the pointer.
         let (centre, zoom) = (pv.centre, pv.zoom);
         let to_screen = move |x: f32, z: f32| rect.center() + (egui::vec2(x, z) - centre) * zoom;
-        let tile = r.hover_pos().or(r.interact_pointer_pos()).map(|p| (p - rect.center()) / zoom + centre);
+        // While something is dragged in from the palette the plan isn't hovered, but
+        // the pointer is still over it.
+        let dropping = (self.s.tools.dragging && r.contains_pointer()).then(|| ui.ctx().pointer_latest_pos()).flatten();
+        let tile = r.hover_pos().or(r.interact_pointer_pos()).or(dropping).map(|p| (p - rect.center()) / zoom + centre);
         let mods = ui.input(|i| i.modifiers);
         let s = &mut *self.s;
         if let Some((lo, hi)) = s.tools.plan(&r, mods, tile, slice, self.doc, &self.built.scene, &mut s.sel, &mut s.message) {
@@ -1247,6 +1315,40 @@ impl Viewer<'_> {
 }
 
 const NEURAL_HINT: &str = "The trained network, as the game draws it: slow without a good GPU, so for checking rather than editing";
+
+/// A square button holding one icon, coloured `colour` (PLACEHOLDER: the text colour).
+fn icon_button(selected: bool, icon: &str, colour: Color32) -> egui::Button<'_> {
+    egui::Button::selectable(selected, RichText::new(icon).size(17.0).color(colour)).min_size(egui::vec2(28.0, 26.0))
+}
+
+/// The "Add here" menu (a right click in the 3D view or the plan): an entity of
+/// each kind, placed at the point clicked.
+fn add_here(ctx: &egui::Context, s: &mut Ui, doc: &mut Doc, built: &Built) {
+    let Some(menu) = &s.tools.menu else { return };
+    let (at, p) = (menu.at, menu.p);
+    let mut close = false;
+    let area = egui::Area::new("add here".into()).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+        egui::Frame::menu(ui.style()).show(ui, |ui| {
+            ui.set_width(130.0);
+            ui.label(RichText::new(if p.is_some() { "Add here" } else { "Add here: not on a floor" }).weak());
+            for (name, kind) in entity_kinds() {
+                let placed = p.and_then(|p| crate::tools::place_at(&built.scene, &kind, p, s.tools.yaw, false));
+                let text = RichText::new(format!("{}  {name}", entity_icon(&kind)));
+                let r = ui.add_enabled(placed.is_some(), egui::Button::new(text).frame(false).min_size(egui::vec2(130.0, 0.0)));
+                if let (true, Some((pos, yaw))) = (r.clicked(), placed) {
+                    let id = crate::tools::add_entity(&mut doc.level, kind, pos, yaw);
+                    s.sel = Sel::Entity(id);
+                    close = true;
+                }
+            }
+        });
+    });
+    // A press anywhere else closes it.
+    let outside = ctx.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer();
+    if close || outside {
+        s.tools.menu = None;
+    }
+}
 
 fn egui_colour(c: Color) -> Color32 {
     let s = c.to_srgba();
@@ -1363,9 +1465,15 @@ fn entity_properties(
     keys: &[(u32, String)],
     doors: &[(u32, String)],
     link: &mut Option<Link>,
+    place: &mut Option<For>,
     delete: &mut bool,
 ) {
     let me = e.id;
+    let place_button = |ui: &mut egui::Ui, text: &str, hint: &str, f: For, place: &mut Option<For>| {
+        if ui.button(text).on_hover_text(hint).clicked() {
+            *place = Some(f);
+        }
+    };
     ui.horizontal(|ui| {
         ui.heading(format!("{} #{}", kind_name(&e.kind), e.id));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1438,6 +1546,14 @@ fn entity_properties(
                     key_edit(ui, me, key, keys, link);
                 });
                 ui.end_row();
+                ui.label("");
+                ui.horizontal(|ui| {
+                    let key = format!("{} Place its key", egui_phosphor::regular::KEY);
+                    place_button(ui, &key, "Lock the door, then click a floor for the key that opens it", For::Key(me), place);
+                    let lever = format!("{} Place a lever", egui_phosphor::regular::JOYSTICK);
+                    place_button(ui, &lever, "Click a floor for a lever that opens this door", For::Lever(me), place);
+                });
+                ui.end_row();
             }
             EntityKind::Key { name } => {
                 ui.label("name");
@@ -1450,6 +1566,10 @@ fn entity_properties(
                     ui.checkbox(locked, "locked");
                     key_edit(ui, me, key, keys, link);
                 });
+                ui.end_row();
+                ui.label("");
+                let text = format!("{} Place its key", egui_phosphor::regular::KEY);
+                place_button(ui, &text, "Lock the chest, then click a floor for the key that opens it", For::Key(me), place);
                 ui.end_row();
                 ui.label("contents");
                 let mut text = contents.join(", ");

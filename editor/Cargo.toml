@@ -10,6 +10,7 @@ bevy_egui.workspace = true
 psx-bevy.workspace = true
 egui_dock = { version = "0.21.1", features = ["serde"] }
 engine = { path = "../engine" }
+egui-phosphor = "0.14"
 rfd = "0.17"
 ron.workspace = true
 serde.workspace = true
