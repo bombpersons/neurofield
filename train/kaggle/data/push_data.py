@@ -1,7 +1,7 @@
 """Start a run's training data: PARTS Kaggle CPU kernels (bombpersons/neurofield-data-<i>),
 each drawing SCENES / PARTS scenes from its own seed, all at once.
 
-    .venv/bin/python train/kaggle/data/push_data.py [--parts 4] [--scenes 4000] [--seed S]
+    .venv/bin/python train/kaggle/data/push_data.py [--parts 4] [--scenes 4000] [--seed S] [--only 2 3]
     .venv/bin/kaggle kernels status bombpersons/neurofield-data-0
 
 They clone neurofield from GitHub, so push the code first. When they finish, push
@@ -25,9 +25,12 @@ def main():
     ap.add_argument("--parts", type=int, default=4)
     ap.add_argument("--scenes", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=int(time.time()))
+    ap.add_argument("--only", type=int, nargs="*", help="push just these parts (e.g. to retry one)")
     a = ap.parse_args()
     src = (HERE / "gen.py").read_text()
     for part in range(a.parts):
+        if a.only and part not in a.only:
+            continue
         consts = f"PART, SEED, SCENES, VIEWS, SHARD, LEVEL_SHARE = {part}, {a.seed + part}, {a.scenes // a.parts}, 8, 250, 0.3"
         code = re.sub(r"^PART, SEED, .*$", consts, src, count=1, flags=re.M)
         slug = f"neurofield-data-{part}"
@@ -41,7 +44,10 @@ def main():
             (Path(d) / "gen.py").write_text(code)
             (Path(d) / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
             r = subprocess.run([KAGGLE, "kernels", "push", "-p", d], text=True, capture_output=True)
-            print(slug, (r.stdout + r.stderr).strip().splitlines()[-1])
+            out = (r.stdout + r.stderr).strip().splitlines()[-1]
+            print(slug, out)
+            if "error" in out.lower():
+                raise SystemExit(1)
 
 
 if __name__ == "__main__":
