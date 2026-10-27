@@ -48,11 +48,15 @@ class Trainer:
         self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
         ckpt = self.out / "ckpt.pt"
         state = torch.load(ckpt, map_location=self.device) if ckpt.exists() else None
-        migrated = False
+        migrated, warmup = False, WARMUP
         if state is not None:
             self.cfg = state.get("cfg", self.cfg)
-            # From before widths varied: start both copies from the averaged weights, migrated.
-            weights, cfg, migrated = migrate(state.get("ema", state["model"]), self.cfg)
+            # From before widths varied or creature parts: start both copies from the averaged
+            # weights, migrated.
+            weights = state.get("ema", state["model"])
+            if "q_pos" in weights:  # the old patch head goes: its replacement needs the long warm-up
+                warmup = WARMUP_NEW_HEAD
+            weights, cfg, migrated = migrate(weights, self.cfg)
             if migrated:
                 state = {**state, "model": weights, "ema": weights, "opt": None}
                 self.cfg = cfg
@@ -60,9 +64,10 @@ class Trainer:
         # A perceptual loss on top of L1, against the blur that L1 alone settles for.
         self.lpips_weight = lpips_weight
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(self.device).eval().requires_grad_(False)
-        main = [p for n, p in self.model.named_parameters() if n != "cover"]
+        covers = ("cover", "part_cover")
+        main = [p for n, p in self.model.named_parameters() if n not in covers]
         self.opt = torch.optim.AdamW(main, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
-        self.opt.add_param_group({"params": [self.model.cover], "weight_decay": 0.0})
+        self.opt.add_param_group({"params": [getattr(self.model, n) for n in covers], "weight_decay": 0.0})
         self.lr = lr
         self.amp = self.device == "cuda"
         self.scaler = torch.amp.GradScaler(enabled=self.amp)
@@ -81,7 +86,7 @@ class Trainer:
             missing = self.model.load_state_dict(state["model"], strict=False).missing_keys
             assert set(missing) <= {"cover"}, missing
             if state["opt"] is None:  # migrated: the shapes changed, so the optimizer starts over
-                self.warm_from, self.warmup = state["step"], WARMUP_NEW_HEAD
+                self.warm_from, self.warmup = state["step"], warmup
             elif len(state["opt"]["param_groups"]) == len(self.opt.param_groups):
                 self.opt.load_state_dict(state["opt"])
                 self.warm_from, self.warmup = state.get("warm", (0, WARMUP))
@@ -90,7 +95,7 @@ class Trainer:
                 self.opt.load_state_dict(state["opt"])
                 self.opt.add_param_group(cover)
             self.step = state["step"]
-            print(f"resumed at step {self.step}" + (" (migrated: new head, fresh optimizer)" if migrated else "")
+            print(f"resumed at step {self.step}" + (" (migrated: fresh optimizer)" if migrated else "")
                   + (f", new {missing}" if missing else ""))
         # A slow average of the weights, used for validation, samples and export: steadier than the
         # weights of any one step.
@@ -114,8 +119,9 @@ class Trainer:
 
     def forward(self, batch, model=None):
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch[:5])
+        pfeats, pids, ppad, _ = (x.to(self.device, non_blocking=True) for x in batch[5])
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            pred = (model or self.model)(feats, tex, pad, cams, width=images.shape[-1])
+            pred = (model or self.model)(feats, tex, pad, cams, width=images.shape[-1], parts=(pfeats, pids, ppad))
         return pred.float(), images
 
     def losses(self, pred, target):
@@ -163,10 +169,17 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, batches=8):
-        """Mean (L1, LPIPS) of the averaged weights over the first validation batches."""
+        """(L1, LPIPS, L1 on creature pixels) of the averaged weights over the first
+        validation batches."""
         loader = DataLoader(self.val_set, batch_sampler=WidthBatches(self.val_set.widths, 16, seed=0, partial=True), collate_fn=collate)
-        ls = [[x.item() for x in self.losses(*self.forward(b, self.ema))[1:]] for b in itertools.islice(loader, batches)]
-        return tuple(float(x) for x in np.mean(ls, 0))
+        ls, err, px = [], 0.0, 0.0
+        for b in itertools.islice(loader, batches):
+            pred, target = self.forward(b, self.ema)
+            ls.append([x.item() for x in self.losses(pred, target)[1:]])
+            mask = b[5][3].to(self.device)[:, None]
+            err += ((pred - target).abs() * mask).sum().item() / 3
+            px += mask.sum().item()
+        return (*(float(x) for x in np.mean(ls, 0)), err / max(px, 1.0))
 
     @torch.no_grad()
     def sample(self, path):
@@ -180,8 +193,11 @@ class Trainer:
         Image.fromarray((grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)).save(path)
 
     def checkpoint(self):
-        val_l1, val_lpips = self.validate()
-        self.log(val_l1=val_l1, val_lpips=val_lpips, cover=self.model.cover.abs().mean().item())
+        val_l1, val_lpips, val_creature = self.validate()
+        self.log(
+            val_l1=val_l1, val_lpips=val_lpips, val_creature_l1=val_creature,
+            cover=self.model.cover.abs().mean().item(), part_cover=self.model.part_cover.abs().mean().item(),
+        )
         self.sample(self.out / f"sample_{self.step:07d}.png")
         self.sample(self.out / "sample_latest.png")
         state = {

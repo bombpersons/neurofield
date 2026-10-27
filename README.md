@@ -128,6 +128,11 @@ the same tokens: patch queries come from the Fourier features of their screen
 positions alone. Its head lays them out as a grid and doubles it four times
 (3x3 convolution, then pixel shuffle) to full resolution.
 
+Creatures reach the network as one token per body part (pose, size, shape, skin
+motif and density, tint, baked light), never as triangles, so it has to invent
+their skins. The WGSL port doesn't pass part tokens yet: it draws the level
+alone, as the network does for views with no creature in sight.
+
 The network runs as hand-written WGSL compute shaders
 (`engine/src/neural/gpu_net.wgsl`) through [wgpu](https://wgpu.rs): Vulkan, Metal or
 DX12, in pure Rust. The whole frame is one submission of about 140 small kernels over

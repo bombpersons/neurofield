@@ -6,6 +6,9 @@ Screen positions of both triangles and patches go through the same Fourier
 features, so a patch can match the triangles that cover it; the
 cross-attention is also biased toward triangles whose screen bounding box
 covers or lies near the patch, by a learned strength per decoder layer and head.
+Creatures come in as one token per body part (see data.part_tokens), with the
+Fourier features of their screen box's corners, alongside the triangles and
+with a coverage bias of their own.
 Patch queries come from their positions alone, so the grid can be any width
 (any aspect ratio; 20 patches across is 4:3).
 
@@ -22,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from data import CAM_FEATURES, H, NUM_TEX, TRI_FEATURES, W
+from data import CAM_FEATURES, H, NUM_MOTIFS, NUM_SHAPES, NUM_TEX, PART_FEATURES, TRI_FEATURES, W
 
 PATCH = 16
 DREAM_DIRS = 16
@@ -119,21 +122,28 @@ class Renderer(nn.Module):
         tri_in = TRI_FEATURES + 6 * 2 * bands  # + Fourier of the 3 vertices' NDC
         self.tri_in = nn.Sequential(nn.Linear(tri_in, d), nn.GELU(), nn.Linear(d, d))
         self.tex = nn.Embedding(NUM_TEX, d)
+        part_in = PART_FEATURES + 4 * 2 * bands  # + Fourier of the screen box's x0, y0, x1, y1
+        self.part_in = nn.Sequential(nn.Linear(part_in, d), nn.GELU(), nn.Linear(d, d))
+        self.shape = nn.Embedding(NUM_SHAPES, d)
+        self.motif = nn.Embedding(NUM_MOTIFS, d)
         self.cam_in = nn.Sequential(nn.Linear(CAM_FEATURES, d), nn.GELU(), nn.Linear(d, d))
         self.encoder = nn.ModuleList([Block(d, heads, False) for _ in range(enc_layers)])
         self.q_in = nn.Sequential(nn.Linear(2 * 2 * bands, d), nn.GELU(), nn.Linear(d, d))
         self.decoder = nn.ModuleList([Block(d, heads, True) for _ in range(dec_layers)])
         # How strongly each decoder layer's heads prefer covering triangles; zero = no preference.
         self.cover = nn.Parameter(torch.zeros(dec_layers, heads))
+        # The same for creature parts and their screen boxes.
+        self.part_cover = nn.Parameter(torch.zeros(dec_layers, heads))
         # Fixed directions for the dream effects (engine::neural::effects) to push patch queries along.
         noise_dirs = torch.randn(DREAM_DIRS, d, generator=torch.Generator().manual_seed(0)) / math.sqrt(DREAM_DIRS)
         self.register_buffer("noise_dirs", noise_dirs, persistent=False)
         self.out_norm = nn.LayerNorm(d)
         self.head = UpHead(d)
 
-    def forward(self, feats, tex, pad, cams, width=W, noise=None, tex_mix=None, temp=None, q_noise=None):
+    def forward(self, feats, tex, pad, cams, width=W, parts=None, noise=None, tex_mix=None, temp=None, q_noise=None):
         """An image [b, 3, 240, width] (width a multiple of 16) of the triangle tokens seen
-        with camera tokens `cams`. `noise` is the head's (see UpHead). The other optional
+        with camera tokens `cams`. `parts` is (part feats, part ids, part pad) as `collate`
+        gives them, None for no creatures. `noise` is the head's (see UpHead). The other optional
         inputs are for disturbing a trained model (the game's dream effects): `tex_mix`
         [NUM_TEX, NUM_TEX] mixes texture embeddings (identity: none), `temp` [1] is the
         cross-attention temperature (1: none), and `q_noise` [patches, DREAM_DIRS] pushes
@@ -147,6 +157,13 @@ class Renderer(nn.Module):
         # The camera token rides along as an extra (never padded) triangle token.
         x = torch.cat([cam, x], 1)
         pad = torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=pad.device), pad], 1)
+        if parts is not None:
+            pfeats, pids, ppad = parts
+            box = pfeats[:, :, 18:22]
+            p = self.part_in(torch.cat([pfeats, fourier(box, self.bands, self.low)], -1))
+            # Creature parts follow the triangles.
+            x = torch.cat([x, p + self.shape(pids[..., 0]) + self.motif(pids[..., 1])], 1)
+            pad = torch.cat([pad, ppad], 1)
         for blk in self.encoder:
             x = blk(x, pad=pad)
 
@@ -157,8 +174,11 @@ class Renderer(nn.Module):
             q = q + q_noise @ self.noise_dirs
         temp = 1.0 if temp is None else temp
         dist = cover_distance(ndc, c)
-        for blk, strength in zip(self.decoder, self.cover):
+        pdist = None if parts is None else box_distance(parts[0][:, :, 18:20], parts[0][:, :, 20:22], c)
+        for blk, strength, pstrength in zip(self.decoder, self.cover, self.part_cover):
             bias = -strength[None, :, None, None] * dist[:, None]  # [b, heads, patches, 1 + tris]
+            if pdist is not None:
+                bias = torch.cat([bias, -pstrength[None, :, None, None] * pdist[:, None]], -1)
             bias = bias.masked_fill(pad[:, None, None], float("-inf"))
             q = blk(q, mem=x, mem_bias=bias, temp=temp)
         return self.head(self.out_norm(q), gw, noise)
@@ -169,14 +189,40 @@ def cover_distance(ndc, c):
     screen bounding box (0 inside it): [b, patches, 1 + tris], with 0 for the camera
     token in front."""
     xy = ndc.unflatten(-1, (3, 2))  # [b, tris, vertex, xy]
-    lo, hi = xy.min(2).values[:, None], xy.max(2).values[:, None]  # [b, 1, tris, 2]
+    return F.pad(box_distance(xy.min(2).values, xy.max(2).values, c), (1, 0))
+
+
+def box_distance(lo, hi, c):
+    """Distance in patch widths from each patch centre c [patches, 2] to each of the
+    screen boxes lo..hi [b, n, 2] (0 inside it): [b, patches, n]."""
     c = c[None, :, None]  # [1, patches, 1, 2]
-    gap = (lo - c).clamp(min=0) + (c - hi).clamp(min=0)
-    dist = gap.norm(dim=-1) / (2 * PATCH / W)
-    return F.pad(dist, (1, 0))
+    gap = (lo[:, None] - c).clamp(min=0) + (c - hi[:, None]).clamp(min=0)
+    return gap.norm(dim=-1) / (2 * PATCH / W)
 
 
 def migrate(weights, cfg):
+    """Weights (and config) of an older model, brought up to date: see `migrate_widths`
+    and `migrate_parts`. Returns (weights, cfg, whether anything changed)."""
+    weights, cfg, widths = migrate_widths(weights, cfg)
+    weights, parts = migrate_parts(weights, cfg)
+    return weights, cfg, widths or parts
+
+
+def migrate_parts(weights, cfg):
+    """From before creature parts: fresh part tokens, with the triangles' coverage
+    strengths to start from (both measure distance to a screen box)."""
+    if "part_in.0.weight" in weights:
+        return weights, False
+    new = Renderer(**cfg).state_dict()
+    out = dict(weights)
+    for k, v in new.items():
+        if k.startswith(("part_in.", "shape.", "motif.")):
+            out[k] = v
+    out["part_cover"] = weights.get("cover", new["cover"]).clone()
+    return out, True
+
+
+def migrate_widths(weights, cfg):
     """Weights (and config) of a model from before widths varied: 45 triangle and 7
     camera features, 6 Fourier bands, a learned table of patch positions and a linear
     patch head. The inputs added since (strangeness; fog colour and screen reach; two

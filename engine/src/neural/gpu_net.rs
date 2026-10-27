@@ -412,6 +412,9 @@ impl GpuNet {
             }
         }
         let rgb = conv(&mut w, &mut up, "head.rgb")?;
+        // Creature part tokens aren't ported yet: without them the network draws the
+        // level alone, as it does for views with no creature in sight.
+        w.0.retain(|k, _| !(k.starts_with("part_in.") || k == "shape.weight" || k == "motif.weight" || k == "part_cover"));
         if !w.0.is_empty() {
             let mut left: Vec<_> = w.0.keys().collect();
             left.sort();
