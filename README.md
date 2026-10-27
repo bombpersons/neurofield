@@ -85,7 +85,7 @@ sheet; `format.json` documents the layouts and the shading. A frame averages
 about 320 KB uncompressed, so 1000 scenes × 8 views ≈ 2.6 GB. Drawing takes about
 120 ms a view on Mesa's software Vulkan (lavapipe) on 12 cores. Kaggle's GPUs
 expose no Vulkan, so `train/kaggle/data/push_data.py` draws a run's data on
-Kaggle CPU kernels, which the training kernel (`train/kaggle`) mounts.
+Kaggle CPU kernels, which the training kernel (`train/kaggle`) mounts. They draw with the photo textures (`data/strange`, `data/skins_gen`) from the private dataset `bombpersons/neurofield-textures`, a tar of those two folders.
 
 Rendering rules worth knowing when reading the data:
 - Triangles are clipped at 0.02 tiles from the eye and depth-buffered; level

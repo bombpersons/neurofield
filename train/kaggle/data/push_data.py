@@ -34,7 +34,7 @@ def main():
         meta = {
             "id": f"bombpersons/{slug}", "title": slug, "code_file": "gen.py", "language": "python",
             "kernel_type": "script", "is_private": "true", "enable_gpu": "false", "enable_tpu": "false",
-            "enable_internet": "true", "dataset_sources": [], "competition_sources": [], "kernel_sources": [],
+            "enable_internet": "true", "dataset_sources": ["bombpersons/neurofield-textures"], "competition_sources": [], "kernel_sources": [],
             "model_sources": [],
         }
         with tempfile.TemporaryDirectory() as d:
