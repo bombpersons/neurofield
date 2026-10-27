@@ -455,7 +455,7 @@ fn budget(l: &Level, scene: &Scene, reach: &HashMap<Node, Node>) -> Option<Budge
                         torch_radius: 0,
                     };
                     let mut v = Vec::new();
-                    features::view_features(scene, 0, &cam, &mut v);
+                    features::view_features(scene, 0, &cam, engine::world::view::W, &mut v);
                     v
                 })
                 .collect();

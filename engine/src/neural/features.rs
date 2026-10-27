@@ -10,7 +10,7 @@ use crate::world::{tex, view};
 /// view in `views.npy`.
 pub const TRI_FEATURES: usize = 35;
 pub const PART_FEATURES: usize = 49;
-pub const VIEW_FEATURES: usize = 26;
+pub const VIEW_FEATURES: usize = 27;
 
 /// Per-triangle features as written to `tris.npy`, appended to `out`: the
 /// level's, then those of its doors, keys and levers (`thing_tri_features`).
@@ -75,8 +75,9 @@ pub fn part_features(scene: &Scene, out: &mut Vec<f32>) {
     }
 }
 
-/// Per-view features as written to `views.npy`, appended to `out`.
-pub fn view_features(scene: &Scene, scene_index: usize, cam: &Camera, out: &mut Vec<f32>) {
+/// Per-view features as written to `views.npy`, appended to `out`, for a frame
+/// `width` pixels wide (240 high; `view::W` is the 4:3 width).
+pub fn view_features(scene: &Scene, scene_index: usize, cam: &Camera, width: u32, out: &mut Vec<f32>) {
     out.push(scene_index as f32);
     out.extend(cam.pos.map(|c| c as f32 / T as f32));
     let m = view::view_matrix(cam);
@@ -88,4 +89,5 @@ pub fn view_features(scene: &Scene, scene_index: usize, cam: &Camera, out: &mut 
     out.extend(cam.torch);
     out.push(cam.torch_radius as f32 / T as f32);
     out.extend(scene.fog_colour(cam.pos));
+    out.push(width as f32);
 }

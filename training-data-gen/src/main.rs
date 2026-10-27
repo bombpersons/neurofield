@@ -1,10 +1,14 @@
 //! PS1-style training data for a neural renderer.
 //!
-//! `datagen gen --out DIR [--scenes N] [--views K] [--shard-scenes S] [--seed X] [--camera fp|free] [--creature-views P]`
+//! `datagen gen --out DIR [--scenes N] [--views K] [--shard-scenes S] [--seed X] [--camera fp|free] [--creature-views P]
+//!              [--levels DIR] [--level-share Q] [--width W]`
 //!     Random scenes, K views each, in shards of S scenes. `fp` (default) samples
 //!     views from King's Field-style first-person walks; `free` uses random cameras.
 //!     With `fp`, a share P (default 0.5) of views instead stand near a creature
-//!     and look at it, since walks alone rarely get close to one.
+//!     and look at it, since walks alone rarely get close to one. With `--levels`,
+//!     a share Q (default 0.3) of the scenes are instead walks through the editor
+//!     levels (*.ron) in DIR, each from a random place. Every view gets its own
+//!     screen width, a multiple of 16 from 320 (4:3) to 576 (2.4:1) at random, or W.
 //! `datagen walk --out DIR [--frames N] [--seed X]`
 //!     One scene and a continuous first-person walk through it.
 //! `datagen textures --out FILE.png`
@@ -18,7 +22,7 @@
 //! `datagen creatures --out FILE.png [--seed X] [--zoom K]`
 //!     16 close views of creatures with their masks, for eyeballing the generator;
 //!     `--zoom` lengthens the lens K times for a closer look.
-//! `datagen check --frames N --out DIR [--model M] [--seed 7] [--effect E]`
+//! `datagen check --frames N --out DIR [--model M] [--seed 7] [--effect E] [--width W]`
 //!     The neural renderer on the first N frames of the walk `datagen walk --seed S`
 //!     makes, as tokens and network images in DIR (with dream effect E), to compare
 //!     against `train/data.py` and PyTorch. The model and textures are
@@ -42,6 +46,7 @@ mod npy;
 
 use engine::neural::features::{part_features, tri_features, view_features, PART_FEATURES, TRI_FEATURES, VIEW_FEATURES};
 use engine::render::headless::{Frame, Renderer};
+use engine::world::level::Level;
 use engine::world::creature::Creature;
 use engine::world::rng::Rng;
 use engine::world::scene::{Camera, Scene};
@@ -50,6 +55,13 @@ use engine::world::{tex, walkable_scene};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Training views are drawn this wide and cropped to their own width: the
+/// widest, a multiple of 64 so GPU readback rows need no unpadding.
+const DRAW_W: u32 = 576;
+/// Narrowest view width (4:3).
+const MIN_W: u32 = 320;
 
 
 const FORMAT: &str = r#"{
@@ -59,10 +71,11 @@ const FORMAT: &str = r#"{
   "tri_offsets.npy": "int64 [S + 1]: scene s owns tris[tri_offsets[s] : tri_offsets[s + 1]]",
   "parts.npy": "float32 [P, 49] per creature part, world space: joint xyz (0-2); centre xyz (3-5); local axes as the columns of a row-major 3x3 (6-14; y runs from the joint end to the far end); radius x, half-length y, radius z (15-17); bounding box in the local frame, lo xyz then hi xyz (18-23); shape 0 ellipsoid, 1 capsule, 2 cone, 3 tentacle (24); taper, bend, bulge, lumps (25-28); skin motif 0-10 (29; flesh, eyes, teeth, mouths, suckers, veins, scales, chitin, hair, wrinkles, bone); skin density 0..1 (30); tiles per skin repeat (31); tint rgb, 1 = neutral (32-34); baked light at the centre as linear spherical harmonics, 1 = neutral: mean rgb (35-37), then the gradient along world x, y, z, rgb each (38-46); parent part index within the scene, -1 for a root (47); creature index within the scene (48)",
   "part_offsets.npy": "int64 [S + 1]: scene s owns parts[part_offsets[s] : part_offsets[s + 1]]",
-  "views.npy": "float32 [V, 23] per view: scene index within the shard (0); camera position xyz (1-3); world-to-view rotation, row-major (4-12; row 2 is the view direction); projection distance H in pixels, screen centre (160, 120) (13); fog near, fog far (14-15); yaw, pitch, roll in turns (16-18); torch rgb strength, 0 = no torch (19-21); torch reach (22); fog colour rgb 0..1, black when grounded (23-25)",
-  "images.npy": "uint8 [V, 240, 320, 3]",
-  "masks.npy": "uint8 [V, 240, 40]: creature pixels, 1 bit per pixel, most significant bit leftmost (np.unpackbits(masks, axis=-1))",
-  "projection": "view = R (p - pos); screen = (160 + H * view.x / view.z, 120 + H * view.y / view.z); triangles are clipped at view.z = 0.02 tiles",
+  "views.npy": "float32 [V, 27] per view: scene index within the shard (0); camera position xyz (1-3); world-to-view rotation, row-major (4-12; row 2 is the view direction); projection distance H in pixels, screen centre (width / 2, 120) (13); fog near, fog far (14-15); yaw, pitch, roll in turns (16-18); torch rgb strength, 0 = no torch (19-21); torch reach (22); fog colour rgb 0..1, black when grounded (23-25); screen width in pixels, a multiple of 16, 240 high (26)",
+  "images.npy": "uint8 [sum of 240 * width * 3]: the views' frames one after another, each [240, width, 3]; view v starts at image_offsets[v]",
+  "image_offsets.npy": "int64 [V + 1]: byte offsets of each view's frame in images.npy",
+  "masks.npy": "uint8 [sum of 240 * width / 8]: creature pixels per view, [240, width / 8], 1 bit per pixel, most significant bit leftmost (np.unpackbits(mask, axis=-1)); view v starts at image_offsets[v] / 24",
+  "projection": "view = R (p - pos); screen = (width / 2 + H * view.x / view.z, 120 + H * view.y / view.z); triangles are clipped at view.z = 0.02 tiles",
   "shading": "level, per vertex: colour = baked + tint * torch * max(0, 1 - d / reach)^2 * max(0, n . l), d and l toward the camera; per pixel: texel * colour / 128 (affine), toward the fog colour by clamp((distance - fog near) / (fog far - fog near), 0, 1), dithered to 15 bits. Creatures are drawn over that in full colour, anti-aliased (see engine/src/render/flesh.wesl)"
 }
 "#;
@@ -96,7 +109,9 @@ struct Batch {
     part_offsets: Vec<i64>,
     views: Vec<f32>,
     images: Vec<u8>,
+    image_offsets: Vec<i64>,
     masks: Vec<u8>,
+    /// The first 4:3 frames, for the preview sheet.
     frames: Vec<Vec<u8>>,
 }
 
@@ -114,6 +129,7 @@ impl Batch {
             part_offsets: vec![0],
             views: Vec::new(),
             images: Vec::new(),
+            image_offsets: vec![0],
             masks: Vec::new(),
             frames: Vec::new(),
         }
@@ -127,12 +143,13 @@ impl Batch {
         self.offsets.len() - 2
     }
 
-    /// Keep `cam`'s view of `scene`, as drawn, and its creature mask.
-    fn add_view(&mut self, scene_index: usize, scene: &Scene, cam: &Camera, frame: &Frame) {
-        view_features(scene, scene_index, cam, &mut self.views);
+    /// Keep `cam`'s view of `scene`, as drawn `width` pixels wide, and its creature mask.
+    fn add_view(&mut self, scene_index: usize, scene: &Scene, cam: &Camera, frame: &Frame, width: u32) {
+        view_features(scene, scene_index, cam, width, &mut self.views);
         self.images.extend_from_slice(&frame.rgb);
+        self.image_offsets.push(self.images.len() as i64);
         self.masks.extend(pack_bits(&frame.mask));
-        if self.frames.len() < 16 {
+        if self.frames.len() < 16 && width == W {
             self.frames.push(frame.rgb.clone());
         }
     }
@@ -145,8 +162,9 @@ impl Batch {
         npy::write(&dir.join("parts.npy"), &[self.parts.len() / PART_FEATURES, PART_FEATURES], &self.parts).unwrap();
         npy::write(&dir.join("part_offsets.npy"), &[self.part_offsets.len()], &self.part_offsets).unwrap();
         npy::write(&dir.join("views.npy"), &[nv, VIEW_FEATURES], &self.views).unwrap();
-        npy::write(&dir.join("images.npy"), &[nv, H as usize, W as usize, 3], &self.images).unwrap();
-        npy::write(&dir.join("masks.npy"), &[nv, H as usize, W as usize / 8], &self.masks).unwrap();
+        npy::write(&dir.join("images.npy"), &[self.images.len()], &self.images).unwrap();
+        npy::write(&dir.join("image_offsets.npy"), &[nv + 1], &self.image_offsets).unwrap();
+        npy::write(&dir.join("masks.npy"), &[self.masks.len()], &self.masks).unwrap();
         contact_sheet(&dir.join("preview.png"), &self.frames);
     }
 }
@@ -165,17 +183,47 @@ fn pick_creature<'a>(scene: &'a Scene, rng: &mut Rng) -> Option<&'a Creature> {
     scene.creatures.get(rng.next() as usize % scene.creatures.len().max(1))
 }
 
-/// Scene `i` of a run and the cameras to draw it from.
-fn scene_and_views(i: usize, seed: u64, views: usize, mode: CameraMode, creature_views: f32) -> (Scene, Vec<Camera>) {
+/// Where a run's scenes come from and how its views are framed.
+struct Sources {
+    mode: CameraMode,
+    /// Share of first-person views that look at a creature.
+    creature_views: f32,
+    /// Editor levels, and the share of scenes walked through them.
+    levels: Arc<Vec<Level>>,
+    level_share: f32,
+    /// Every view this wide, or (None) each its own width at random.
+    width: Option<u32>,
+}
+
+/// A view's screen width: a multiple of 16 from 320 to `DRAW_W`.
+fn pick_width(src: &Sources, rng: &mut Rng) -> u32 {
+    src.width.unwrap_or_else(|| MIN_W + 16 * rng.range(0, ((DRAW_W - MIN_W) / 16 + 1) as i32) as u32)
+}
+
+/// A walker somewhere in editor level `level`'s scene with room to walk.
+fn level_scene(level: &Level, rng: &mut Rng) -> Option<(Scene, engine::world::walker::Walker)> {
+    let scene = level.to_scene();
+    let walker = (0..50).find_map(|_| engine::world::walker::Walker::new(&scene, rng))?;
+    Some((scene, walker))
+}
+
+/// Scene `i` of a run and the cameras (with their widths) to draw it from.
+fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, Vec<(Camera, u32)>) {
     let mut rng = Rng::new(seed.wrapping_mul(1_000_003) ^ i as u64);
-    match mode {
+    let (scene, cams) = match src.mode {
         CameraMode::Free => {
             let scene = Scene::generate(&mut rng);
             let cams = (0..views).map(|_| scene.random_camera(&mut rng)).collect();
             (scene, cams)
         }
         CameraMode::FirstPerson => {
-            let (scene, mut walker) = walkable_scene(&mut rng, 6);
+            let from_level = (!src.levels.is_empty() && rng.chance(src.level_share))
+                .then(|| {
+                    let level = &src.levels[rng.next() as usize % src.levels.len()];
+                    level_scene(level, &mut rng)
+                })
+                .flatten();
+            let (scene, mut walker) = from_level.unwrap_or_else(|| walkable_scene(&mut rng, 6));
             for _ in 0..rng.range(0, 60) {
                 walker.step(&scene, &mut rng);
             }
@@ -186,7 +234,7 @@ fn scene_and_views(i: usize, seed: u64, views: usize, mode: CameraMode, creature
                 }
                 // Creature views come in orbits of 1-3 round the same one, so
                 // the network sees it from several sides.
-                let orbit: Vec<Camera> = if rng.chance(creature_views) {
+                let orbit: Vec<Camera> = if rng.chance(src.creature_views) {
                     let n = rng.range(1, 4).min((views - out.len()) as i32) as usize;
                     pick_creature(&scene, &mut rng)
                         .map(|c| (0..n).filter_map(|_| walker.view_of(&scene, c, &mut rng)).collect())
@@ -202,21 +250,22 @@ fn scene_and_views(i: usize, seed: u64, views: usize, mode: CameraMode, creature
             }
             (scene, out)
         }
-    }
+    };
+    let cams = cams.into_iter().map(|c| (c, pick_width(src, &mut rng))).collect();
+    (scene, cams)
 }
 
 /// Scenes are built on every core, a batch at a time in order, while this
 /// thread draws the last batch's views on the GPU; shards are written behind.
-#[allow(clippy::too_many_arguments)]
-fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, mode: CameraMode, creature_views: f32) {
+fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, src: Sources) {
     let batch_len = rayon::current_num_threads() * 2;
-    let (send, recv) = std::sync::mpsc::sync_channel::<Vec<(usize, Scene, Vec<Camera>)>>(1);
+    let (send, recv) = std::sync::mpsc::sync_channel::<Vec<(usize, Scene, Vec<(Camera, u32)>)>>(1);
     let builder = std::thread::spawn(move || {
         for start in (0..scenes).step_by(batch_len) {
             let built = (start..(start + batch_len).min(scenes))
                 .into_par_iter()
                 .map(|i| {
-                    let (scene, cams) = scene_and_views(i, seed, views, mode, creature_views);
+                    let (scene, cams) = scene_and_views(i, seed, views, &src);
                     (i, scene, cams)
                 })
                 .collect();
@@ -225,7 +274,7 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
             }
         }
     });
-    let mut renderer = Renderer::new();
+    let mut renderer = Renderer::with_width(DRAW_W);
     let mut writers = Vec::new();
     let mut batch = Batch::new();
     let finish = |batch: Batch, s: usize, writers: &mut Vec<std::thread::JoinHandle<()>>| {
@@ -244,8 +293,9 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
             let t = std::time::Instant::now();
             let si = batch.add_scene(&scene);
             renderer.set_scene(&scene);
-            for (cam, frame) in cams.iter().zip(renderer.render_all(&scene, &cams)) {
-                batch.add_view(si, &scene, cam, &frame);
+            let only: Vec<Camera> = cams.iter().map(|c| c.0).collect();
+            for ((cam, width), frame) in cams.iter().zip(renderer.render_all(&scene, &only)) {
+                batch.add_view(si, &scene, cam, &frame.crop(*width), *width);
             }
             drawing += t.elapsed().as_secs_f64();
             drawn += cams.len();
@@ -267,6 +317,19 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
     std::fs::write(out.join("format.json"), FORMAT).unwrap();
 }
 
+/// Every editor level (*.ron) in `dir`, sorted by name.
+fn load_levels(dir: &Path) -> Vec<Level> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "ron"))
+        .collect();
+    files.sort();
+    let levels: Vec<Level> = files.iter().map(|f| Level::load(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()))).collect();
+    eprintln!("{} levels from {}", levels.len(), dir.display());
+    levels
+}
+
 /// One level and a continuous first-person walk through it.
 fn walk(out: &Path, frames: usize, seed: u64) {
     let mut rng = Rng::new(seed);
@@ -280,7 +343,7 @@ fn walk(out: &Path, frames: usize, seed: u64) {
     for f in 0..frames {
         let cam = walker.camera();
         let frame = renderer.render(&scene, &cam);
-        batch.add_view(si, &scene, &cam, &frame);
+        batch.add_view(si, &scene, &cam, &frame, W);
         write_png(&out.join(format!("frames/{f:05}.png")), W, H, &frame.rgb);
         walker.step(&scene, &mut rng);
     }
@@ -383,16 +446,20 @@ fn main() {
                 Some("free") => CameraMode::Free,
                 Some(m) => panic!("--camera must be fp or free, got {m}"),
             };
-            std::fs::create_dir_all(&out).unwrap();
-            gen(
-                &out,
-                num("scenes", 1000) as usize,
-                num("views", 8) as usize,
-                num("shard-scenes", 100) as usize,
-                num("seed", 1),
+            let frac = |k: &str, d: f32| opts.get(k).map_or(d, |v| v.parse().expect("numeric option"));
+            let width = opts.get("width").map(|v| v.parse::<u32>().expect("--width is a number of pixels"));
+            if let Some(w) = width {
+                assert!(w % 16 == 0 && (MIN_W..=DRAW_W).contains(&w), "--width must be a multiple of 16 from {MIN_W} to {DRAW_W}");
+            }
+            let src = Sources {
                 mode,
-                opts.get("creature-views").map_or(0.5, |v| v.parse().expect("numeric option")),
-            );
+                creature_views: frac("creature-views", 0.5),
+                levels: Arc::new(opts.get("levels").map(|d| load_levels(Path::new(d))).unwrap_or_default()),
+                level_share: frac("level-share", 0.3),
+                width,
+            };
+            std::fs::create_dir_all(&out).unwrap();
+            gen(&out, num("scenes", 1000) as usize, num("views", 8) as usize, num("shard-scenes", 100) as usize, num("seed", 1), src);
         }
         "walk" => walk(&out, num("frames", 300) as usize, num("seed", 7)),
         "textures" => {

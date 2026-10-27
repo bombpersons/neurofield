@@ -20,11 +20,18 @@ from pathlib import Path
 import lpips
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from data import Shards, collate
-from model import Renderer, loss_fn
+from data import Shards, WidthBatches, collate
+from model import Renderer, loss_fn, migrate
+
+# Steps of learning-rate warm-up after the optimizer starts afresh.
+WARMUP = 500
+# Longer when a new head starts from scratch on a trained body, so its first,
+# random gradients don't knock the body about.
+WARMUP_NEW_HEAD = 3000
 
 
 class Trainer:
@@ -39,6 +46,16 @@ class Trainer:
         self.train_set = Shards(data, range(n_shards - 1))
         self.val_set = Shards(data, [n_shards - 1])
         self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
+        ckpt = self.out / "ckpt.pt"
+        state = torch.load(ckpt, map_location=self.device) if ckpt.exists() else None
+        migrated = False
+        if state is not None:
+            self.cfg = state.get("cfg", self.cfg)
+            # From before widths varied: start both copies from the averaged weights, migrated.
+            weights, cfg, migrated = migrate(state.get("ema", state["model"]), self.cfg)
+            if migrated:
+                state = {**state, "model": weights, "ema": weights, "opt": None}
+                self.cfg = cfg
         self.model = Renderer(**self.cfg).to(self.device)
         # A perceptual loss on top of L1, against the blur that L1 alone settles for.
         self.lpips_weight = lpips_weight
@@ -50,26 +67,31 @@ class Trainer:
         self.amp = self.device == "cuda"
         self.scaler = torch.amp.GradScaler(enabled=self.amp)
         self.step = 0
+        # Where the learning rate last warmed up from, and for how long.
+        self.warm_from, self.warmup = 0, WARMUP
+        # Each batch is views of one screen width.
         self.loader = DataLoader(
-            self.train_set, batch_size=batch, shuffle=True, collate_fn=collate, num_workers=workers,
-            drop_last=True, persistent_workers=workers > 0,
+            self.train_set, batch_sampler=WidthBatches(self.train_set.widths, batch, seed=int(time.time())),
+            collate_fn=collate, num_workers=workers, persistent_workers=workers > 0,
         )
         self.batches = self._forever()
-        # Fixed views to watch across training.
-        self.watch = collate([self.val_set[i] for i in np.linspace(0, len(self.val_set) - 1, 6).astype(int)])
-        ckpt = self.out / "ckpt.pt"
-        if ckpt.exists():
-            state = torch.load(ckpt, map_location=self.device)
+        # Fixed views to watch across training, one at a time (their widths differ).
+        self.watch = [collate([self.val_set[i]]) for i in np.linspace(0, len(self.val_set) - 1, 6).astype(int)]
+        if state is not None:
             missing = self.model.load_state_dict(state["model"], strict=False).missing_keys
             assert set(missing) <= {"cover"}, missing
-            if len(state["opt"]["param_groups"]) == len(self.opt.param_groups):
+            if state["opt"] is None:  # migrated: the shapes changed, so the optimizer starts over
+                self.warm_from, self.warmup = state["step"], WARMUP_NEW_HEAD
+            elif len(state["opt"]["param_groups"]) == len(self.opt.param_groups):
                 self.opt.load_state_dict(state["opt"])
+                self.warm_from, self.warmup = state.get("warm", (0, WARMUP))
             else:  # from before the coverage bias: restore the rest, start `cover` fresh
                 cover = self.opt.param_groups.pop()
                 self.opt.load_state_dict(state["opt"])
                 self.opt.add_param_group(cover)
             self.step = state["step"]
-            print(f"resumed at step {self.step}" + (f", new {missing}" if missing else ""))
+            print(f"resumed at step {self.step}" + (" (migrated: new head, fresh optimizer)" if migrated else "")
+                  + (f", new {missing}" if missing else ""))
         # A slow average of the weights, used for validation, samples and export: steadier than the
         # weights of any one step.
         self.ema_decay = ema_decay
@@ -85,7 +107,7 @@ class Trainer:
 
     def _lr(self, progress=None):
         """Warm-up from the first step; with `progress` (0..1 through a run), a cosine decay to 5%."""
-        lr = self.lr * min(1.0, (self.step + 1) / 500)
+        lr = self.lr * min(1.0, (self.step - self.warm_from + 1) / self.warmup)
         if progress is not None:
             lr *= 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
         return lr
@@ -93,7 +115,7 @@ class Trainer:
     def forward(self, batch, model=None):
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch[:5])
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            pred = (model or self.model)(feats, tex, pad, cams)
+            pred = (model or self.model)(feats, tex, pad, cams, width=images.shape[-1])
         return pred.float(), images
 
     def losses(self, pred, target):
@@ -142,16 +164,19 @@ class Trainer:
     @torch.no_grad()
     def validate(self, batches=8):
         """Mean (L1, LPIPS) of the averaged weights over the first validation batches."""
-        loader = DataLoader(self.val_set, batch_size=16, shuffle=False, collate_fn=collate)
+        loader = DataLoader(self.val_set, batch_sampler=WidthBatches(self.val_set.widths, 16, seed=0, partial=True), collate_fn=collate)
         ls = [[x.item() for x in self.losses(*self.forward(b, self.ema))[1:]] for b in itertools.islice(loader, batches)]
         return tuple(float(x) for x in np.mean(ls, 0))
 
     @torch.no_grad()
     def sample(self, path):
         """Rows of target | prediction (averaged weights) for the watched validation views."""
-        pred, target = self.forward(self.watch, self.ema)
-        rows = torch.cat([target, pred.clamp(0, 1)], 3)  # side by side
-        grid = torch.cat(list(rows), 1)  # stacked vertically
+        rows = []
+        for batch in self.watch:
+            pred, target = self.forward(batch, self.ema)
+            rows.append(torch.cat([target[0], pred[0].clamp(0, 1)], 2))  # side by side
+        wide = max(r.shape[2] for r in rows)
+        grid = torch.cat([F.pad(r, (0, wide - r.shape[2])) for r in rows], 1)  # stacked vertically
         Image.fromarray((grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)).save(path)
 
     def checkpoint(self):
@@ -161,7 +186,7 @@ class Trainer:
         self.sample(self.out / "sample_latest.png")
         state = {
             "model": self.model.state_dict(), "ema": self.ema.state_dict(), "opt": self.opt.state_dict(),
-            "step": self.step, "cfg": self.cfg,
+            "step": self.step, "cfg": self.cfg, "warm": (self.warm_from, self.warmup),
         }
         torch.save(state, self.out / "ckpt.pt")
 

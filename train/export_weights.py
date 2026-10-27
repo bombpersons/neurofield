@@ -2,9 +2,10 @@
 
     .venv/bin/python train/export_weights.py --ckpt runs/x/ckpt.pt --out runs/x/model.safetensors
 
-Writes the averaged weights when the checkpoint has them, plus the fixed buffers
-the forward pass needs (patch centres, dream noise directions), as float32
-safetensors with the model config in the metadata.
+Writes the averaged weights when the checkpoint has them, plus the fixed buffer
+the forward pass needs (dream noise directions), as float32 safetensors with the
+model config in the metadata. Patch centres depend on the screen's width, so
+the renderer works them out (model.centres).
 """
 
 import argparse
@@ -41,7 +42,7 @@ def main():
     tensors = dict(m.state_dict())
     tensors["noise_dirs"] = m.noise_dirs
     cfg = {"d": m.tex.weight.shape[1], "heads": m.encoder[0].attn.num_heads,
-           "enc_layers": len(m.encoder), "dec_layers": len(m.decoder), "bands": m.bands}
+           "enc_layers": len(m.encoder), "dec_layers": len(m.decoder), "bands": m.bands, "low": m.low}
     save_safetensors(tensors, a.out, {"cfg": json.dumps(cfg), "step": str(state["step"])})
     print(f"wrote {a.out} (step {state['step']}, {len(tensors)} tensors)")
 

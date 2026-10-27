@@ -6,8 +6,8 @@ use crate::neural::features::TRI_FEATURES as RAW;
 
 pub const MAX_TRIS: usize = 512;
 /// Floats per triangle token and in the camera token (data.py TRI_FEATURES, CAM_FEATURES).
-pub const TRI_FEATURES: usize = 45;
-pub const CAM_FEATURES: usize = 7;
+pub const TRI_FEATURES: usize = 46;
+pub const CAM_FEATURES: usize = 11;
 
 pub struct Tokens {
     /// [n, TRI_FEATURES], nearest triangle first.
@@ -17,6 +17,8 @@ pub struct Tokens {
     /// [n] index of each token's triangle in the scene: stable from frame to frame.
     pub ids: Vec<usize>,
     pub cam: [f32; CAM_FEATURES],
+    /// The frame's width in pixels (a multiple of 16; 240 high).
+    pub width: u32,
 }
 
 impl Tokens {
@@ -66,7 +68,9 @@ fn cull(tris: &[f32], v: &[f32]) -> Vec<(f32, [[f32; 3]; 3], [f32; 3], usize)> {
     let h = v[13];
     let fog_far = v[15];
     let near = h / 2.0 / 256.0;
-    let k = 160.0 / h * 1.05;
+    // Half the frame's width and height over the lens, with a margin.
+    let kx = width(v) / 2.0 / h * 1.05;
+    let ky = 120.0 / h * 1.05;
 
     let mut kept = Vec::new();
     for (i, t) in tris.chunks_exact(RAW).enumerate() {
@@ -84,10 +88,10 @@ fn cull(tris: &[f32], v: &[f32]) -> Vec<(f32, [[f32; 3]; 3], [f32; 3], usize)> {
             (q[0] / zc, q[1] / zc, q[2] > 0.0)
         });
         let all = |f: &dyn Fn((f32, f32, bool)) -> bool| s.iter().all(|&e| f(e));
-        if all(&|(x, _, a)| x > k && a)
-            || all(&|(x, _, a)| x < -k && a)
-            || all(&|(_, y, a)| y > 0.75 * k && a)
-            || all(&|(_, y, a)| y < -0.75 * k && a)
+        if all(&|(x, _, a)| x > kx && a)
+            || all(&|(x, _, a)| x < -kx && a)
+            || all(&|(_, y, a)| y > ky && a)
+            || all(&|(_, y, a)| y < -ky && a)
         {
             continue;
         }
@@ -124,8 +128,15 @@ pub fn tokens(tris: &[f32], v: &[f32]) -> Tokens {
         feats.extend(n.map(|c| c / l));
         feats.extend_from_slice(&t[9..15]);
         feats.extend(t[16..34].iter().map(|c| c * 2.0));
+        feats.push(t[34]);
         tex.push(t[15] as i64);
     }
-    let cam = [h / 160.0, v[14] / 8.0, v[15] / 8.0, v[19], v[20], v[21], v[22] / 4.0];
-    Tokens { feats, tex, ids, cam }
+    let w = width(v);
+    let cam = [h / 160.0, v[14] / 8.0, v[15] / 8.0, v[19], v[20], v[21], v[22] / 4.0, v[23], v[24], v[25], w / 320.0];
+    Tokens { feats, tex, ids, cam, width: w as u32 }
+}
+
+/// The view's frame width in pixels (`views.npy` column 26).
+fn width(v: &[f32]) -> f32 {
+    v[26]
 }

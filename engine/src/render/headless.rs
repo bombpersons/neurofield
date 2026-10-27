@@ -23,19 +23,40 @@ const MAX_WAIT: u32 = 600;
 pub struct Renderer {
     app: App,
     parts: Vec<Entity>,
+    width: u32,
 }
 
-/// One rendered view: the 320x240 RGB8 frame as the PS1 screen holds it, and
-/// per pixel whether creatures cover at least half of it (1) or not (0).
+/// One rendered view: the RGB8 frame as the PS1 screen holds it (`Renderer`'s
+/// width by 240), and per pixel whether creatures cover at least half of it (1)
+/// or not (0).
 pub struct Frame {
     pub rgb: Vec<u8>,
     pub mask: Vec<u8>,
 }
 
+impl Frame {
+    /// The middle `width` columns: the same view on a narrower screen (the lens's
+    /// field of view is vertical, so a wider screen only adds to the sides).
+    pub fn crop(&self, width: u32) -> Frame {
+        let full = self.mask.len() / H as usize;
+        let (w, x0) = (width as usize, (full - width as usize) / 2);
+        let rows = |v: &[u8], c: usize| -> Vec<u8> {
+            v.chunks_exact(full * c).flat_map(|row| row[x0 * c..(x0 + w) * c].iter().copied()).collect()
+        };
+        Frame { rgb: rows(&self.rgb, 3), mask: rows(&self.mask, 1) }
+    }
+}
+
 type Slot = Arc<Mutex<Option<Vec<u8>>>>;
 
 impl Renderer {
+    /// A 320x240 screen, as the game's.
     pub fn new() -> Renderer {
+        Self::with_width(W)
+    }
+
+    /// A screen `width` pixels wide (and 240 high): wider ones see more to the sides.
+    pub fn with_width(width: u32) -> Renderer {
         let mut app = App::new();
         app.add_plugins(
             DefaultPlugins
@@ -49,7 +70,7 @@ impl Renderer {
                 // Each update draws its own frame, start to finish.
                 .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
         )
-        .add_plugins(PsxPlugin { screen: PsxScreen { width: W, height: H, ..default() } })
+        .add_plugins(PsxPlugin { screen: PsxScreen { width, height: H, ..default() } })
         .add_plugins(LevelGfxPlugin);
         while app.plugins_state() == PluginsState::Adding {
             bevy::tasks::tick_global_task_pools_on_main_thread();
@@ -64,7 +85,7 @@ impl Renderer {
         for _ in 0..SETTLE_FRAMES {
             app.update();
         }
-        Renderer { app, parts: Vec::new() }
+        Renderer { app, parts: Vec::new(), width }
     }
 
     /// Show `scene` from now on (replacing the last one).
@@ -116,7 +137,10 @@ impl Renderer {
             .map(|(rgb, mask)| {
                 let rgba = rgb.lock().unwrap().take().unwrap();
                 let flesh = mask.lock().unwrap().take().unwrap();
-                Frame { rgb: rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(), mask: creature_mask(&flesh) }
+                // Readback rows are padded to 256 bytes: widths that are multiples of 64 have none.
+                assert_eq!(rgba.len(), self.width as usize * H as usize * 4, "pick a width that is a multiple of 64");
+                let rgb = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+                Frame { rgb, mask: creature_mask(&flesh, self.width as usize) }
             })
             .collect()
     }
@@ -145,8 +169,8 @@ fn read_back(world: &mut World, image: Handle<Image>) -> (Slot, Entity) {
 
 /// The flesh image (half floats, twice the screen's size) to one byte per screen
 /// pixel: 1 where creatures cover at least two of its four samples.
-fn creature_mask(flesh: &[u8]) -> Vec<u8> {
-    let (w, h) = (W as usize, H as usize);
+fn creature_mask(flesh: &[u8], w: usize) -> Vec<u8> {
+    let h = H as usize;
     let alpha = |x: usize, y: usize| {
         let o = (y * 2 * w + x) * 8 + 6;
         half::f16::from_le_bytes([flesh[o], flesh[o + 1]]).to_f32() > 0.5

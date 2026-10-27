@@ -7,7 +7,7 @@
 //! is one submission: upload the tokens, run ~150 small kernels, read back the image. The
 //! kernels take any sizes, so nothing is compiled per triangle count.
 
-use crate::neural::dream::{Dream, DREAM_DIRS, NUM_TEX, PATCHES};
+use crate::neural::dream::{Dream, DREAM_DIRS, NUM_TEX};
 use crate::neural::tokens::{Tokens, CAM_FEATURES, MAX_TRIS, TRI_FEATURES};
 use crate::world::view::{H, W};
 use std::collections::HashMap;
@@ -16,13 +16,20 @@ use std::path::Path;
 type Result<T> = std::result::Result<T, String>;
 
 const PATCH: usize = 16;
-/// Columns of the triangle MLP's input: the features and 12 Fourier features per NDC coordinate.
-const TRI_IN: usize = TRI_FEATURES + 6 * 12;
-/// Channels of the refinement convolutions.
-const REFINE: usize = 32;
+/// Fourier bands per coordinate, the lowest at pi / 2^LOW (model.py `fourier`).
+const BANDS: usize = 8;
+const LOW: i32 = 2;
+/// Columns of the triangle MLP's input: the features and 16 Fourier features per NDC coordinate.
+const TRI_IN: usize = TRI_FEATURES + 6 * 2 * BANDS;
+/// The widest frame (training data's widest, 2.4:1), and its patch grid.
+pub const MAX_W: u32 = 576;
+const GH: usize = H as usize / PATCH;
+const MAX_PATCHES: usize = (MAX_W as usize / PATCH) * GH;
 const NONE: u32 = u32::MAX;
 const GELU: u32 = 1;
 const ACCUMULATE: u32 = 2;
+const SHUFFLE: u32 = 4;
+const INTERLEAVE: u32 = 8;
 /// Bytes per uniform slot (wgpu's minimum dynamic-offset alignment).
 const SLOT: u64 = 256;
 const MAX_OPS: u64 = 1024;
@@ -65,7 +72,7 @@ enum Kernel {
     Prepare,
     AddTexture,
     CoverDistance,
-    PatchesToImage,
+    Transpose,
     Conv3x3,
     Add,
 }
@@ -77,7 +84,7 @@ const KERNELS: [(Kernel, &str); 9] = [
     (Kernel::Prepare, "prepare"),
     (Kernel::AddTexture, "add_texture"),
     (Kernel::CoverDistance, "cover_distance"),
-    (Kernel::PatchesToImage, "patches_to_image"),
+    (Kernel::Transpose, "transpose"),
     (Kernel::Conv3x3, "conv3x3"),
     (Kernel::Add, "add"),
 ];
@@ -134,12 +141,24 @@ struct Scratch {
     qc: u32,
     kv: u32,
     dist: u32,
-    patches: u32,
-    image: u32,
-    r1: u32,
-    r2: u32,
+    /// [patches, d] base queries and [patches, 2] centres for the current grid width.
+    queries: u32,
+    centres: u32,
+    /// The head's projection [patches, channels], then its grids, ping and pong.
+    proj: u32,
+    ga: u32,
+    gb: u32,
     out: u32,
     end: u32,
+}
+
+/// One doubling of the upsampling head: 3x3 conv weights [4 cout][cin][3][3], bias, sizes.
+#[derive(Clone, Copy)]
+struct Up {
+    w: u32,
+    b: u32,
+    cin: usize,
+    cout: usize,
 }
 
 /// Host copy of the weights region of `mem`, built at load.
@@ -284,16 +303,31 @@ pub struct GpuNet {
     decoder: Vec<Block>,
     /// [d, layers * 2d]: every decoder layer's cross-attention keys and values, side by side.
     cross_kv: Linear,
-    /// [patches, d]: q_in(fourier(centres)) + q_pos, precomputed.
-    queries: u32,
-    centres: u32,
+    /// q_in's two layers on the CPU ([inp, out] weights, bias), for each grid width's
+    /// patch queries, and the width they were last made for.
+    q_in: [(usize, usize, Vec<f32>, Vec<f32>); 2],
+    grid_w: usize,
     /// [dec_layers, heads] coverage strengths.
     cover: u32,
     noise_dirs: u32,
     out_norm: Norm,
-    head: Linear,
-    refine: [(u32, u32); 3],
+    /// The upsampling head: projection, doublings, and the conv to RGB.
+    proj: Linear,
+    ups: Vec<Up>,
+    rgb: Up,
     pub adapter: String,
+}
+
+/// Patch centres [gh * gw, 2] in NDC for a grid `gw` patches wide (model.py `centres`).
+fn centres(gw: usize) -> Vec<f32> {
+    let mut c = Vec::with_capacity(gw * GH * 2);
+    for y in 0..GH {
+        for x in 0..gw {
+            c.push(((x as f32 + 0.5) * PATCH as f32 - (gw * PATCH) as f32 / 2.0) / (W as f32 / 2.0));
+            c.push(((y as f32 + 0.5) * PATCH as f32 - H as f32 / 2.0) / (W as f32 / 2.0));
+        }
+    }
+    c
 }
 
 impl GpuNet {
@@ -302,8 +336,14 @@ impl GpuNet {
         let cfg = meta.get("cfg").ok_or("no cfg in the weights' metadata")?;
         let (heads, bands) = (json_number(cfg, "heads")?, json_number(cfg, "bands")?);
         let (enc_layers, dec_layers) = (json_number(cfg, "enc_layers")?, json_number(cfg, "dec_layers")?);
-        if bands != 6 {
-            return Err(format!("gpu_net.wgsl assumes 6 Fourier bands, the model has {bands}"));
+        let low = json_number(cfg, "low").unwrap_or(0);
+        if bands != BANDS || low != LOW as usize {
+            return Err(format!(
+                "gpu_net.wgsl assumes {BANDS} Fourier bands from pi / {}, the model has {bands} from pi / {} \
+                 (re-export it with the current train/export_weights.py)",
+                1 << LOW,
+                1 << low
+            ));
         }
         let mut w = Weights(tensors);
         let mut up = Upload { data: Vec::new() };
@@ -346,33 +386,32 @@ impl GpuNet {
         let cross_kv =
             Linear { w: up.push(&kv_w), b: up.push(&kv_b), inp: d, out: dec_layers * 2 * d, rs: dec_layers * 2 * d };
 
-        // Patch queries: q_in(fourier(centres)) + q_pos, once, on the CPU.
-        let (_, centres) = w.take("centres")?;
-        let mut four = Vec::with_capacity(PATCHES * 24);
-        for c in centres.chunks_exact(2) {
-            for &x in c {
-                let a: Vec<f32> = (0..6).map(|k| x * (2f32.powi(k) * std::f32::consts::PI)).collect();
-                four.extend(a.iter().map(|a| a.sin()));
-                four.extend(a.iter().map(|a| a.cos()));
-            }
-        }
-        let (i0, o0, w0) = w.transposed("q_in.0.weight")?;
-        let b0 = w.take("q_in.0.bias")?.1;
-        let (i2, o2, w2) = w.transposed("q_in.2.weight")?;
-        let b2 = w.take("q_in.2.bias")?.1;
-        let h: Vec<f32> = cpu_linear(&four, &w0, &b0, i0, o0).into_iter().map(gelu_cpu).collect();
-        let pos = w.take("q_pos")?.1;
-        let queries: Vec<f32> = cpu_linear(&h, &w2, &b2, i2, o2).iter().zip(&pos).map(|(a, b)| a + b).collect();
-        let queries = up.push(&queries);
-        let centres = up.push(&centres);
+        // Patch queries come from their centres alone, so they are made on the CPU for
+        // each grid width (`set_grid`).
+        let q_in = [w.transposed("q_in.0.weight")?, w.transposed("q_in.2.weight")?];
+        let q_in = [
+            (q_in[0].0, q_in[0].1, q_in[0].2.clone(), w.take("q_in.0.bias")?.1),
+            (q_in[1].0, q_in[1].1, q_in[1].2.clone(), w.take("q_in.2.bias")?.1),
+        ];
         let cover = up.push(&w.take("cover")?.1);
         let noise_dirs = up.push(&w.take("noise_dirs")?.1);
         let out_norm = w.norm(&mut up, "out_norm")?;
-        let head = w.linear(&mut up, "head")?;
-        let mut conv = |i: usize| -> Result<(u32, u32)> {
-            Ok((up.push(&w.take(&format!("refine.{i}.weight"))?.1), up.push(&w.take(&format!("refine.{i}.bias"))?.1)))
+        let proj = w.linear(&mut up, "head.proj")?;
+        let conv = |w: &mut Weights, up: &mut Upload, name: &str| -> Result<Up> {
+            let (shape, wt) = w.take(&format!("{name}.weight"))?;
+            Ok(Up { w: up.push(&wt), b: up.push(&w.take(&format!("{name}.bias"))?.1), cin: shape[1], cout: shape[0] })
         };
-        let refine = [conv(0)?, conv(2)?, conv(4)?];
+        let mut ups = Vec::new();
+        while w.0.contains_key(&format!("head.ups.{}.weight", ups.len())) {
+            let name = format!("head.ups.{}", ups.len());
+            ups.push(conv(&mut w, &mut up, &name)?);
+            // Noise injection comes with the creatures; until then its strengths must be zero.
+            let (_, scale) = w.take(&format!("head.noise_scale.{}", ups.len() - 1))?;
+            if scale.iter().any(|&v| v != 0.0) {
+                return Err("this model adds noise in its head, which gpu_net doesn't do yet".into());
+            }
+        }
+        let rgb = conv(&mut w, &mut up, "head.rgb")?;
         if !w.0.is_empty() {
             let mut left: Vec<_> = w.0.keys().collect();
             left.sort();
@@ -380,7 +419,9 @@ impl GpuNet {
         }
 
         // Scratch space after the weights, sized for the largest view.
-        let (s_max, p) = (MAX_TRIS + 1, PATCHES);
+        let (s_max, p) = (MAX_TRIS + 1, MAX_PATCHES);
+        // The biggest of the head's grids: each doubling's conv output, as channels x pixels.
+        let grid = ups.iter().enumerate().map(|(i, u)| u.cout * p << (2 * i)).chain([proj.out * p]).max().unwrap_or(0);
         let rows = s_max.max(p);
         let mut at = up.data.len().div_ceil(64) * 64;
         let mut alloc = |n: usize| {
@@ -388,7 +429,7 @@ impl GpuNet {
             at += n.div_ceil(64) * 64;
             o
         };
-        let plane = (W * H) as usize;
+        let plane = (MAX_W * H) as usize;
         let s = Scratch {
             feats: alloc(MAX_TRIS * TRI_FEATURES),
             tex: alloc(MAX_TRIS),
@@ -410,10 +451,11 @@ impl GpuNet {
             qc: alloc(p * d),
             kv: alloc(s_max * dec_layers * 2 * d),
             dist: alloc(p * s_max),
-            patches: alloc(p * 3 * PATCH * PATCH),
-            image: alloc(3 * plane),
-            r1: alloc(REFINE * plane),
-            r2: alloc(REFINE * plane),
+            queries: alloc(p * d),
+            centres: alloc(p * 2),
+            proj: alloc(p * proj.out),
+            ga: alloc(grid),
+            gb: alloc(grid),
             out: alloc(3 * plane),
             end: alloc(0),
         };
@@ -534,19 +576,48 @@ impl GpuNet {
             encoder,
             decoder,
             cross_kv,
-            queries,
-            centres,
+            q_in,
+            grid_w: 0,
             cover,
             noise_dirs,
             out_norm,
-            head,
-            refine,
+            proj,
+            ups,
+            rgb,
             adapter: adapter.get_info().name,
         })
     }
 
-    /// The network's frame for these tokens: [H * W * 3] floats, roughly 0..1, row-major RGB.
+    /// Patch queries and centres for a grid `gw` patches wide: q_in(fourier(centres)).
+    fn set_grid(&mut self, gw: usize) {
+        let c = centres(gw);
+        let mut four = Vec::with_capacity(c.len() * 2 * BANDS);
+        for xy in c.chunks_exact(2) {
+            for &x in xy {
+                let a: Vec<f32> = (0..BANDS as i32).map(|k| x * (2f32.powi(k - LOW) * std::f32::consts::PI)).collect();
+                four.extend(a.iter().map(|a| a.sin()));
+                four.extend(a.iter().map(|a| a.cos()));
+            }
+        }
+        let [(i0, o0, w0, b0), (i2, o2, w2, b2)] = &self.q_in;
+        let h: Vec<f32> = cpu_linear(&four, w0, b0, *i0, *o0).into_iter().map(gelu_cpu).collect();
+        let q = cpu_linear(&h, w2, b2, *i2, *o2);
+        self.queue.write_buffer(&self.mem, self.s.queries as u64 * 4, bytemuck::cast_slice(&q));
+        self.queue.write_buffer(&self.mem, self.s.centres as u64 * 4, bytemuck::cast_slice(&c));
+        self.grid_w = gw;
+    }
+
+    /// The network's frame for these tokens: [240 * t.width * 3] floats, roughly 0..1, row-major RGB.
     pub fn render(&mut self, t: &Tokens, dream: &Dream) -> Result<Vec<f32>> {
+        let width = t.width;
+        if width % PATCH as u32 != 0 || !(PATCH as u32..=MAX_W).contains(&width) {
+            return Err(format!("a frame {width} wide: it must be a multiple of {PATCH} up to {MAX_W}"));
+        }
+        let gw = width as usize / PATCH;
+        if gw != self.grid_w {
+            self.set_grid(gw);
+        }
+        let patches = gw * GH;
         let n = t.len().min(MAX_TRIS);
         let tokens = n + 1; // the camera rides along as token 0
         let s = &self.s;
@@ -557,7 +628,12 @@ impl GpuNet {
         }
         write(s.cams, &t.cam);
         write(s.mix, &dream.tex_mix);
-        write(s.noise, &dream.q_noise);
+        // The dream's pushes are per patch of a 4:3 grid; other widths go without.
+        if dream.q_noise.len() == patches * DREAM_DIRS {
+            write(s.noise, &dream.q_noise);
+        } else {
+            write(s.noise, &vec![0.0; patches * DREAM_DIRS]);
+        }
 
         let mut ops = Ops::default();
         let (d, heads) = (self.d, self.heads);
@@ -593,33 +669,33 @@ impl GpuNet {
         }
 
         // Patch queries: the precomputed base + the dream pushes + the camera token (as a bias).
-        ops.linear(s.noise, PATCHES, Linear { w: self.noise_dirs, b: s.cam, inp: DREAM_DIRS, out: d, rs: d }, s.q, 0);
+        ops.linear(s.noise, patches, Linear { w: self.noise_dirs, b: s.cam, inp: DREAM_DIRS, out: d, rs: d }, s.q, 0);
         ops.push(
             Kernel::Add,
-            Params { m: (PATCHES * d) as u32, a_off: self.queries, c_off: s.q, ..Default::default() },
-            [(PATCHES * d).div_ceil(64) as u32, 1, 1],
+            Params { m: (patches * d) as u32, a_off: s.queries, c_off: s.q, ..Default::default() },
+            [(patches * d).div_ceil(64) as u32, 1, 1],
         );
         ops.linear(s.x, tokens, self.cross_kv, s.kv, 0);
         ops.push(
             Kernel::CoverDistance,
             Params {
-                m: PATCHES as u32,
+                m: patches as u32,
                 k: TRI_FEATURES as u32,
                 n: tokens as u32,
                 a_off: s.feats,
-                b_off: self.centres,
+                b_off: s.centres,
                 c_off: s.dist,
                 f0: 2.0 * PATCH as f32 / W as f32,
                 ..Default::default()
             },
-            [tokens.div_ceil(64) as u32, PATCHES as u32, 1],
+            [tokens.div_ceil(64) as u32, patches as u32, 1],
         );
         let kv_rs = self.cross_kv.out;
         for (l, blk) in self.decoder.iter().enumerate() {
-            ops.block_self(blk, s, s.q, PATCHES, d, heads);
+            ops.block_self(blk, s, s.q, patches, d, heads);
             let (n2, xq, xout) = blk.cross.expect("decoder blocks cross-attend");
-            ops.norm(s.q, PATCHES, d, n2, s.qn);
-            ops.linear(s.qn, PATCHES, xq, s.qc, 0);
+            ops.norm(s.q, patches, d, n2, s.qn);
+            ops.linear(s.qn, patches, xq, s.qc, 0);
             let kv = s.kv + (l * 2 * d) as u32;
             let cover = (self.cover + (l * heads) as u32, s.dist);
             let alpha = 1.0 / ((d / heads) as f32).sqrt() / dream.temp;
@@ -628,57 +704,56 @@ impl GpuNet {
                 (s.qc, d),
                 (kv, kv_rs),
                 (kv + d as u32, kv_rs),
-                PATCHES,
+                patches,
                 tokens,
                 d,
                 heads,
                 alpha,
                 Some(cover),
             );
-            ops.linear(s.attn, PATCHES, xout, s.q, ACCUMULATE);
-            ops.mlp(blk, s, s.q, PATCHES, d);
+            ops.linear(s.attn, patches, xout, s.q, ACCUMULATE);
+            ops.mlp(blk, s, s.q, patches, d);
         }
 
-        // Pixels: the head's 16x16 patches, then the refinement convolutions added on top.
-        ops.norm(s.q, PATCHES, d, self.out_norm, s.qn);
-        ops.linear(s.qn, PATCHES, self.head, s.patches, 0);
-        let (w, h) = (W, H);
+        // Pixels: the head projects the queries to a grid of channels, doubles it four times
+        // (conv, then pixel shuffle) and convolves it to RGB.
+        ops.norm(s.q, patches, d, self.out_norm, s.qn);
+        ops.linear(s.qn, patches, self.proj, s.proj, 0);
+        let c = self.proj.out;
         ops.push(
-            Kernel::PatchesToImage,
-            Params { m: h, n: w, a_off: s.patches, c_off: s.image, ..Default::default() },
-            [w.div_ceil(64), h, 3],
+            Kernel::Transpose,
+            Params { m: patches as u32, n: c as u32, a_off: s.proj, c_off: s.ga, ..Default::default() },
+            [c.div_ceil(64) as u32, patches as u32, 1],
         );
-        let conv = |ops: &mut Ops,
-                    (wt, b): (u32, u32),
-                    from: u32,
-                    cin: usize,
-                    to: u32,
-                    cout: usize,
-                    flags: u32,
-                    last: bool| {
+        let conv = |ops: &mut Ops, u: Up, from: u32, to: u32, (gh, gw): (usize, usize), flags: u32| {
             let p = Params {
-                m: h,
-                k: cin as u32,
-                n: w,
+                m: gh as u32,
+                k: u.cin as u32,
+                n: gw as u32,
                 a_off: from,
-                b_off: wt,
-                bias_off: b,
+                b_off: u.w,
+                bias_off: u.b,
                 c_off: to,
-                x0: cout as u32,
+                x0: u.cout as u32,
                 flags,
-                x1: if last { s.image } else { NONE },
                 ..Default::default()
             };
-            ops.push(Kernel::Conv3x3, p, [w.div_ceil(16), h.div_ceil(16), cout.div_ceil(8) as u32]);
+            ops.push(Kernel::Conv3x3, p, [gw.div_ceil(16) as u32, gh.div_ceil(16) as u32, u.cout.div_ceil(8) as u32]);
         };
-        conv(&mut ops, self.refine[0], s.image, 3, s.r1, REFINE, GELU, false);
-        conv(&mut ops, self.refine[1], s.r1, REFINE, s.r2, REFINE, GELU, false);
-        conv(&mut ops, self.refine[2], s.r2, REFINE, s.out, 3, 0, true);
-        self.run(&ops)
+        let (mut from, mut to, mut size) = (s.ga, s.gb, (GH, gw));
+        for &u in &self.ups {
+            conv(&mut ops, u, from, to, size, SHUFFLE | GELU);
+            (from, to, size) = (to, from, (size.0 * 2, size.1 * 2));
+        }
+        if size != (H as usize, width as usize) {
+            return Err(format!("the head makes {size:?} images, not 240 x {width}"));
+        }
+        conv(&mut ops, self.rgb, from, s.out, size, INTERLEAVE);
+        self.run(&ops, 3 * H as usize * width as usize)
     }
 
-    /// Run the dispatches as one submission and read back the output image.
-    fn run(&mut self, ops: &Ops) -> Result<Vec<f32>> {
+    /// Run the dispatches as one submission and read back the first `floats` of the output.
+    fn run(&mut self, ops: &Ops, floats: usize) -> Result<Vec<f32>> {
         if ops.list.len() as u64 > MAX_OPS {
             return Err(format!("{} dispatches, room for {MAX_OPS}", ops.list.len()));
         }
@@ -699,10 +774,10 @@ impl GpuNet {
                 pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
             }
         }
-        let size = self.readback.size();
+        let size = floats as u64 * 4;
         enc.copy_buffer_to_buffer(&self.mem, self.s.out as u64 * 4, &self.readback, 0, size);
         self.queue.submit([enc.finish()]);
-        let slice = self.readback.slice(..);
+        let slice = self.readback.slice(..size);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| e.to_string())?;
         let out = bytemuck::cast_slice(&slice.get_mapped_range().map_err(|e| e.to_string())?).to_vec();

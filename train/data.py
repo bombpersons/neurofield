@@ -6,6 +6,10 @@ would before rasterising (behind the camera, beyond the fog, outside the
 frustum, back-facing). Occlusion, perspective-correct-ish coverage, texturing,
 fog and torch light are left for the network to learn.
 
+Every view has its own screen width (a multiple of 16, 240 pixels high; 320
+is 4:3): the lens's field of view is vertical, so wider screens see more to the
+sides. Batches hold views of one width (`WidthBatches`).
+
 Creatures arrive as one token per body part (pose, size, shape dials, skin
 motif and density, tint, baked light), never as triangles: the dense meshes
 and skin layouts behind the images are for the network to make up. Shards
@@ -18,12 +22,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-W, H = 320, 240
+W, H = 320, 240  # the 4:3 screen; views can be wider
 MAX_TRIS = 512
 NUM_TEX = 12
 # Per-triangle continuous features (see `tri_tokens`).
-TRI_FEATURES = 9 + 6 + 3 + 3 + 6 + 18
-CAM_FEATURES = 1 + 2 + 3 + 1
+TRI_FEATURES = 9 + 6 + 3 + 3 + 6 + 18 + 1
+CAM_FEATURES = 1 + 2 + 3 + 1 + 3 + 1
 MAX_PARTS = 128
 NUM_SHAPES = 4
 NUM_MOTIFS = 11
@@ -40,6 +44,7 @@ class Shards(Dataset):
             dirs = [dirs[i] for i in shards if i < len(dirs)]
         self.shards = []
         self.index = []
+        self.widths = []
         for d in dirs:
             s = {
                 "tris": np.load(d / "tris.npy", mmap_mode="r"),
@@ -51,7 +56,10 @@ class Shards(Dataset):
                 s["parts"] = np.load(d / "parts.npy")
                 s["part_offsets"] = np.load(d / "part_offsets.npy")
                 s["masks"] = np.load(d / "masks.npy", mmap_mode="r")
+            if (d / "image_offsets.npy").exists():  # frames of their own widths, one after another
+                s["image_offsets"] = np.load(d / "image_offsets.npy")
             self.index += [(len(self.shards), i) for i in range(len(s["views"]))]
+            self.widths += [view_width(v) for v in s["views"]]
             self.shards.append(s)
 
     def __len__(self):
@@ -64,12 +72,20 @@ class Shards(Dataset):
         scene = int(v[0])
         tris = np.asarray(s["tris"][s["offsets"][scene] : s["offsets"][scene + 1]])
         feats, tex = tri_tokens(tris, v)
-        image = torch.from_numpy(np.array(s["images"][vi])).permute(2, 0, 1).float() / 255.0
+        w = view_width(v)
+        if "image_offsets" in s:
+            a, b = s["image_offsets"][vi : vi + 2]
+            pixels = np.array(s["images"][a:b]).reshape(H, w, 3)
+            packed = np.array(s["masks"][a // 24 : b // 24]).reshape(H, w // 8)
+        else:
+            pixels = np.array(s["images"][vi])
+            packed = np.array(s["masks"][vi]) if "masks" in s else None
+        image = torch.from_numpy(pixels).permute(2, 0, 1).float() / 255.0
         if "parts" in s:
             parts = s["parts"][s["part_offsets"][scene] : s["part_offsets"][scene + 1]]
-            mask = np.unpackbits(np.array(s["masks"][vi]), axis=-1)
+            mask = np.unpackbits(packed, axis=-1)
         else:
-            parts, mask = np.zeros((0, 49), np.float32), np.zeros((H, W), np.uint8)
+            parts, mask = np.zeros((0, 49), np.float32), np.zeros((H, w), np.uint8)
         pfeats, pids = part_tokens(parts, v)
         return (
             torch.from_numpy(feats),
@@ -82,10 +98,17 @@ class Shards(Dataset):
         )
 
 
+def view_width(v):
+    """The view's screen width in pixels (views from before widths varied are 4:3)."""
+    return int(v[26]) if len(v) > 26 else W
+
+
 def cam_token(v):
-    """Fog near/far, lens, torch colour and reach: everything per-view but the pose."""
+    """Lens, fog near/far, torch colour and reach, fog colour, and how far the screen
+    reaches to the sides (1 for 4:3): everything per-view but the pose."""
     h = v[13]
-    return np.concatenate([[h / 160.0], v[14:16] / 8.0, v[19:22], [v[22] / 4.0]]).astype(np.float32)
+    fog = v[23:26] if len(v) > 25 else np.zeros(3)
+    return np.concatenate([[h / 160.0], v[14:16] / 8.0, v[19:22], [v[22] / 4.0], fog, [view_width(v) / W]]).astype(np.float32)
 
 
 def tri_tokens(tris, v):
@@ -94,15 +117,16 @@ def tri_tokens(tris, v):
     p = (tris[:, :9].reshape(-1, 3, 3) - pos) @ R.T  # [T, 3 verts, xyz], tiles
     z = p[:, :, 2]
     near = h / 2 / 256
-    k = 160.0 / h * 1.05
+    # Half the screen's width and height over the lens, with a margin.
+    kx, ky = view_width(v) / 2 / h * 1.05, 120.0 / h * 1.05
     zc = np.maximum(z, 1e-3)
     sx, sy = p[:, :, 0] / zc, p[:, :, 1] / zc
     ahead = z > 0
     outside = (
-        ((sx > k) & ahead).all(1)
-        | ((sx < -k) & ahead).all(1)
-        | ((sy > 0.75 * k) & ahead).all(1)
-        | ((sy < -0.75 * k) & ahead).all(1)
+        ((sx > kx) & ahead).all(1)
+        | ((sx < -kx) & ahead).all(1)
+        | ((sy > ky) & ahead).all(1)
+        | ((sy < -ky) & ahead).all(1)
     )
     e1, e2 = p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]
     n = np.cross(e1, e2)
@@ -112,7 +136,8 @@ def tri_tokens(tris, v):
     order = np.argsort(z.min(1))[:MAX_TRIS]
     p, z, n, tris = p[order], z[order], n[order], tris[order]
 
-    # Screen position in NDC (x in -1..1 across the width), clamped for vertices near or behind the eye.
+    # Screen position in NDC (x in -1..1 across a 4:3 width, further on wider screens; y in
+    # -0.75..0.75), clamped for vertices near or behind the eye.
     zc = np.maximum(z, near * 0.5)
     ndc = np.stack([p[:, :, 0] / zc * h / 160.0, p[:, :, 1] / zc * h / 160.0], -1).clip(-4, 4)
     inv_z = (near / zc).clip(0, 2)
@@ -125,6 +150,7 @@ def tri_tokens(tris, v):
             n,
             tris[:, 9:15],
             tris[:, 16:34] * 2.0,  # baked colour and tint, 1.0 = neutral
+            tris[:, 34:35] if tris.shape[1] > 34 else np.zeros((len(tris), 1), np.float32),  # strangeness
         ],
         1,
     ).astype(np.float32)
@@ -146,12 +172,12 @@ def part_tokens(parts, v):
     zc = np.maximum(z, near * 0.5)
     ndc = (corners[..., :2] / zc[..., None] * h / 160.0).clip(-4, 4)
     ahead = z > 0
-    k = 1.05
+    kx, ky = view_width(v) / W * 1.05, 0.75 * 1.05
     outside = (
-        ((ndc[..., 0] > k) & ahead).all(1)
-        | ((ndc[..., 0] < -k) & ahead).all(1)
-        | ((ndc[..., 1] > 0.75 * k) & ahead).all(1)
-        | ((ndc[..., 1] < -0.75 * k) & ahead).all(1)
+        ((ndc[..., 0] > kx) & ahead).all(1)
+        | ((ndc[..., 0] < -kx) & ahead).all(1)
+        | ((ndc[..., 1] > ky) & ahead).all(1)
+        | ((ndc[..., 1] < -ky) & ahead).all(1)
     )
     keep = (z > near).any(1) & (z.min(1) < v[15]) & ~outside
     order = np.argsort(z.min(1)[keep])[:MAX_PARTS]
@@ -180,8 +206,36 @@ def part_tokens(parts, v):
     return feats, ids
 
 
+class WidthBatches(torch.utils.data.Sampler):
+    """Batches of `batch` indices into `widths` that share a width, in random order
+    (each epoch reshuffled); a width's leftover views wait for the next epoch, or
+    with `partial` make a smaller batch."""
+
+    def __init__(self, widths, batch, seed=0, partial=False):
+        self.groups = {}
+        for i, w in enumerate(widths):
+            self.groups.setdefault(w, []).append(i)
+        self.batch, self.partial = batch, partial
+        self.rng = np.random.default_rng(seed)
+
+    def _sizes(self, n):
+        return range(0, n if self.partial else n - self.batch + 1, self.batch)
+
+    def __iter__(self):
+        batches = []
+        for idx in self.groups.values():
+            idx = self.rng.permutation(idx)
+            batches += [idx[i : i + self.batch].tolist() for i in self._sizes(len(idx))]
+        for j in self.rng.permutation(len(batches)):
+            yield batches[j]
+
+    def __len__(self):
+        return sum(len(self._sizes(len(idx))) for idx in self.groups.values())
+
+
 def collate(batch):
     """Pad triangle and part tokens to the longest in the batch; the pads mark padding.
+    The views must share a width.
     Returns (feats, tex, pad, cams, images, (part feats, part ids, part pad, creature masks))."""
     n = max(1, max(item[0].shape[0] for item in batch))
     m = max(1, max(item[4].shape[0] for item in batch))

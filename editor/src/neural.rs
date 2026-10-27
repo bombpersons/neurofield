@@ -156,7 +156,7 @@ impl NeuralView {
             self.tris = Some((built.version, built.cut_at, Arc::new(v)));
         }
         let mut view = Vec::new();
-        features::view_features(&built.scene, 0, &c, &mut view);
+        features::view_features(&built.scene, 0, &c, engine::world::view::W, &mut view);
         let tris = self.tris.as_ref().unwrap().2.clone();
         if self.jobs.as_ref().is_some_and(|j| j.send(Job { key, tris, view }).is_ok()) {
             self.busy = true;

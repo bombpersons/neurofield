@@ -9,8 +9,15 @@
   "enable_tpu": "false",
   "enable_internet": "true",
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["bombpersons/neurofield-ckpt"],
+  "dataset_sources": [
+    "bombpersons/neurofield-ckpt"
+  ],
   "competition_sources": [],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "bombpersons/neurofield-data-0",
+    "bombpersons/neurofield-data-1",
+    "bombpersons/neurofield-data-2",
+    "bombpersons/neurofield-data-3"
+  ],
   "model_sources": []
 }

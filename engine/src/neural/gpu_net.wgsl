@@ -19,6 +19,8 @@ struct Params {
 const NONE: u32 = 0xffffffffu;
 const GELU: u32 = 1u;
 const ACCUMULATE: u32 = 2u;
+const SHUFFLE: u32 = 4u;
+const INTERLEAVE: u32 = 8u;
 const PI: f32 = 3.14159265358979;
 
 // erf by Abramowitz and Stegun 7.1.26 (absolute error under 1.5e-7): WGSL has no erf.
@@ -199,10 +201,10 @@ fn softmax(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l
 
 // ---- Inputs ---------------------------------------------------------------------------------
 
-// The triangle MLP's input: m rows of [features (k = 45), Fourier features of the 6 NDC
-// coordinates (12 each: sin at 6 octaves, then cos)], from features at a_off to c_off (row
-// stride n = k + 72). Angles are reduced in turns first, exactly, since GPU sin and cos lose
-// accuracy far from zero.
+// The triangle MLP's input: m rows of [features (k = 46), Fourier features of the 6 NDC
+// coordinates (16 each: sin at 8 octaves from pi / 4, then cos)], from features at a_off to
+// c_off (row stride n = k + 96). Angles are reduced in turns first, exactly, since GPU sin and
+// cos lose accuracy far from zero.
 @compute @workgroup_size(64)
 fn prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.y;
@@ -213,12 +215,12 @@ fn prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = mem[p.a_off + row * p.k + col];
     } else {
         let c = col - p.k;
-        let x = mem[p.a_off + row * p.k + 9u + c / 12u];
-        let r = c % 12u;
-        // angle = x * 2^band * pi = 2 pi * (x * 2^(band - 1)) turns
-        let turns = fract(x * exp2(f32(r % 6u) - 1.0));
+        let x = mem[p.a_off + row * p.k + 9u + c / 16u];
+        let r = c % 16u;
+        // angle = x * 2^(band - 2) * pi = 2 pi * (x * 2^(band - 3)) turns
+        let turns = fract(x * exp2(f32(r % 8u) - 3.0));
         let a = 2.0 * PI * turns;
-        v = select(cos(a), sin(a), r < 6u);
+        v = select(cos(a), sin(a), r < 8u);
     }
     mem[p.c_off + row * p.n + col] = v;
 }
@@ -257,22 +259,22 @@ fn cover_distance(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ---- Image ----------------------------------------------------------------------------------
 
-// Patches [(gy * gw + gx)][3][16][16] at a_off to an image [3][H = m][W = n] at c_off.
+// Transpose: A [m][n] at a_off to C [n][m] at c_off (patch queries to the head's channel grid).
 @compute @workgroup_size(64)
-fn patches_to_image(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
-    let ch = gid.z;
-    if (x >= p.n || y >= p.m) { return; }
-    let tile = (y / 16u) * (p.n / 16u) + x / 16u;
-    mem[p.c_off + (ch * p.m + y) * p.n + x] = mem[p.a_off + (tile * 3u + ch) * 256u + (y % 16u) * 16u + x % 16u];
+fn transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;
+    let row = gid.y;
+    if (row >= p.m || col >= p.n) { return; }
+    mem[p.c_off + col * p.m + row] = mem[p.a_off + row * p.n + col];
 }
 
 // 3x3 convolution, padding 1: in [k channels][H = m][W = n] at a_off, weights [x0][k][3][3] at
-// b_off, bias at bias_off, out [x0][H][W] at c_off; GELU after with the GELU flag. With x1 != NONE
-// it is the last layer: the output plus the image at x1 is written as interleaved RGB at c_off.
-// Each thread makes 8 output channels (group wg.z) of one pixel from one read of its 3x3
-// neighbourhood, with the group's weights in workgroup memory.
+// b_off, bias at bias_off, out [x0][H][W] at c_off; GELU after with the GELU flag. With SHUFFLE
+// the output is pixel-shuffled: channel 4c + 2i + j of pixel (y, x) goes to channel c of pixel
+// (2y + i, 2x + j) of an image [x0 / 4][2H][2W]. With INTERLEAVE it is written as interleaved
+// RGB [H][W][3]. Each thread makes 8 output channels (group wg.z) of one pixel from one read
+// of its 3x3 neighbourhood, with the group's weights for 32 input channels at a time in
+// workgroup memory.
 
 var<workgroup> cw: array<vec4<f32>, 576>; // [ci < 32][tap 9][2]: 8 output channels' weights
 
@@ -280,42 +282,54 @@ var<workgroup> cw: array<vec4<f32>, 576>; // [ci < 32][tap 9][2]: 8 output chann
 fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let co0 = wg.z * 8u;
     let cout = p.x0;
-    // Load this group's weights: w[co0 + o][ci][tap] -> cw[(ci * 9 + tap) * 2 + o / 4][o % 4].
-    for (var e = li; e < p.k * 9u * 8u; e += 256u) {
-        let o = e % 8u;
-        let ct = e / 8u; // ci * 9 + tap
-        let co = min(co0 + o, cout - 1u);
-        let v = select(0.0, mem[p.b_off + co * p.k * 9u + ct], co0 + o < cout);
-        cw[ct * 2u + o / 4u][o % 4u] = v;
-    }
-    workgroupBarrier();
     let x = gid.x;
     let y = gid.y;
-    if (x >= p.n || y >= p.m) { return; }
+    let live = x < p.n && y < p.m;
     let plane = p.m * p.n;
     var acc0 = vec4<f32>(0.0);
     var acc1 = vec4<f32>(0.0);
-    for (var ci = 0u; ci < p.k; ci++) {
-        let src = p.a_off + ci * plane;
-        for (var tap = 0u; tap < 9u; tap++) {
-            let yy = i32(y) + i32(tap / 3u) - 1;
-            let xx = i32(x) + i32(tap % 3u) - 1;
-            let inside = yy >= 0 && yy < i32(p.m) && xx >= 0 && xx < i32(p.n);
-            let at = u32(clamp(yy, 0, i32(p.m) - 1)) * p.n + u32(clamp(xx, 0, i32(p.n) - 1));
-            let v = select(0.0, mem[src + at], inside);
-            let w = (ci * 9u + tap) * 2u;
-            acc0 += v * cw[w];
-            acc1 += v * cw[w + 1u];
+    for (var c0 = 0u; c0 < p.k; c0 += 32u) {
+        let kc = min(32u, p.k - c0);
+        workgroupBarrier();
+        // This chunk's weights: w[co0 + o][c0 + ci][tap] -> cw[(ci * 9 + tap) * 2 + o / 4][o % 4].
+        for (var e = li; e < kc * 9u * 8u; e += 256u) {
+            let o = e % 8u;
+            let ct = e / 8u; // ci * 9 + tap
+            let co = min(co0 + o, cout - 1u);
+            let v = select(0.0, mem[p.b_off + co * p.k * 9u + c0 * 9u + ct], co0 + o < cout);
+            cw[ct * 2u + o / 4u][o % 4u] = v;
+        }
+        workgroupBarrier();
+        if (live) {
+            for (var ci = 0u; ci < kc; ci++) {
+                let src = p.a_off + (c0 + ci) * plane;
+                for (var tap = 0u; tap < 9u; tap++) {
+                    let yy = i32(y) + i32(tap / 3u) - 1;
+                    let xx = i32(x) + i32(tap % 3u) - 1;
+                    let inside = yy >= 0 && yy < i32(p.m) && xx >= 0 && xx < i32(p.n);
+                    let at = u32(clamp(yy, 0, i32(p.m) - 1)) * p.n + u32(clamp(xx, 0, i32(p.n) - 1));
+                    let v = select(0.0, mem[src + at], inside);
+                    let w = (ci * 9u + tap) * 2u;
+                    acc0 += v * cw[w];
+                    acc1 += v * cw[w + 1u];
+                }
+            }
         }
     }
+    if (!live) { return; }
     let outs = array<vec4<f32>, 2>(acc0, acc1);
     for (var o = 0u; o < 8u; o++) {
         let co = co0 + o;
         if (co >= cout) { break; }
         var s = outs[o / 4u][o % 4u] + mem[p.bias_off + co];
         if ((p.flags & GELU) != 0u) { s = gelu(s); }
-        if (p.x1 != NONE) {
-            mem[p.c_off + (y * p.n + x) * 3u + co] = s + mem[p.x1 + co * plane + y * p.n + x];
+        if ((p.flags & INTERLEAVE) != 0u) {
+            mem[p.c_off + (y * p.n + x) * 3u + co] = s;
+        } else if ((p.flags & SHUFFLE) != 0u) {
+            let c = co / 4u;
+            let yy = 2u * y + (co % 4u) / 2u;
+            let xx = 2u * x + co % 2u;
+            mem[p.c_off + (c * 2u * p.m + yy) * 2u * p.n + xx] = s;
         } else {
             mem[p.c_off + co * plane + y * p.n + x] = s;
         }

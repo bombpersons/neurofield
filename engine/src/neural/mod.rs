@@ -46,7 +46,7 @@ impl Network {
         &self.net.adapter
     }
 
-    /// The 320x240 frame, RGB floats (roughly 0..1), row by row.
+    /// The frame (240 high, as wide as the tokens say), RGB floats (roughly 0..1), row by row.
     pub fn render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Vec<f32> {
         self.net.render(t, dream).expect("inference")
     }
@@ -113,10 +113,16 @@ impl Level {
         features::thing_tri_features(&self.scene, &mut self.tris);
     }
 
-    /// The network's inputs for the walker's current view.
+    /// The network's inputs for the walker's current view, on a 4:3 screen.
     pub fn tokens(&self) -> tokens::Tokens {
+        self.tokens_at(crate::world::view::W)
+    }
+
+    /// The network's inputs for the walker's current view on a screen `width` pixels
+    /// wide (a multiple of 16, up to `gpu_net::MAX_W`).
+    pub fn tokens_at(&self, width: u32) -> tokens::Tokens {
         let mut v = Vec::new();
-        view_features(&self.scene, 0, &self.walker.camera(), &mut v);
+        view_features(&self.scene, 0, &self.walker.camera(), width, &mut v);
         tokens::tokens(&self.tris, &v)
     }
 }

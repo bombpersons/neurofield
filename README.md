@@ -55,7 +55,7 @@ cargo build --release -p training-data-gen
 ```
 
 ```bash
-target/release/datagen gen --out data/train --scenes 5000 --views 8 --shard-scenes 250
+target/release/datagen gen --out data/train --scenes 5000 --views 8 --shard-scenes 250 --levels levels/random
 ```
 
 ```bash
@@ -69,14 +69,23 @@ target/release/datagen textures --out data/textures.png
 `gen` samples views from first-person walks by default (`--camera fp`): fixed
 eye height and lens, no roll, gaze mostly level, turning to face the way it
 walks and sometimes stopping to look around. `--camera free` gives random
-cameras with varied height, tilt, roll and lens instead. `walk` writes one
-continuous walk, as PNG frames plus the same arrays.
+cameras with varied height, tilt, roll and lens instead. `--levels DIR` makes a
+share of the scenes (`--level-share`, default 0.3) walks through the editor levels
+in DIR, from random places; `levels/random` holds 200 made by
+`editor/scripts/random_levels.py`. Each view gets its own screen width, a multiple
+of 16 from 320 (4:3) to 576 (2.4:1), 240 high (`--width W` fixes it): views are
+drawn 576 wide and cropped, since the field of view is vertical. `walk` writes one
+continuous 4:3 walk, as PNG frames plus the same arrays.
 
 Twelve fixed 64x64 textures (eight for the level, three for creatures, one for
-doors). Each shard holds `tris.npy`, `tri_offsets.npy`, `views.npy`, `images.npy` and a
-`preview.png` contact sheet; `format.json` documents the layouts and the
-shading. Scenes average about 650 triangles. One frame is 230 KB uncompressed,
-so 1000 scenes × 8 views ≈ 1.9 GB, generated in about 13 s on 12 cores.
+doors). Each shard holds `tris.npy`, `tri_offsets.npy`, `parts.npy`,
+`part_offsets.npy`, `views.npy`, `images.npy` with `image_offsets.npy` (frames of
+their own widths, one after another), `masks.npy` and a `preview.png` contact
+sheet; `format.json` documents the layouts and the shading. A frame averages
+about 320 KB uncompressed, so 1000 scenes × 8 views ≈ 2.6 GB. Drawing takes about
+120 ms a view on Mesa's software Vulkan (lavapipe) on 12 cores. Kaggle's GPUs
+expose no Vulkan, so `train/kaggle/data/push_data.py` draws a run's data on
+Kaggle CPU kernels, which the training kernel (`train/kaggle`) mounts.
 
 Rendering rules worth knowing when reading the data:
 - Triangles are clipped at 0.02 tiles from the eye and depth-buffered; level
@@ -113,6 +122,11 @@ By hand: export a checkpoint's weights (`train/export_weights.py`), and point th
 ```bash
 cargo run --release -p game -- --model runs/colab2/model.safetensors --seed 7
 ```
+
+The network draws a frame of any width that is a multiple of 16, up to 576, from
+the same tokens: patch queries come from the Fourier features of their screen
+positions alone. Its head lays them out as a grid and doubles it four times
+(3x3 convolution, then pixel shuffle) to full resolution.
 
 The network runs as hand-written WGSL compute shaders
 (`engine/src/neural/gpu_net.wgsl`) through [wgpu](https://wgpu.rs): Vulkan, Metal or

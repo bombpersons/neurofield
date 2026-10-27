@@ -15,11 +15,12 @@ pub fn run(opts: &HashMap<String, String>, frames: usize, out: &Path) {
     let model = engine::neural::model_path(opts, &config);
     let seed: u64 = opts.get("seed").map_or(7, |s| s.parse().expect("--seed is a number"));
     let effect = opts.get("effect").map_or(0, |e| e.parse().expect("--effect is a number"));
+    let width = opts.get("width").map_or(W, |w| w.parse().expect("--width is a number of pixels"));
     let mut net = Network::load(&model);
-    check(&mut net, seed, frames, out, effect);
+    check(&mut net, seed, frames, out, effect, width);
 }
 
-fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize) {
+fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize, width: u32) {
     std::fs::create_dir_all(out).unwrap();
     let mut rng = Rng::new(seed);
     let mut level = Level::new(&mut rng);
@@ -27,7 +28,7 @@ fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize)
     let mut counts = Vec::new();
     let mut times = Vec::new();
     for f in 0..frames {
-        let mut t = level.tokens();
+        let mut t = level.tokens_at(width);
         let dream = effects::apply(effect, f as f32 / TICK as f32, &mut t, &level.tris);
         npy::write(&out.join(format!("feats_{f:05}.npy")), &[t.len(), tokens::TRI_FEATURES], &t.feats).unwrap();
         npy::write(&out.join(format!("tex_{f:05}.npy")), &[t.len()], &t.tex).unwrap();
@@ -38,7 +39,7 @@ fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize)
         counts.push(t.len() as i64);
         level.walker.step(&level.scene, &mut rng);
     }
-    npy::write(&out.join("images.npy"), &[frames, H as usize, W as usize, 3], &images).unwrap();
+    npy::write(&out.join("images.npy"), &[frames, H as usize, width as usize, 3], &images).unwrap();
     npy::write(&out.join("counts.npy"), &[frames], &counts).unwrap();
     println!("wrote {frames} frames to {}", out.display());
     let (first, rest) = times.split_at_mut(frames.min(1));
