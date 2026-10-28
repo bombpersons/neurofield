@@ -272,3 +272,22 @@ def load(path, device="cpu"):
 
 def loss_fn(pred, target):
     return F.l1_loss(pred, target)
+
+
+class PatchDisc(nn.Module):
+    """A patch discriminator for training only: an image [b, 3, H, W] to a realness score
+    for each 8x8 cell [b, 1, H/8, W/8], each seeing about 46 pixels across. Spectral norm
+    keeps it from overpowering the renderer."""
+
+    def __init__(self, c=64):
+        super().__init__()
+        sn = nn.utils.parametrizations.spectral_norm
+        chans = (3, c, 2 * c, 4 * c)
+        self.downs = nn.ModuleList([sn(nn.Conv2d(a, b, 4, 2, 1)) for a, b in zip(chans, chans[1:])])
+        self.out = sn(nn.Conv2d(chans[-1], 1, 3, 1, 1))
+
+    def forward(self, x):
+        x = x * 2 - 1
+        for down in self.downs:
+            x = F.leaky_relu(down(x), 0.2)
+        return self.out(x)

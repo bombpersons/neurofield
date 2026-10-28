@@ -130,7 +130,10 @@ positions alone. Its head lays them out as a grid and doubles it four times
 
 Creatures reach the network as one token per body part (pose, size, shape, skin
 motif and density, tint, baked light), never as triangles, so it has to invent
-their skins. The WGSL port doesn't pass part tokens yet: it draws the level
+their skins. On creature pixels, training adds a patch discriminator and a match of
+feature statistics (Gram matrices) to L1 and LPIPS, against a blur of every skin it
+might give them, and the head adds learned per-pixel noise so it can pick one. The
+WGSL port doesn't pass part tokens or the head's noise yet: it draws the level
 alone, as the network does for views with no creature in sight.
 
 The network runs as hand-written WGSL compute shaders
