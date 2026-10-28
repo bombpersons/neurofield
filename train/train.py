@@ -74,6 +74,10 @@ class Trainer:
         # patch discriminator, and matching the statistics (Gram matrices) of LPIPS's features,
         # ask for one sharp skin instead; the head's noise gives it the randomness to pick one.
         self.adv_weight, self.gram_weight = adv_weight, gram_weight
+        # They train only the head and the part tokens' encoders: let them reach the shared
+        # encoder and decoder and the level blurs (run 5).
+        creature_params = ("head.", "part_in.", "shape.", "motif.")
+        self.creature_params = [p for n, p in self.model.named_parameters() if n.startswith(creature_params)]
         self.disc = PatchDisc().to(self.device)
         self.disc_opt = torch.optim.Adam(self.disc.parameters(), lr=1e-4, betas=(0.0, 0.99))
         self.disc_scaler = torch.amp.GradScaler(enabled=self.device == "cuda")
@@ -211,9 +215,15 @@ class Trainer:
             loss, l1, perceptual = self.losses(pred, target)
             ramp = min(1.0, (self.step - self.creature_from + 1) / CREATURE_RAMP)
             adv, gram = self.creature_losses(pred, target, mask)
-            loss = loss + ramp * (self.adv_weight * adv + self.gram_weight * gram)
+            creature = ramp * (self.adv_weight * adv + self.gram_weight * gram)
             self.opt.zero_grad(set_to_none=True)
+            if creature.requires_grad:
+                grads = torch.autograd.grad(self.scaler.scale(creature), self.creature_params, retain_graph=True, allow_unused=True)
             self.scaler.scale(loss).backward()
+            if creature.requires_grad:
+                for p, g in zip(self.creature_params, grads):
+                    if g is not None:
+                        p.grad = g if p.grad is None else p.grad + g
             self.scaler.unscale_(self.opt)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.opt)

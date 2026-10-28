@@ -27,7 +27,7 @@ import sys
 import time
 
 START = time.time()
-HOURS = 10  # of Kaggle's 12 (11.25 max, leaving room for the last checkpoint); also keep under the weekly quota left
+HOURS = 9.5  # of Kaggle's 12 (11.25 max, leaving room for the last checkpoint); also keep under the weekly quota left
 SCENES, VIEWS, SHARD, LEVEL_SHARE = 4000, 8, 250, 0.3
 SEED = int(START)  # fresh levels every run, so no scene is seen in more than one
 REPO, DATA, OUT = "/tmp/neurofield", "/tmp/data/train", "/kaggle/working/out"
