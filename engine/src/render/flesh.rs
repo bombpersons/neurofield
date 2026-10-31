@@ -179,6 +179,13 @@ impl Material2d for OverlayMaterial {
     }
 }
 
+/// Keep the creatures apart from the screen (for the training data): no
+/// overlay, so the screen holds the level alone, and no level depth in the flesh
+/// camera, so the flesh image holds every creature whole. Set before spawning a
+/// scene.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+pub struct FleshLayers(pub bool);
+
 #[derive(Component)]
 struct FleshCamera;
 
@@ -268,7 +275,8 @@ pub(crate) fn plugin(app: &mut App) {
         Material2dPlugin::<OverlayMaterial>::default(),
     ))
     .add_systems(Startup, setup)
-    .add_systems(Update, display_after_overlay)
+    .init_resource::<FleshLayers>()
+    .add_systems(Update, (display_after_overlay, overlay_on))
     .add_systems(
         PostUpdate,
         (follow_screen, follow_camera.after(crate::render::apply_view)).before(bevy::camera::CameraUpdateSystems),
@@ -331,6 +339,14 @@ fn display_after_overlay(mut cams: Query<(&mut Camera, &RenderLayers), With<Came
     for (mut cam, layers) in &mut cams {
         if layers.intersects(&RenderLayers::layer(DISPLAY_LAYER)) && cam.order <= OVERLAY_ORDER {
             cam.order = OVERLAY_ORDER + 1;
+        }
+    }
+}
+
+fn overlay_on(layers: Res<FleshLayers>, mut cams: Query<&mut Camera, With<OverlayCamera>>) {
+    for mut cam in &mut cams {
+        if cam.is_active == layers.0 {
+            cam.is_active = !layers.0;
         }
     }
 }

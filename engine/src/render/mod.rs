@@ -25,7 +25,7 @@ use crate::world::tex;
 use psx_bevy::psx::{PsxMaterial, PsxView};
 use std::collections::HashMap;
 
-pub use flesh::FleshTarget;
+pub use flesh::{FleshLayers, FleshTarget};
 
 pub const TF: f32 = T as f32;
 /// Level triangles are split until no edge is longer than this (world units):
@@ -241,6 +241,7 @@ pub struct Gfx<'w> {
     textures: ResMut<'w, LevelTextures>,
     torch: Res<'w, Torch>,
     view: Res<'w, View>,
+    layers: Res<'w, FleshLayers>,
 }
 
 impl Gfx<'_> {
@@ -256,8 +257,10 @@ impl Gfx<'_> {
 /// the moving things (`spawn_thing`), and full-colour creatures for the flesh
 /// pass. Returns the entities, to despawn when the scene goes.
 pub fn spawn(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene) -> Vec<Entity> {
-    let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view } = gfx;
+    let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view, layers } = gfx;
     let (mut out, level) = spawn_psx(commands, meshes, images, materials, textures, scene, torch);
+    // Kept apart, the creatures are drawn whole: nothing of the level hides them.
+    let level = if layers.0 { Vec::new() } else { level };
     let occluder = occluders.add(flesh::OccluderMaterial::default());
     out.extend(flesh::spawn(commands, meshes, images, flesh, occluder, &level, scene, view));
     for i in 0..scene.things.parts.len() {
@@ -274,7 +277,7 @@ pub struct ThingPart(pub usize);
 /// also hiding creatures behind it in the flesh pass. All are tagged
 /// `ThingPart(i)`, so they can be despawned and spawned again when it moves.
 pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usize) -> Vec<Entity> {
-    let Gfx { meshes, images, materials, textures, torch, occluders, .. } = gfx;
+    let Gfx { meshes, images, materials, textures, torch, occluders, layers, .. } = gfx;
     let mut groups: HashMap<u8, Vec<&Tri>> = HashMap::new();
     for t in &scene.things.parts[i].tris {
         let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
@@ -286,6 +289,9 @@ pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usi
         let (e, mesh) = spawn_part(commands, meshes, &tris, m, torch);
         commands.entity(e).insert(ThingPart(i));
         out.push(e);
+        if layers.0 {
+            continue;
+        }
         let occluder = occluders.add(flesh::OccluderMaterial::default());
         let layer = bevy::camera::visibility::RenderLayers::layer(flesh::FLESH_LAYER);
         out.push(commands.spawn((Mesh3d(mesh), MeshMaterial3d(occluder), layer, ThingPart(i))).id());

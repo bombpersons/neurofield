@@ -28,6 +28,9 @@
 //!     against `train/data.py` and PyTorch. The model and textures are
 //!     `neurofield.ron`'s unless given.
 //!
+//! `gen` keeps the creatures apart from the frame (see `format.json`); the rest
+//! draw them over it, as the game does.
+//!
 //! Frames are drawn by the game's renderer (`engine::render` on psx-bevy) without a
 //! window, so they need a GPU adapter: Vulkan, or Mesa's software one (lavapipe)
 //! on machines without. Scenes are built on every core meanwhile.
@@ -72,9 +75,11 @@ const FORMAT: &str = r#"{
   "parts.npy": "float32 [P, 49] per creature part, world space: joint xyz (0-2); centre xyz (3-5); local axes as the columns of a row-major 3x3 (6-14; y runs from the joint end to the far end); radius x, half-length y, radius z (15-17); bounding box in the local frame, lo xyz then hi xyz (18-23); shape 0 ellipsoid, 1 capsule, 2 cone, 3 tentacle (24); taper, bend, bulge, lumps (25-28); skin motif 0-10 (29; flesh, eyes, teeth, mouths, suckers, veins, scales, chitin, hair, wrinkles, bone); skin density 0..1 (30); tiles per skin repeat (31); tint rgb, 1 = neutral (32-34); baked light at the centre as linear spherical harmonics, 1 = neutral: mean rgb (35-37), then the gradient along world x, y, z, rgb each (38-46); parent part index within the scene, -1 for a root (47); creature index within the scene (48)",
   "part_offsets.npy": "int64 [S + 1]: scene s owns parts[part_offsets[s] : part_offsets[s + 1]]",
   "views.npy": "float32 [V, 27] per view: scene index within the shard (0); camera position xyz (1-3); world-to-view rotation, row-major (4-12; row 2 is the view direction); projection distance H in pixels, screen centre (width / 2, 120) (13); fog near, fog far (14-15); yaw, pitch, roll in turns (16-18); torch rgb strength, 0 = no torch (19-21); torch reach (22); fog colour rgb 0..1, black when grounded (23-25); screen width in pixels, a multiple of 16, 240 high (26)",
-  "images.npy": "uint8 [sum of 240 * width * 3]: the views' frames one after another, each [240, width, 3]; view v starts at image_offsets[v]",
+  "images.npy": "uint8 [sum of 240 * width * 3]: the views' frames one after another, each [240, width, 3], without creatures (gen) or with them drawn over (walk); view v starts at image_offsets[v]",
   "image_offsets.npy": "int64 [V + 1]: byte offsets of each view's frame in images.npy",
-  "masks.npy": "uint8 [sum of 240 * width / 8]: creature pixels per view, [240, width / 8], 1 bit per pixel, most significant bit leftmost (np.unpackbits(mask, axis=-1)); view v starts at image_offsets[v] / 24",
+  "creature_boxes.npy": "int32 [V, 4] per view: x0, y0, x1, y1, the pixels creatures touch (x0 <= x < x1, y0 <= y < y1); empty (x0 = x1) when none do",
+  "creatures.npy": "uint8 [sum of box area * 4]: per view its box's pixels, rows top to bottom, as rgba: the colour of the creature samples in the pixel (2x2 per pixel), averaged, and alpha = samples covered / 4 (0, 64, 128, 191 or 255); rgb is 0 where alpha is. In gen every creature is whole, however much of the level stands in front of it; in walk the level hides them as on screen. The game lays them over the frame as mix(frame, rgb, alpha) in linear light (the screen is sRGB); view v starts at creature_offsets[v]",
+  "creature_offsets.npy": "int64 [V + 1]: byte offsets of each view's box in creatures.npy",
   "projection": "view = R (p - pos); screen = (width / 2 + H * view.x / view.z, 120 + H * view.y / view.z); triangles are clipped at view.z = 0.02 tiles",
   "shading": "level, per vertex: colour = baked + tint * torch * max(0, 1 - d / reach)^2 * max(0, n . l), d and l toward the camera; per pixel: texel * colour / 128 (affine), toward the fog colour by clamp((distance - fog near) / (fog far - fog near), 0, 1), dithered to 15 bits. Creatures are drawn over that in full colour, anti-aliased (see engine/src/render/flesh.wesl)"
 }
@@ -110,14 +115,28 @@ struct Batch {
     views: Vec<f32>,
     images: Vec<u8>,
     image_offsets: Vec<i64>,
-    masks: Vec<u8>,
+    boxes: Vec<i32>,
+    creatures: Vec<u8>,
+    creature_offsets: Vec<i64>,
     /// The first 4:3 frames, for the preview sheet.
     frames: Vec<Vec<u8>>,
 }
 
-/// Packs a 0/1 mask eight pixels to a byte, leftmost in the high bit.
-fn pack_bits(mask: &[u8]) -> impl Iterator<Item = u8> + '_ {
-    mask.chunks(8).map(|c| c.iter().fold(0u8, |acc, &b| acc << 1 | b))
+/// The box round the pixels of a `width`-wide RGBA layer with any alpha, as
+/// x0, y0, x1, y1 (all 0 when none have).
+fn alpha_box(rgba: &[u8], width: usize) -> [i32; 4] {
+    let (mut lo, mut hi) = ([usize::MAX; 2], [0usize; 2]);
+    for (i, p) in rgba.chunks_exact(4).enumerate() {
+        if p[3] > 0 {
+            let (x, y) = (i % width, i / width);
+            lo = [lo[0].min(x), lo[1].min(y)];
+            hi = [hi[0].max(x + 1), hi[1].max(y + 1)];
+        }
+    }
+    if lo[0] == usize::MAX {
+        return [0; 4];
+    }
+    [lo[0], lo[1], hi[0], hi[1]].map(|c| c as i32)
 }
 
 impl Batch {
@@ -130,7 +149,9 @@ impl Batch {
             views: Vec::new(),
             images: Vec::new(),
             image_offsets: vec![0],
-            masks: Vec::new(),
+            boxes: Vec::new(),
+            creatures: Vec::new(),
+            creature_offsets: vec![0],
             frames: Vec::new(),
         }
     }
@@ -143,12 +164,19 @@ impl Batch {
         self.offsets.len() - 2
     }
 
-    /// Keep `cam`'s view of `scene`, as drawn `width` pixels wide, and its creature mask.
+    /// Keep `cam`'s view of `scene`, as drawn `width` pixels wide, and its creatures' box.
     fn add_view(&mut self, scene_index: usize, scene: &Scene, cam: &Camera, frame: &Frame, width: u32) {
         view_features(scene, scene_index, cam, width, &mut self.views);
         self.images.extend_from_slice(&frame.rgb);
         self.image_offsets.push(self.images.len() as i64);
-        self.masks.extend(pack_bits(&frame.mask));
+        let b = alpha_box(&frame.creatures, width as usize);
+        let (x0, x1) = (b[0] as usize * 4, b[2] as usize * 4);
+        for y in b[1] as usize..b[3] as usize {
+            let row = y * width as usize * 4;
+            self.creatures.extend_from_slice(&frame.creatures[row + x0..row + x1]);
+        }
+        self.boxes.extend(b);
+        self.creature_offsets.push(self.creatures.len() as i64);
         if self.frames.len() < 16 && width == W {
             self.frames.push(frame.rgb.clone());
         }
@@ -164,7 +192,9 @@ impl Batch {
         npy::write(&dir.join("views.npy"), &[nv, VIEW_FEATURES], &self.views).unwrap();
         npy::write(&dir.join("images.npy"), &[self.images.len()], &self.images).unwrap();
         npy::write(&dir.join("image_offsets.npy"), &[nv + 1], &self.image_offsets).unwrap();
-        npy::write(&dir.join("masks.npy"), &[self.masks.len()], &self.masks).unwrap();
+        npy::write(&dir.join("creature_boxes.npy"), &[nv, 4], &self.boxes).unwrap();
+        npy::write(&dir.join("creatures.npy"), &[self.creatures.len()], &self.creatures).unwrap();
+        npy::write(&dir.join("creature_offsets.npy"), &[nv + 1], &self.creature_offsets).unwrap();
         contact_sheet(&dir.join("preview.png"), &self.frames);
     }
 }
@@ -274,7 +304,7 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
             }
         }
     });
-    let mut renderer = Renderer::with_width(DRAW_W);
+    let mut renderer = Renderer::layers(DRAW_W);
     let mut writers = Vec::new();
     let mut batch = Batch::new();
     let finish = |batch: Batch, s: usize, writers: &mut Vec<std::thread::JoinHandle<()>>| {
@@ -365,7 +395,8 @@ fn creatures(out: &Path, seed: u64, zoom: f32) {
         };
         cam.h = (cam.h as f32 * zoom) as u16;
         renderer.set_scene(&scene);
-        let Frame { rgb: frame, mask } = renderer.render(&scene, &cam);
+        let drawn = renderer.render(&scene, &cam);
+        let (frame, mask) = (drawn.rgb.clone(), drawn.mask());
         let tinted = frame.chunks(3).zip(&mask).flat_map(|(p, &m)| if m == 1 { [p[0] / 2 + 128, p[1] / 2, p[2] / 2] } else { [p[0] / 3, p[1] / 3, p[2] / 3] }).collect();
         eprintln!("{} creature tris, {} skins", scene.flesh.tris.len(), scene.flesh.skins.len());
         frames.push(frame);

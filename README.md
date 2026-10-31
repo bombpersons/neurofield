@@ -31,8 +31,8 @@ One Cargo workspace:
 
 The `datagen` command draws the engine's worlds with the game's own renderer,
 without a window: affine textures, Gouraud vertex colours, vertex snapping,
-dithering to 15-bit colour and fog, with creatures over the PS1 frame in full
-colour. It needs a GPU adapter: Vulkan, or Mesa's software one (lavapipe,
+dithering to 15-bit colour and fog, with the creatures in full colour kept
+apart from the PS1 frame. It needs a GPU adapter: Vulkan, or Mesa's software one (lavapipe,
 `mesa-vulkan-drivers`) where there is none. Scenes are built on every core while
 the GPU draws.
 
@@ -80,9 +80,11 @@ continuous 4:3 walk, as PNG frames plus the same arrays.
 Twelve fixed 64x64 textures (eight for the level, three for creatures, one for
 doors). Each shard holds `tris.npy`, `tri_offsets.npy`, `parts.npy`,
 `part_offsets.npy`, `views.npy`, `images.npy` with `image_offsets.npy` (frames of
-their own widths, one after another), `masks.npy` and a `preview.png` contact
-sheet; `format.json` documents the layouts and the shading. A frame averages
-about 320 KB uncompressed, so 1000 scenes × 8 views ≈ 2.6 GB. Drawing takes about
+their own widths, one after another, without creatures), `creatures.npy` with
+`creature_boxes.npy` and `creature_offsets.npy` (each view's creatures as an RGBA
+box) and a `preview.png` contact sheet; `format.json` documents the layouts and
+the shading. A frame averages about 350 KB uncompressed with its creatures, so
+1000 scenes × 8 views ≈ 2.8 GB. Drawing takes about
 120 ms a view on Mesa's software Vulkan (lavapipe) on 12 cores. Kaggle's GPUs
 expose no Vulkan, so `train/kaggle/data/push_data.py` draws a run's data on
 Kaggle CPU kernels, which the training kernel (`train/kaggle`) mounts. They draw with the photo textures (`data/strange`, `data/skins_gen`) from the private dataset `bombpersons/neurofield-textures`, a tar of those two folders.
@@ -93,8 +95,11 @@ Rendering rules worth knowing when reading the data:
 - Vertex colour 128/255 is neutral texture modulation; lighting is baked into
   the colours, the torch is added per vertex, and fog is applied per pixel by
   distance from the camera.
-- Creatures are drawn over the PS1 frame in full colour at twice the resolution
-  and averaged down; `masks.npy` marks pixels at least half covered.
+- Creatures are drawn in full colour at twice the resolution and averaged down,
+  into a layer of their own: whole, with nothing of the level in front of them,
+  so the network that draws them can be trained apart from the level's. The
+  game lays them over the frame by alpha, hidden where the level is nearer.
+  `walk` still draws them over its frames, as the game does.
 
 ## The neural renderer (`engine::neural`)
 

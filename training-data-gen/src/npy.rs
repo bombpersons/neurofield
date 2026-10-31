@@ -22,6 +22,13 @@ impl Elem for i64 {
     }
 }
 
+impl Elem for i32 {
+    const DESCR: &'static str = "<i4";
+    fn put(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
 impl Elem for u8 {
     const DESCR: &'static str = "|u1";
     fn put(self, out: &mut Vec<u8>) {

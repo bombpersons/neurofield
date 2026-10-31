@@ -1,8 +1,8 @@
 //! The game's renderer without a window, for the training data: the same
 //! psx-bevy screen, level meshes, flesh pass and `View`, with each finished
-//! frame and its creature mask read back from the GPU.
+//! frame and its creatures read back from the GPU.
 
-use crate::render::{flesh, FleshTarget, Gfx, LevelGfxPlugin, View};
+use crate::render::{flesh, FleshLayers, FleshTarget, Gfx, LevelGfxPlugin, View};
 use bevy::app::PluginsState;
 use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
@@ -27,23 +27,31 @@ pub struct Renderer {
 }
 
 /// One rendered view: the RGB8 frame as the PS1 screen holds it (`Renderer`'s
-/// width by 240), and per pixel whether creatures cover at least half of it (1)
-/// or not (0).
+/// width by 240), and the creatures as RGBA8, the same size: the colour of the
+/// flesh samples in each pixel that a creature covers, averaged (black where
+/// none does), and how many of its four samples it covers, over 4. The screen
+/// is `mix(screen, rgb, a)` of the creatures, in encoded colour: done already
+/// unless the renderer keeps them apart (`Renderer::layers`).
 pub struct Frame {
     pub rgb: Vec<u8>,
-    pub mask: Vec<u8>,
+    pub creatures: Vec<u8>,
 }
 
 impl Frame {
     /// The middle `width` columns: the same view on a narrower screen (the lens's
     /// field of view is vertical, so a wider screen only adds to the sides).
     pub fn crop(&self, width: u32) -> Frame {
-        let full = self.mask.len() / H as usize;
+        let full = self.rgb.len() / 3 / H as usize;
         let (w, x0) = (width as usize, (full - width as usize) / 2);
         let rows = |v: &[u8], c: usize| -> Vec<u8> {
             v.chunks_exact(full * c).flat_map(|row| row[x0 * c..(x0 + w) * c].iter().copied()).collect()
         };
-        Frame { rgb: rows(&self.rgb, 3), mask: rows(&self.mask, 1) }
+        Frame { rgb: rows(&self.rgb, 3), creatures: rows(&self.creatures, 4) }
+    }
+
+    /// Per pixel whether creatures cover at least half of it (1) or not (0).
+    pub fn mask(&self) -> Vec<u8> {
+        self.creatures.chunks_exact(4).map(|p| (p[3] >= 128) as u8).collect()
     }
 }
 
@@ -57,6 +65,17 @@ impl Renderer {
 
     /// A screen `width` pixels wide (and 240 high): wider ones see more to the sides.
     pub fn with_width(width: u32) -> Renderer {
+        Self::make(width, false)
+    }
+
+    /// A screen `width` pixels wide whose frames keep the creatures apart: the
+    /// screen without them, and each one whole, however much of the level is in
+    /// front of it.
+    pub fn layers(width: u32) -> Renderer {
+        Self::make(width, true)
+    }
+
+    fn make(width: u32, layers: bool) -> Renderer {
         let mut app = App::new();
         app.add_plugins(
             DefaultPlugins
@@ -71,7 +90,8 @@ impl Renderer {
                 .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
         )
         .add_plugins(PsxPlugin { screen: PsxScreen { width, height: H, ..default() } })
-        .add_plugins(LevelGfxPlugin);
+        .add_plugins(LevelGfxPlugin)
+        .insert_resource(FleshLayers(layers));
         while app.plugins_state() == PluginsState::Adding {
             bevy::tasks::tick_global_task_pools_on_main_thread();
         }
@@ -140,7 +160,7 @@ impl Renderer {
                 // Readback rows are padded to 256 bytes: widths that are multiples of 64 have none.
                 assert_eq!(rgba.len(), self.width as usize * H as usize * 4, "pick a width that is a multiple of 64");
                 let rgb = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-                Frame { rgb, mask: creature_mask(&flesh, self.width as usize) }
+                Frame { rgb, creatures: creature_layer(&flesh, self.width as usize) }
             })
             .collect()
     }
@@ -167,20 +187,37 @@ fn read_back(world: &mut World, image: Handle<Image>) -> (Slot, Entity) {
     (slot, e)
 }
 
-/// The flesh image (half floats, twice the screen's size) to one byte per screen
-/// pixel: 1 where creatures cover at least two of its four samples.
-fn creature_mask(flesh: &[u8], w: usize) -> Vec<u8> {
+/// The flesh image (half floats, twice the screen's size) to RGBA8 per screen
+/// pixel, as the overlay lays it over the screen (`flesh_overlay.wesl`): the
+/// covered samples' colour averaged and clamped, and the share covered.
+fn creature_layer(flesh: &[u8], w: usize) -> Vec<u8> {
     let h = H as usize;
-    let alpha = |x: usize, y: usize| {
-        let o = (y * 2 * w + x) * 8 + 6;
-        half::f16::from_le_bytes([flesh[o], flesh[o + 1]]).to_f32() > 0.5
+    let at = |x: usize, y: usize, c: usize| {
+        let o = (y * 2 * w + x) * 8 + c * 2;
+        half::f16::from_le_bytes([flesh[o], flesh[o + 1]]).to_f32()
     };
-    let mut mask = vec![0u8; w * h];
+    let mut out = vec![0u8; w * h * 4];
     for y in 0..h {
         for x in 0..w {
-            let n = (0..4).filter(|i| alpha(x * 2 + i % 2, y * 2 + i / 2)).count();
-            mask[y * w + x] = (n >= 2) as u8;
+            let (mut sum, mut n) = ([0.0f32; 3], 0);
+            for i in 0..4 {
+                let (sx, sy) = (x * 2 + i % 2, y * 2 + i / 2);
+                if at(sx, sy, 3) > 0.5 {
+                    for c in 0..3 {
+                        sum[c] += at(sx, sy, c);
+                    }
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let o = (y * w + x) * 4;
+            for c in 0..3 {
+                out[o + c] = ((sum[c] / n as f32).clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+            out[o + 3] = ((n * 255 + 2) / 4) as u8;
         }
     }
-    mask
+    out
 }

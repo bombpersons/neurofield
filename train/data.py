@@ -14,6 +14,10 @@ Creatures arrive as one token per body part (pose, size, shape dials, skin
 motif and density, tint, baked light), never as triangles: the dense meshes
 and skin layouts behind the images are for the network to make up. Shards
 from before creatures had parts load with none.
+
+Newer shards keep the creatures apart: the frame is the level alone, and each
+view's creatures are an RGBA box of their own, whole (`creatures`). Their mask is
+where they cover at least half a pixel, as older shards' `masks.npy` was.
 """
 
 from pathlib import Path
@@ -55,7 +59,12 @@ class Shards(Dataset):
             if (d / "parts.npy").exists():
                 s["parts"] = np.load(d / "parts.npy")
                 s["part_offsets"] = np.load(d / "part_offsets.npy")
-                s["masks"] = np.load(d / "masks.npy", mmap_mode="r")
+                if (d / "creatures.npy").exists():
+                    s["boxes"] = np.load(d / "creature_boxes.npy")
+                    s["creatures"] = np.load(d / "creatures.npy", mmap_mode="r")
+                    s["creature_offsets"] = np.load(d / "creature_offsets.npy")
+                else:
+                    s["masks"] = np.load(d / "masks.npy", mmap_mode="r")
             if (d / "image_offsets.npy").exists():  # frames of their own widths, one after another
                 s["image_offsets"] = np.load(d / "image_offsets.npy")
             self.index += [(len(self.shards), i) for i in range(len(s["views"]))]
@@ -76,14 +85,17 @@ class Shards(Dataset):
         if "image_offsets" in s:
             a, b = s["image_offsets"][vi : vi + 2]
             pixels = np.array(s["images"][a:b]).reshape(H, w, 3)
-            packed = np.array(s["masks"][a // 24 : b // 24]).reshape(H, w // 8)
+            packed = np.array(s["masks"][a // 24 : b // 24]).reshape(H, w // 8) if "masks" in s else None
         else:
             pixels = np.array(s["images"][vi])
             packed = np.array(s["masks"][vi]) if "masks" in s else None
         image = torch.from_numpy(pixels).permute(2, 0, 1).float() / 255.0
         if "parts" in s:
             parts = s["parts"][s["part_offsets"][scene] : s["part_offsets"][scene + 1]]
-            mask = np.unpackbits(packed, axis=-1)
+            if packed is not None:
+                mask = np.unpackbits(packed, axis=-1)
+            else:
+                mask = (self.creatures(i)[..., 3] >= 128).astype(np.uint8)
         else:
             parts, mask = np.zeros((0, 49), np.float32), np.zeros((H, w), np.uint8)
         pfeats, pids = part_tokens(parts, v)
@@ -96,6 +108,20 @@ class Shards(Dataset):
             torch.from_numpy(pids),
             torch.from_numpy(mask).float(),
         )
+
+
+    def creatures(self, i):
+        """Item `i`'s creatures as uint8 [240, width, 4]: rgb, and alpha = share of the
+        pixel they cover (see format.json), zero outside their box."""
+        si, vi = self.index[i]
+        s = self.shards[si]
+        w = view_width(s["views"][vi])
+        out = np.zeros((H, w, 4), np.uint8)
+        if "creatures" in s:
+            x0, y0, x1, y1 = (int(c) for c in s["boxes"][vi])
+            a, b = s["creature_offsets"][vi : vi + 2]
+            out[y0:y1, x0:x1] = np.asarray(s["creatures"][a:b]).reshape(y1 - y0, x1 - x0, 4)
+        return out
 
 
 def view_width(v):
