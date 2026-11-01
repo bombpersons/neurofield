@@ -1,0 +1,21 @@
+{
+  "id": "bombpersons/neurofield-dream",
+  "title": "neurofield-dream",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [
+    "bombpersons/neurofield-data-0",
+    "bombpersons/neurofield-data-1",
+    "bombpersons/neurofield-data-2",
+    "bombpersons/neurofield-data-3"
+  ],
+  "model_sources": []
+}
