@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from transformers import CLIPModel, CLIPTokenizer
 
 from creatures import composite
-from dream import NEGATIVE_ID, Q_PHRASE, VOCAB, WHOLE_IDS, DreamCrops, DreamNet, fields, fogged
+from dream import NEGATIVE_ID, Q_PHRASE, VOCAB, VOCABS, DreamCrops, DreamNet, fields, fogged
 
 CLIP = "openai/clip-vit-base-patch32"
 MEAN = torch.tensor([0.4815, 0.4578, 0.4082])[:, None, None]
@@ -46,6 +46,8 @@ BAND, CORE = 2.5, 0.5
 LOGIT_SCALE = 100.0
 # Steps over which alpha is pushed towards 0 or 1: from, then ramping up over.
 BINARY_FROM, BINARY_RAMP = 2000, 4000
+# Non-finite steps in a row after which training goes back to the last good checkpoint.
+BAD_STEPS = 20
 
 
 def embed(f):
@@ -91,7 +93,7 @@ def cutouts(img, centre, extent, cuts):
 
 
 class Trainer:
-    def __init__(self, data, out, batch=16, size=128, lr=1e-4, workers=2, device=None, cuts=4, ema_decay=0.999,
+    def __init__(self, data, out, batch=16, size=128, lr=3e-4, workers=2, device=None, cuts=4, ema_decay=0.999, vocab="motifs",
                  part_weight=0.1, whole_weight=0.5, negative_weight=0.3, band_weight=2.0, binary_weight=0.5):
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -99,8 +101,8 @@ class Trainer:
         self.amp = self.device == "cuda"
         n_shards = len(list(Path(data).glob("shard_*")))
         assert n_shards >= 2, "need at least two shards (the last one is held out)"
-        self.train_set = DreamCrops(data, range(n_shards - 1), size)
-        self.val_set = DreamCrops(data, [n_shards - 1], size, fixed=True)
+        self.train_set = DreamCrops(data, range(n_shards - 1), size, vocab=vocab)
+        self.val_set = DreamCrops(data, [n_shards - 1], size, fixed=True, vocab=vocab)
         self.clip = CLIPModel.from_pretrained(CLIP).to(self.device).eval().requires_grad_(False)
         tok = CLIPTokenizer.from_pretrained(CLIP)
         with torch.no_grad():
@@ -109,6 +111,11 @@ class Trainer:
                 for i in range(0, len(VOCAB), 256)
             ])
         self.mean, self.std = MEAN.to(self.device), STD.to(self.device)
+        # The phrases a part's phrase competes with, and each phrase's place among them.
+        self.candidates = torch.tensor(VOCABS[vocab], device=self.device)
+        self.position = torch.zeros(len(VOCAB), dtype=torch.long, device=self.device)
+        self.position[self.candidates] = torch.arange(len(self.candidates), device=self.device)
+        self.vocab = vocab
         self.model = DreamNet(text_dim=self.text.shape[1]).to(self.device)
         self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.99))
@@ -124,7 +131,11 @@ class Trainer:
             self.ema.load_state_dict(state["ema"])
             self.opt.load_state_dict(state["opt"])
             self.step = state["step"]
+            self.lr = state.get("lr", self.lr)
             print(f"resumed at step {self.step}")
+        self.good = None
+        self.keep_good()
+        assert self.good is not None, "the weights are not finite: resume from an earlier checkpoint"
         self.loader = DataLoader(self.train_set, batch_size=batch, shuffle=True, drop_last=True, num_workers=workers,
                                  persistent_workers=workers > 0)
         self.batches = (b for _ in itertools.count() for b in self.loader)
@@ -139,8 +150,9 @@ class Trainer:
         with torch.no_grad():
             feats, weights, dmin, fog = fields(q, cam, palette, n)
         text = self.text[q[..., Q_PHRASE].long()]
-        with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            layer = (model or self.model)(feats, weights, text, palette)
+        # In fp32: the net is small, and without normalisation its activations can outgrow
+        # fp16 (run 1 went NaN on every step from then on). CLIP stays in fp16.
+        layer = (model or self.model)(feats, weights, text, palette)
         return layer.float(), frame, dmin, fog, (q, cam, palette, whole, judged)
 
     def scores(self, img, q, whole, judged):
@@ -163,8 +175,8 @@ class Trainer:
         phrase = torch.cat([torch.gather(q[..., Q_PHRASE], 1, idx.clamp(min=0)).long(), whole[:, None]], 1).flatten()[sel]
         sims = (f * self.text[phrase][:, None]).sum(-1).mean(1)
         part_rows = (~(torch.arange(J + 1, device=img.device) == J).expand(b, -1)).flatten()[sel]
-        logits = LOGIT_SCALE * f[part_rows] @ self.text[: WHOLE_IDS[0]].T  # [parts, cuts, part phrases]
-        target = phrase[part_rows][:, None].expand(-1, self.cuts)
+        logits = LOGIT_SCALE * f[part_rows] @ self.text[self.candidates].T  # [parts, cuts, vocab phrases]
+        target = self.position[phrase[part_rows]][:, None].expand(-1, self.cuts)
         ce = F.cross_entropy(logits.flatten(0, 1), target.flatten()) if part_rows.any() else img.sum() * 0
         neg = (f @ self.text[NEGATIVE_ID]).mean(1)
         table = torch.full((b * (J + 1),), math.nan, device=img.device)
@@ -199,8 +211,9 @@ class Trainer:
 
     def run(self, minutes=None, steps=None, log_every=50, sample_every=1000):
         self.model.train()
-        start, done = time.time(), 0
+        start, done, bad = time.time(), 0, 0
         logs = {k: [] for k in ("loss", "part_ce", "part", "whole", "rainbow", "outside", "missing")}
+        skipped = []
         while (steps is None or done < steps) and (minutes is None or time.time() - start < minutes * 60):
             for g in self.opt.param_groups:
                 g["lr"] = self.lr * min(1.0, (self.step + 1) / WARMUP)
@@ -211,9 +224,15 @@ class Trainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.opt)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            if torch.isfinite(loss):
+            finite = bool(torch.isfinite(loss))
+            if finite:
                 self.scaler.step(self.opt)
             self.scaler.update()
+            skipped.append(0 if finite else 1)
+            bad = 0 if finite else bad + 1
+            if bad >= BAD_STEPS:  # stuck: back to the last good state, more gently
+                self.restore_good()
+                bad = 0
             with torch.no_grad():
                 torch._foreach_lerp_(list(self.ema.parameters()), list(self.model.parameters()), 1 - self.ema_decay)
             for k, v in zip(logs, out):
@@ -221,8 +240,8 @@ class Trainer:
             self.step += 1
             done += 1
             if self.step % log_every == 0:
-                recent = {f"train_{k}": float(np.mean(v[-log_every:])) for k, v in logs.items()}
-                self.log(**recent, secs=time.time() - start)
+                recent = {f"train_{k}": float(np.nanmean(v[-log_every:])) for k, v in logs.items()}
+                self.log(**recent, nonfinite=int(sum(skipped[-log_every:])), lr=self.lr, secs=time.time() - start)
             if self.step % sample_every == 0:
                 self.checkpoint()
         self.checkpoint()
@@ -256,12 +275,37 @@ class Trainer:
             lines.append(f"row {i}: {VOCAB[int(whole[i])]} | judged: {'; '.join(judged_phrases) or '-'}")
         Path(path).with_suffix(".txt").write_text("\n".join(lines) + "\n")
 
+    def finite(self):
+        return all(bool(torch.isfinite(p).all()) for m in (self.model, self.ema) for p in m.parameters())
+
+    def keep_good(self):
+        """Remember the current state (on the CPU) to come back to if training goes non-finite,
+        if it is finite itself."""
+        if not self.finite():
+            return
+        self.good = {"model": copy.deepcopy(self.model.state_dict()), "ema": copy.deepcopy(self.ema.state_dict()),
+                     "opt": copy.deepcopy(self.opt.state_dict()), "step": self.step}
+        self.good = {k: (v if k == "step" else {n: t.cpu() if torch.is_tensor(t) else t for n, t in v.items()})
+                     for k, v in self.good.items()}
+
+    def restore_good(self):
+        self.model.load_state_dict(self.good["model"])
+        self.ema.load_state_dict(self.good["ema"])
+        self.opt.load_state_dict(self.good["opt"])
+        self.lr *= 0.5
+        self.log(restored_from=self.good["step"], lr=self.lr)
+
     def checkpoint(self):
-        self.log(**self.validate())
+        val = self.validate()
+        self.log(**val)
         self.sample(self.out / f"sample_{self.step:07d}.png")
         self.sample(self.out / "sample_latest.png")
+        if not (self.finite() and all(math.isfinite(v) for v in val.values())):
+            self.log(skipped_checkpoint="non-finite weights or validation")
+            return
+        self.keep_good()
         torch.save({"model": self.model.state_dict(), "ema": self.ema.state_dict(), "opt": self.opt.state_dict(),
-                    "step": self.step, "vocab": VOCAB, "text": self.text.cpu()}, self.out / "ckpt.pt")
+                    "step": self.step, "lr": self.lr, "vocab": VOCAB, "vocab_set": self.vocab, "text": self.text.cpu()}, self.out / "ckpt.pt")
 
     def log(self, **kv):
         rec = {"step": self.step, **kv}
@@ -279,11 +323,13 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--size", type=int, default=128)
     ap.add_argument("--cuts", type=int, default=4)
+    ap.add_argument("--vocab", default="motifs", choices=["motifs", "full"])
+    ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--sample-every", type=int, default=1000)
     a = ap.parse_args()
-    t = Trainer(a.data, a.out, batch=a.batch, size=a.size, workers=a.workers, cuts=a.cuts)
+    t = Trainer(a.data, a.out, batch=a.batch, size=a.size, workers=a.workers, cuts=a.cuts, vocab=a.vocab, lr=a.lr)
     t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every)
 
 

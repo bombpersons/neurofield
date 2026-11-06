@@ -63,6 +63,12 @@ TEMPLATES = {
 # Any part, whatever its motif, sometimes dreams one of these instead.
 DREAMS = ["a {} with a dog's face", "a {} made of human hands", "a {} turning into a bird's head", "a {} with a human ear", "a {} of fingers and nails", "a {} sprouting tiny mouths"]
 DREAM_SHARE = 0.25
+# The small vocabulary (`vocab="motifs"`): one phrase per skin, given to parts at random.
+MOTIF_PHRASES = [
+    "raw pink flesh", "bloodshot human eyes", "a mouth full of sharp teeth", "gaping wet mouths",
+    "octopus suckers", "throbbing veins under pale skin", "snake scales", "shiny black beetle shell",
+    "coarse black hair", "wrinkled folded skin", "bare yellowed bone",
+]
 WHOLES = ["a grotesque creature of melting flesh", "a nightmarish flesh monster", "a dreamlike monster made of body parts", "a strange fleshy beast"]
 NEGATIVE = "a rainbow psychedelic pattern"
 
@@ -83,13 +89,17 @@ def build_vocab():
             for n in nouns:
                 dreams[s].append(len(phrases))
                 phrases.append(tpl.format(n))
+    full = list(range(len(phrases)))
+    motifs = list(range(len(phrases), len(phrases) + len(MOTIF_PHRASES)))
+    phrases += MOTIF_PHRASES
     wholes = list(range(len(phrases), len(phrases) + len(WHOLES)))
     phrases += WHOLES
     phrases.append(NEGATIVE)
-    return phrases, by_kind, dreams, wholes, len(phrases) - 1
+    return phrases, by_kind, dreams, {"full": full, "motifs": motifs}, wholes, len(phrases) - 1
 
 
-VOCAB, BY_KIND, DREAM_IDS, WHOLE_IDS, NEGATIVE_ID = build_vocab()
+# `VOCABS`: the part phrases of each vocabulary, which a part's phrase must beat all others of.
+VOCAB, BY_KIND, DREAM_IDS, VOCABS, WHOLE_IDS, NEGATIVE_ID = build_vocab()
 
 PALETTES = [
     ["#efe6d2", "#d9a3a0", "#7a1f1f", "#3b2a20"],  # bone
@@ -120,10 +130,11 @@ def random_palette(rng):
     return np.array([colorsys.hsv_to_rgb(x % 1, s, v) for x, s, v in shades], np.float32)
 
 
-def view_parts(parts, v, rng, box=None, dream_share=DREAM_SHARE):
+def view_parts(parts, v, rng, box=None, vocab="full", dream_share=DREAM_SHARE):
     """Scene parts [P, 49] (parts.npy) in camera space for view `v`, ahead of the camera
     (and reaching into screen `box` x0, y0, x1, y1 if given), nearest first, as float32
-    [MAX_PARTS, Q_PARAMS] (zero padding), each given a phrase."""
+    [MAX_PARTS, Q_PARAMS] (zero padding), each given a phrase from `vocab` (VOCABS): by its
+    motif and shape for "full", a motif at random for "motifs"."""
     pos, R = v[1:4], v[4:13].reshape(3, 3)
     centre = (parts[:, 3:6] - pos) @ R.T
     axes = R @ parts[:, 6:15].reshape(-1, 3, 3)  # columns: local x, y, z in camera space
@@ -140,7 +151,11 @@ def view_parts(parts, v, rng, box=None, dream_share=DREAM_SHARE):
     q = np.zeros((MAX_PARTS, Q_PARAMS), np.float32)
     for i, k in enumerate(keep):
         shape, motif = int(parts[k, 24]), int(parts[k, 29])
-        ids = DREAM_IDS[shape] if rng.random() < dream_share else BY_KIND[motif, shape]
+        if vocab == "motifs":
+            motif = int(rng.integers(len(MOTIFS)))
+            ids = [VOCABS["motifs"][motif]]
+        else:
+            ids = DREAM_IDS[shape] if rng.random() < dream_share else BY_KIND[motif, shape]
         q[i, Q_CENTRE] = centre[k]
         q[i, Q_AX] = axes[k][:, 0]
         q[i, Q_AY] = axes[k][:, 1]
@@ -253,9 +268,9 @@ class DreamCrops(Dataset):
 
     JUDGED = 2
 
-    def __init__(self, root, shards=None, size=128, fixed=False):
+    def __init__(self, root, shards=None, size=128, fixed=False, vocab="full"):
         self.shards = Shards(root, shards)
-        self.size, self.fixed = size, fixed
+        self.size, self.fixed, self.vocab = size, fixed, vocab
         self.items = []
         for i, (si, vi) in enumerate(self.shards.index):
             s = self.shards.shards[si]
@@ -281,7 +296,7 @@ class DreamCrops(Dataset):
         y0 = int(np.clip(cy - n / 2, 0, H - n))
         scene = int(v[0])
         parts = s["parts"][s["part_offsets"][scene] : s["part_offsets"][scene + 1]]
-        q = view_parts(parts, v, rng, (x0, y0, x0 + n, y0 + n))
+        q = view_parts(parts, v, rng, (x0, y0, x0 + n, y0 + n), self.vocab)
         cam = np.array([x0, y0, v[13], width, v[14], v[15], *v[23:26]], np.float32)
         a, b = s["image_offsets"][vi : vi + 2]
         frame = np.array(s["images"][a:b]).reshape(H, width, 3)[y0 : y0 + n, x0 : x0 + n]

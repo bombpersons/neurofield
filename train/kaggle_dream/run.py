@@ -21,7 +21,7 @@ import sys
 import time
 
 START = time.time()
-HOURS = 10  # of Kaggle's 12, leaving room for the last checkpoint
+HOURS = 4.75  # of the 5 h 15 min of GPU quota left this week, with room for setup and the last checkpoint
 REPO, DATA, OUT = "/tmp/neurofield", "/tmp/data/train", "/kaggle/working/out"
 
 
