@@ -2,12 +2,14 @@
 
     kaggle kernels push -p train/kaggle_distil
     kaggle kernels status bombpersons/neurofield-distil
-    kaggle kernels output bombpersons/neurofield-distil -p runs/distil1
+    kaggle kernels output bombpersons/neurofield-distil -p runs/distil2
 
 The targets are the output of the targets kernel (kaggle_dream_targets), mounted as a
-kernel source. It trains until HOURS are up and everything in /kaggle/working/out comes
-back as output. To continue from a finished run, upload its ckpt.pt as a private
-dataset, add that to dataset_sources in kernel-metadata.json and push again.
+kernel source. It learns them alone until CLIP_FROM (run 1's held-out loss was best
+near step 17k), then with CLIP teaching too. It trains until HOURS are up and
+everything in /kaggle/working/out comes back as output. To continue from a finished
+run, upload its ckpt.pt as a private dataset, add that to dataset_sources in
+kernel-metadata.json and push again.
 """
 
 import glob
@@ -18,7 +20,8 @@ import sys
 import time
 
 START = time.time()
-HOURS = 10
+HOURS = 8  # this week's quota, less the targets and distil run 1
+CLIP_FROM = 15000
 REPO, OUT = "/tmp/neurofield", "/kaggle/working/out"
 
 
@@ -47,7 +50,7 @@ if ckpts and not os.path.exists(f"{OUT}/ckpt.pt"):
 sys.path.insert(0, f"{REPO}/train")
 from train_distil import Trainer  # noqa: E402
 
-trainer = Trainer("/kaggle/input", OUT, batch=16, workers=3)
+trainer = Trainer("/kaggle/input", OUT, batch=16, workers=3, clip_from=CLIP_FROM)
 minutes = HOURS * 60 - (time.time() - START) / 60
 print(f"setup took {(time.time() - START) / 60:.1f} min, training for {minutes:.0f} min", flush=True)
 trainer.run(minutes=minutes, log_every=100, sample_every=1000)

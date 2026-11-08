@@ -92,6 +92,38 @@ def cutouts(img, centre, extent, cuts):
     return out + torch.randn_like(out) * 0.04
 
 
+def scores(clip, text, candidates, position, img, q, whole, judged, cuts, amp):
+    """For composites `img` [b, 3, n, n]: CLIP's mean similarity per item (parts [b, JUDGED]
+    (nan where none), whole [b], rainbow [b]) and the parts' cross-entropy against the
+    `candidates` phrases (`position`: each phrase's place among them; mean over judged parts)."""
+    b, _, n, _ = img.shape
+    J = judged.shape[1]
+    idx = judged[..., 0].long()
+    centres = torch.cat([judged[..., 1:3], torch.full((b, 1, 2), n / 2, device=img.device)], 1)
+    extents = torch.cat([judged[..., 3], torch.full((b, 1), 0.9 * n, device=img.device)], 1)
+    valid = torch.cat([idx >= 0, torch.ones(b, 1, dtype=torch.bool, device=img.device)], 1)
+    # Only valid cutouts go through CLIP.
+    sel = valid.flatten().nonzero()[:, 0]
+    src = img.repeat_interleave(J + 1, 0)[sel]
+    c = cutouts(src, centres.flatten(0, 1)[sel], extents.flatten()[sel], cuts)
+    with torch.autocast(img.device.type, dtype=torch.float16, enabled=amp):
+        f = embed(clip.get_image_features(pixel_values=(c - MEAN.to(img.device)) / STD.to(img.device))).float()
+    f = f.reshape(len(sel), cuts, -1)
+    phrase = torch.cat([torch.gather(q[..., Q_PHRASE], 1, idx.clamp(min=0)).long(), whole[:, None]], 1).flatten()[sel]
+    sims = (f * text[phrase][:, None]).sum(-1).mean(1)
+    part_rows = (~(torch.arange(J + 1, device=img.device) == J).expand(b, -1)).flatten()[sel]
+    logits = LOGIT_SCALE * f[part_rows] @ text[candidates].T  # [parts, cuts, vocab phrases]
+    target = position[phrase[part_rows]][:, None].expand(-1, cuts)
+    ce = F.cross_entropy(logits.flatten(0, 1), target.flatten()) if part_rows.any() else img.sum() * 0
+    neg = (f @ text[NEGATIVE_ID]).mean(1)
+    table = torch.full((b * (J + 1),), math.nan, device=img.device)
+    table[sel] = sims
+    table = table.reshape(b, J + 1)
+    negs = torch.zeros(b * (J + 1), device=img.device)
+    negs[sel] = neg
+    return table[:, :J], table[:, J], negs.reshape(b, J + 1)[:, J], ce
+
+
 class Trainer:
     def __init__(self, data, out, batch=16, size=128, lr=3e-4, workers=2, device=None, cuts=4, ema_decay=0.999, vocab="motifs",
                  part_weight=0.1, whole_weight=0.5, negative_weight=0.3, band_weight=2.0, binary_weight=0.5):
@@ -110,7 +142,6 @@ class Trainer:
                 embed(self.clip.get_text_features(**tok(VOCAB[i : i + 256], padding=True, return_tensors="pt").to(self.device)))
                 for i in range(0, len(VOCAB), 256)
             ])
-        self.mean, self.std = MEAN.to(self.device), STD.to(self.device)
         # The phrases a part's phrase competes with, and each phrase's place among them.
         self.candidates = torch.tensor(VOCABS[vocab], device=self.device)
         self.position = torch.zeros(len(VOCAB), dtype=torch.long, device=self.device)
@@ -156,35 +187,7 @@ class Trainer:
         return layer.float(), frame, dmin, fog, (q, cam, palette, whole, judged)
 
     def scores(self, img, q, whole, judged):
-        """For composites `img` [b, 3, n, n]: CLIP's mean similarity per item (parts [b, JUDGED]
-        (nan where none), whole [b], rainbow [b]) and the parts' cross-entropy against all
-        part phrases (mean over judged parts)."""
-        b, _, n, _ = img.shape
-        J = judged.shape[1]
-        idx = judged[..., 0].long()
-        centres = torch.cat([judged[..., 1:3], torch.full((b, 1, 2), n / 2, device=img.device)], 1)
-        extents = torch.cat([judged[..., 3], torch.full((b, 1), 0.9 * n, device=img.device)], 1)
-        valid = torch.cat([idx >= 0, torch.ones(b, 1, dtype=torch.bool, device=img.device)], 1)
-        # Only valid cutouts go through CLIP.
-        sel = valid.flatten().nonzero()[:, 0]
-        src = img.repeat_interleave(J + 1, 0)[sel]
-        cuts = cutouts(src, centres.flatten(0, 1)[sel], extents.flatten()[sel], self.cuts)
-        with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            f = embed(self.clip.get_image_features(pixel_values=(cuts - self.mean) / self.std)).float()
-        f = f.reshape(len(sel), self.cuts, -1)
-        phrase = torch.cat([torch.gather(q[..., Q_PHRASE], 1, idx.clamp(min=0)).long(), whole[:, None]], 1).flatten()[sel]
-        sims = (f * self.text[phrase][:, None]).sum(-1).mean(1)
-        part_rows = (~(torch.arange(J + 1, device=img.device) == J).expand(b, -1)).flatten()[sel]
-        logits = LOGIT_SCALE * f[part_rows] @ self.text[self.candidates].T  # [parts, cuts, vocab phrases]
-        target = self.position[phrase[part_rows]][:, None].expand(-1, self.cuts)
-        ce = F.cross_entropy(logits.flatten(0, 1), target.flatten()) if part_rows.any() else img.sum() * 0
-        neg = (f @ self.text[NEGATIVE_ID]).mean(1)
-        table = torch.full((b * (J + 1),), math.nan, device=img.device)
-        table[sel] = sims
-        table = table.reshape(b, J + 1)
-        negs = torch.zeros(b * (J + 1), device=img.device)
-        negs[sel] = neg
-        return table[:, :J], table[:, J], negs.reshape(b, J + 1)[:, J], ce
+        return scores(self.clip, self.text, self.candidates, self.position, img, q, whole, judged, self.cuts, self.amp)
 
     def losses(self, layer, frame, dmin, q, whole, judged):
         """(loss, part cross-entropy, mean part score, mean whole score, rainbow score, alpha
