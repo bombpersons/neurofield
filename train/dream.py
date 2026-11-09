@@ -51,6 +51,8 @@ F_NORMAL = 9 + NOISE * OCTAVES + PALETTE * 3
 F_CREASE = F_NORMAL + 5
 # Where the drawn edge of a limb is, in its radii (the net's alpha crosses a half about here).
 EDGE = 1.25
+# How far past that the outline shows, in the same radii (the net's alpha is halfway out about here).
+OUTLINE = 1.5
 # How widely parts melt into each other at their joints, and how much the outline swells there.
 MELT, FILLET = 1.0, 2.2
 
@@ -268,10 +270,17 @@ def fields(q, cam, palette, n):
     weights = torch.softmax(-2 * d * d, 1) * (d.amin(1, keepdim=True) < 4)
     # Each limb's rounded surface here, and among those covering a pixel the nearest wins.
     surface = depth - radius[..., None, None] * EDGE * (1 - (d / EDGE).clamp(max=1) ** 2).clamp(min=0).sqrt()
-    inside = d < EDGE
-    closest = d.amin(1)
-    i = torch.where(inside.any(1), torch.where(inside, surface, torch.full_like(surface, float("inf"))).argmin(1), d.argmin(1))
     g = lambda x, at: torch.gather(x, 1, at[:, None]).squeeze(1)  # noqa: E731
+    # A part well behind the nearest outline here has no claim on the pixel: the outline
+    # reaches past EDGE, and that band would go to whatever lies behind it.
+    far = torch.full_like(surface, float("inf"))
+    reaches = d < OUTLINE
+    f = torch.where(reaches, surface, far).argmin(1)
+    r_all = radius[..., None, None].expand_as(d)
+    behind = reaches.any(1)[:, None] & (surface > g(surface, f)[:, None] + 3 * torch.maximum(r_all, g(r_all, f)[:, None]))
+    inside = (d < EDGE) & ~behind
+    closest = d.amin(1)
+    i = torch.where(inside.any(1), torch.where(inside, surface, far).argmin(1), torch.where(behind, far, d).argmin(1))
     bi = torch.arange(B, device=q.device)[:, None, None]
     # The outline: a smooth minimum, so joints swell into each other.
     melted = closest - torch.log(torch.exp(-FILLET * (d - closest[:, None])).sum(1)) / FILLET

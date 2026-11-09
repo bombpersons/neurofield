@@ -31,6 +31,8 @@ const PLANE_FOG: u32 = 115u;
 const PLANE_DEPTH: u32 = 116u;
 // Where the drawn edge of a limb is, in its radii (dream.py EDGE).
 const EDGE: f32 = 1.25;
+// How far past that the outline shows, in the same radii (dream.py OUTLINE).
+const OUTLINE: f32 = 1.5;
 // How widely parts melt into each other at their joints, and how much the outline swells there.
 const MELT: f32 = 1.0;
 const FILLET: f32 = 2.2;
@@ -185,6 +187,8 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     var closest = 1e4; // the smallest distance, whichever part is on top
     var nearest = 0u;
     var near_surface = 1e9;
+    var front = 1e9; // the nearest surface whose outline reaches here
+    var front_radius = 0.0;
     for (var q = 0u; q < p.k; q++) {
         let base = p.a_off + q * PART_FLOATS;
         let l = limb(base, at, corner);
@@ -195,12 +199,23 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
         let round = min(l.d / EDGE, 1.0);
         let surface = l.depth - mem[base + PART_RADIUS] * EDGE * sqrt(max(1.0 - round * round, 0.0));
         zs[q] = surface;
+        if (l.d < OUTLINE && surface < front) {
+            front = surface;
+            front_radius = mem[base + PART_RADIUS];
+        }
+    }
+    for (var q = 0u; q < p.k; q++) {
+        // A part well behind the nearest outline here has no claim on the pixel: the outline
+        // reaches past EDGE, and that band would go to whatever lies behind it.
+        if (zs[q] > front + 3.0 * max(mem[p.a_off + q * PART_FLOATS + PART_RADIUS], front_radius)) { continue; }
+        let surface = zs[q];
+        let l_d = ds[q];
         // Among the limbs covering this pixel the nearest surface wins.
-        let inside = l.d < EDGE;
+        let inside = l_d < EDGE;
         let held = dmin < EDGE;
-        if ((inside && !held) || (inside == held && select(l.d < dmin, surface < near_surface, inside))) {
+        if ((inside && !held) || (inside == held && select(l_d < dmin, surface < near_surface, inside))) {
             near_surface = surface;
-            dmin = l.d;
+            dmin = l_d;
             nearest = q;
         }
     }
