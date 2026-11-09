@@ -10,14 +10,18 @@
 //!     `--strangeness 0.7` sets how strange each level is (otherwise random).
 //!     `--level-file levels/x.ron` plays a hand-built level (see `engine::world::level`) from its
 //!     player start, or from `--start x,y,z,yaw` (world units, yaw in radians); N reloads it.
-//!     E (or cross) opens and closes the door in front, or pulls the lever; walking over a
+//!     E (or circle) opens and closes the door in front, or pulls the lever; walking over a
 //!     key picks it up, and locked doors open for their key.
-//!     Mouse: look   WASD: walk and strafe   Arrows: walk and turn   Tab: auto-walk
-//!     Space: network / rasteriser   B: both side by side   H: hide the effects panel
-//!     N: new level   P: pause   Esc: free the mouse (click to capture it again; Esc again quits)
-//!     Gamepad: left stick walk and strafe, right stick look, d-pad walk and turn,
-//!     L2 / R2 strafe, triangle network / rasteriser, square auto-walk, L1 / R1
-//!     strangeness down / up, select new level (or reload), start pause
+//!     Mouse: look   Right click: attack   WASD: walk and strafe   Arrows: walk and turn   Space: jump
+//!     Shift: sprint   1-4: use the hotbar   Esc: free the mouse (click to capture it
+//!     again; Esc again quits)
+//!     Gamepad: left stick walk and strafe, right stick look, cross jump, L3 sprint,
+//!     R2 attack, circle use, d-pad use the hotbar, start pause
+//!     Debug keys: F1 network / rasteriser   F2 both side by side   F3 hurt   Tab auto-walk
+//!     H show the effects panel   N new level   P pause
+//!     Debug on the pad, holding select: d-pad walk and turn, L2 sprint, triangle
+//!     network / rasteriser, square auto-walk, L1 / R1 strangeness down / up, circle
+//!     hurt, cross new level (or reload)
 //!
 //! The dream effects panel (egui) turns effects on and off in any combination; free the
 //! mouse with Esc to use it. The network runs in the main world each frame and its image, 240
@@ -30,13 +34,15 @@
 //! Developer builds (`--features dev-mcp`) take `--mcp` for psx-bevy's developer MCP
 //! on stdio (see psx-bevy's README, "Agent driving"), with `--headless` and `--software`
 //! to run without a window. Under it the walk starts paused; `game_step` holds pad
-//! buttons for a number of ticks (up/down walk, left/right turn, l2/r2 strafe, cross
-//! uses), `game_screenshot {"target":"screen"}` grabs the rasteriser's frame, and
-//! `game_query {"resources":["Report"]}` reads where the walker is and what happened.
+//! buttons for a number of ticks (select with up/down walks, with left/right turns;
+//! cross jumps, circle uses), `game_screenshot {"target":"screen"}` grabs the
+//! rasteriser's frame, and `game_query {"resources":["Report"]}` reads where the walker
+//! is and what happened.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::image::ImageSampler;
+use bevy::input::gamepad::Gamepad;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -53,6 +59,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use engine::neural::gpu_net::MAX_W;
 use engine::neural::{effects, Level, Network, TICK};
+
+mod hud;
+mod player;
+mod sword;
+use hud::HudState;
+use player::Player;
+use sword::Sword;
 
 /// Mouse sensitivity: yaw units (4096 per turn) per pixel of mouse movement.
 const LOOK: f32 = 1.2;
@@ -93,6 +106,10 @@ struct Sim {
     held: Vec<(u32, String)>,
     /// What last happened (a door, a key), and seconds left to show it.
     said: Option<(String, f32)>,
+    player: Player,
+    sword: Sword,
+    /// Whether the controller was the last thing used, for the shape of the hotbar.
+    on_pad: bool,
 }
 
 impl Sim {
@@ -101,6 +118,10 @@ impl Sim {
         engine::world::scene::force_strangeness(Some(self.strangeness));
         self.level.set_strangeness(self.strangeness);
         self.version += 1;
+    }
+
+    fn toggle_renderer(&mut self) {
+        self.mode = if self.mode == Mode::Network { Mode::Raster } else { Mode::Network };
     }
 
     /// Use whatever is in front: a door or a lever.
@@ -130,6 +151,28 @@ impl Sim {
 
     fn say(&mut self, what: String) {
         self.said = Some((what, 3.0));
+    }
+
+    /// Whether the player's own actions count: not paused, not on auto-walk.
+    fn in_control(&self) -> bool {
+        !self.paused && !self.auto_walk
+    }
+
+    fn jump(&mut self) {
+        let level = &mut self.level;
+        level.walker.jump(&level.scene);
+    }
+
+    fn use_slot(&mut self, slot: usize) {
+        if let Some(what) = self.player.use_slot(slot) {
+            self.say(what);
+        }
+    }
+
+    /// Lose some health and mana, so the bars can be tried before anything can hurt.
+    fn debug_hurt(&mut self) {
+        self.player.hurt(5);
+        self.player.spend_mp(2);
     }
 
     /// The walker's feet, and which way it faces in radians.
@@ -164,6 +207,17 @@ struct Parts {
 #[derive(Component)]
 struct Status;
 
+/// The HUD's image, and what it last showed.
+#[derive(Resource)]
+struct Hud {
+    image: Handle<Image>,
+    shown: Option<HudState>,
+}
+
+/// Shows the HUD, over the network's frame.
+#[derive(Component)]
+struct HudSprite;
+
 /// What the walk is doing, for the developer MCP's `game_query` to read.
 #[derive(Resource, Reflect, Default)]
 #[reflect(Resource)]
@@ -176,6 +230,16 @@ struct Report {
     keys: Vec<String>,
     /// Each door's openness, 0 shut to 1 open, by entity id.
     doors: Vec<(u32, f32)>,
+    /// The player: health and mana, what is carried, and the hotbar's items.
+    hp: i32,
+    mp: i32,
+    items: Vec<(String, u32)>,
+    hotbar: Vec<String>,
+    airborne: bool,
+    sprinting: bool,
+    attacking: bool,
+    /// The walking bob's offset of the camera, in world units.
+    bob: f32,
 }
 
 fn main() {
@@ -282,7 +346,7 @@ fn main() {
                 Some(v) => panic!("--view network|raster|both, not {v}"),
             },
             effects: [None; effects::EFFECTS.len()],
-            panel: true,
+            panel: false,
             net_ms: 0.0,
             herd: Default::default(),
             tris: 0,
@@ -293,11 +357,14 @@ fn main() {
             version: 0,
             held: Vec::new(),
             said: None,
+            player: Player::new(),
+            sword: Sword::default(),
+            on_pad: false,
         })
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
-        .add_systems(Update, (keys, mouse, draw, build_scene, move_things, raster_camera, status, auto_screenshot).chain())
+        .add_systems(Update, (keys, mouse, draw, build_scene, move_things, raster_camera, status, update_hud, auto_screenshot).chain())
         .add_systems(Update, egui_on_display)
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
@@ -330,6 +397,20 @@ fn frame_image() -> Image {
     image
 }
 
+/// Transparent, and as wide as the frame can be, like `frame_image`.
+fn hud_image() -> Image {
+    let size = Extent3d { width: MAX_W, height: H, depth_or_array_layers: 1 };
+    let mut image = Image::new_fill(
+        size,
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    image
+}
+
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let frame = images.add(frame_image());
     // Over psx-bevy's display quad (z 0), drawn by its window camera.
@@ -340,16 +421,34 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         NetworkSprite,
     ));
     commands.insert_resource(Frame(frame));
+    let hud = images.add(hud_image());
+    commands.spawn((
+        Sprite::from_image(hud.clone()),
+        Transform::from_xyz(0.0, 0.0, 2.0),
+        RenderLayers::layer(DISPLAY_LAYER),
+        HudSprite,
+    ));
+    commands.insert_resource(Hud { image: hud, shown: None });
     commands.spawn((
         Text::new(""),
         TextFont { font_size: bevy::text::FontSize::Px(14.0), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
-        Node { position_type: PositionType::Absolute, top: Val::Px(6.0), left: Val::Px(8.0), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(6.0),
+            left: Val::Percent(22.0),
+            max_width: Val::Percent(62.0),
+            ..default()
+        },
         Status,
     ));
 }
 
 fn capture_mouse(mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>) {
+    // A scripted screenshot must leave the desktop's mouse alone.
+    if std::env::var_os("GAME_SHOT").is_some() {
+        return;
+    }
     if let Ok(mut cursor) = cursor.single_mut() {
         set_captured(&mut cursor, true);
     }
@@ -366,10 +465,14 @@ fn keys(
     egui: Res<EguiWantsInput>,
     mut sim: ResMut<Sim>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    gamepads: Query<&Gamepad>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if let Ok(mut cursor) = cursor.single_mut() {
         let captured = cursor.grab_mode != CursorGrabMode::None;
+        if captured && button.just_pressed(MouseButton::Right) && sim.in_control() {
+            sim.sword.attack();
+        }
         if key.just_pressed(KeyCode::Escape) {
             if captured {
                 set_captured(&mut cursor, false);
@@ -381,11 +484,33 @@ fn keys(
             set_captured(&mut cursor, true);
         }
     }
-    if key.just_pressed(KeyCode::Space) {
-        sim.mode = if sim.mode == Mode::Network { Mode::Raster } else { Mode::Network };
+    if key.get_just_pressed().next().is_some() {
+        sim.on_pad = false;
     }
-    if key.just_pressed(KeyCode::KeyB) {
+    if key.just_pressed(KeyCode::F1) {
+        sim.toggle_renderer();
+    }
+    if key.just_pressed(KeyCode::F2) {
         sim.mode = if sim.mode == Mode::Both { Mode::Network } else { Mode::Both };
+    }
+    if key.just_pressed(KeyCode::F3) {
+        sim.debug_hurt();
+    }
+    // L3 isn't one of the shell's pad buttons, so it comes straight from the gamepad.
+    let sprint = key.any_just_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+        || gamepads.iter().any(|g| g.just_pressed(GamepadButton::LeftThumb));
+    if sim.in_control() {
+        if key.just_pressed(KeyCode::Space) {
+            sim.jump();
+        }
+        if sprint {
+            sim.level.walker.start_sprint();
+        }
+        for (slot, k) in [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4].into_iter().enumerate() {
+            if key.just_pressed(k) {
+                sim.use_slot(slot);
+            }
+        }
     }
     if key.just_pressed(KeyCode::Tab) {
         sim.auto_walk = !sim.auto_walk;
@@ -407,8 +532,42 @@ fn keys(
 /// Pad buttons, sampled once per tick by psx-bevy's shell (where the developer
 /// MCP's buttons arrive too).
 fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
+    if pad.left_stick != Vec2::ZERO || pad.right_stick != Vec2::ZERO || !pad.buttons().is_empty() {
+        sim.on_pad = true;
+    }
+    if pad.held(Button::Select) {
+        debug_chords(pad, sim);
+        return;
+    }
+    if pad.pressed(Button::Start) {
+        sim.paused = !sim.paused;
+    }
+    if !sim.in_control() {
+        return;
+    }
+    if pad.pressed(Button::Cross) {
+        sim.jump();
+    }
+    if pad.pressed(Button::Circle) {
+        sim.use_thing();
+    }
+    if pad.pressed(Button::R2) {
+        sim.sword.attack();
+    }
+    // Holding triangle will give the d-pad to the quick-change list.
+    if !pad.held(Button::Triangle) {
+        for (slot, b) in [Button::Up, Button::Right, Button::Down, Button::Left].into_iter().enumerate() {
+            if pad.pressed(b) {
+                sim.use_slot(slot);
+            }
+        }
+    }
+}
+
+/// The developer's controls, on the pad while select is held; walking is in `walk`.
+fn debug_chords(pad: &ControllerState, sim: &mut Sim) {
     if pad.pressed(Button::Triangle) {
-        sim.mode = if sim.mode == Mode::Network { Mode::Raster } else { Mode::Network };
+        sim.toggle_renderer();
     }
     for (b, d) in [(Button::L1, -0.1), (Button::R1, 0.1)] {
         if pad.pressed(b) {
@@ -419,13 +578,13 @@ fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
     if pad.pressed(Button::Square) {
         sim.auto_walk = !sim.auto_walk;
     }
-    if pad.pressed(Button::Start) {
-        sim.paused = !sim.paused;
+    if pad.pressed(Button::L2) {
+        sim.level.walker.start_sprint();
+    }
+    if pad.pressed(Button::Circle) {
+        sim.debug_hurt();
     }
     if pad.pressed(Button::Cross) {
-        sim.use_thing();
-    }
-    if pad.pressed(Button::Select) {
         sim.reload();
     }
 }
@@ -477,6 +636,9 @@ fn mouse(
         return;
     }
     let captured = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
+    if captured && motion.delta != Vec2::ZERO {
+        sim.on_pad = false;
+    }
     let mut d = if captured { motion.delta * LOOK } else { Vec2::ZERO };
     // Stick up is +y; looking up is less pitch.
     let s = pad.right_stick;
@@ -498,6 +660,14 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         said: sim.said.as_ref().map_or(String::new(), |s| s.0.clone()),
         keys: sim.held.iter().map(|k| k.1.clone()).collect(),
         doors: sim.level.scene.things.doors.iter().map(|d| (d.entity, d.open)).collect(),
+        hp: sim.player.hp,
+        mp: sim.player.mp,
+        items: sim.player.items.iter().map(|(i, n)| (i.name().to_string(), *n)).collect(),
+        hotbar: sim.player.hotbar.iter().map(|s| s.map_or(String::new(), |i| i.name().to_string())).collect(),
+        airborne: sim.level.walker.airborne(),
+        sprinting: sim.level.walker.sprinting(),
+        attacking: sim.sword.swinging(),
+        bob: sim.level.walker.bob(),
     };
     if sim.paused {
         return;
@@ -529,9 +699,12 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
     let mut turn = down(KeyCode::ArrowLeft, KeyCode::ArrowLeft) - down(KeyCode::ArrowRight, KeyCode::ArrowRight);
     let (mut forward, mut strafe) = (forward, strafe);
     let held = |b: Button| pad.held(b) as i32 as f32;
-    forward += pad.left_stick.y + held(Button::Up) - held(Button::Down);
-    strafe += pad.left_stick.x + held(Button::R2) - held(Button::L2);
-    turn += held(Button::Left) - held(Button::Right);
+    forward += pad.left_stick.y;
+    strafe += pad.left_stick.x;
+    if pad.held(Button::Select) {
+        forward += held(Button::Up) - held(Button::Down);
+        turn += held(Button::Left) - held(Button::Right);
+    }
     let turn = turn.clamp(-1.0, 1.0);
     let len = (forward * forward + strafe * strafe).sqrt().max(1.0);
     // The pitch is the mouse's: passing it as the target leaves it where it is.
@@ -668,7 +841,8 @@ fn layout(
     screen: Res<PsxScreen>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut network: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<NetworkSprite>>,
-    mut display: Query<(&Sprite, &mut Transform), Without<NetworkSprite>>,
+    mut hud: Query<(&mut Sprite, &mut Transform), (With<HudSprite>, Without<NetworkSprite>)>,
+    mut display: Query<(&Sprite, &mut Transform), (Without<NetworkSprite>, Without<HudSprite>)>,
 ) {
     let Ok(window) = window.single() else { return };
     let frames = if sim.mode == Mode::Both { 2.0 } else { 1.0 };
@@ -694,6 +868,37 @@ fn layout(
     ns.custom_size = Some(size * scale);
     nt.translation.x = half;
     *nv = if sim.mode == Mode::Raster { Visibility::Hidden } else { Visibility::Visible };
+    // The HUD sits on whichever picture is shown, at its resolution.
+    if let Ok((mut hs, mut ht)) = hud.single_mut() {
+        if sim.mode == Mode::Raster {
+            hs.rect = Some(Rect::new(0.0, 0.0, W as f32, H as f32));
+            hs.custom_size = Some(Vec2::new(W as f32, H as f32) * raster);
+            ht.translation.x = 0.0;
+        } else {
+            hs.rect = Some(Rect::new(0.0, 0.0, width as f32, H as f32));
+            hs.custom_size = Some(size * scale);
+            ht.translation.x = half;
+        }
+    }
+}
+
+/// Redraw the HUD's image when what it shows has changed.
+fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut images: ResMut<Assets<Image>>) {
+    let sim = &mut *sim;
+    if !sim.paused {
+        sim.sword.update(time.delta_secs(), sim.level.walker.yaw);
+    }
+    let width = if sim.mode == Mode::Raster { W } else { sim.width };
+    let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
+    let state = HudState::of(&sim.player, width, sim.on_pad, yaw, sim.sword.pose(sim.level.walker.bob()));
+    if hud.shown.as_ref() == Some(&state) {
+        return;
+    }
+    let Some(mut image) = images.get_mut(&hud.image) else { return };
+    if let Some(data) = image.data.as_mut() {
+        hud::draw(data, MAX_W, H, &state);
+        hud.shown = Some(state);
+    }
 }
 
 /// `GAME_SHOT=out.png:5` saves a screenshot of the window after 5 seconds and
@@ -732,7 +937,7 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
     let said = sim.said.as_ref().map_or(String::new(), |s| format!("\n{}", s.0));
     text.0 = format!(
         "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | {walk}{pause}{keys}\n\
-         mouse: look  wasd: move  e: use  tab: auto-walk  space: switch  b: both  h: panel  n: new level  esc: free mouse{said}",
+         mouse: look  rmb: attack  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  f1: switch  f2: both  f3: hurt  h: panel  esc: free mouse{said}",
         sim.net_ms, sim.tris
     );
 }

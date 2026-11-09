@@ -115,8 +115,9 @@ plain PSX renderer instead of the neural one.
 
 | Action             | Mouse / keyboard     | Controller |
 |--------------------|----------------------|------------|
-| Jump               | *TBD (probably Space)* | X        |
-| Sprint             | *TBD*                | L3 (click left stick) |
+| Jump               | Space                | X          |
+| Sprint             | Shift                | L3 (click left stick) |
+| Use door or lever  | E                    | Circle     |
 | Raise shield       | Left click           | L2         |
 | Attack with weapon | Right click          | R2         |
 | Cast selected spell| *TBD*                | L1         |

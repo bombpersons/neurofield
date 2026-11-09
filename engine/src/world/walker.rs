@@ -20,6 +20,34 @@ const SPEED: f32 = 14.0;
 const MAX_TURN: f32 = 40.0;
 /// Furthest the gaze tilts up or down (512 = 45°).
 pub const MAX_PITCH: f32 = 512.0;
+/// Sprinting, as a multiple of walking speed; it ends when the view turns faster than
+/// `SPRINT_TURN` (yaw units per frame), so a very slow turn is still allowed.
+const SPRINT: f32 = 1.7;
+const SPRINT_TURN: f32 = 12.0;
+/// A jump: speed off the ground and the pull down, per frame (about 0.4 tiles high).
+const JUMP: f32 = 23.0;
+const GRAVITY: f32 = 2.5;
+const FASTEST_FALL: f32 = 40.0;
+/// How near the eye comes to a ceiling in a jump.
+const HEAD: f32 = 0.15 * TF;
+/// World units walked per bob of the camera, and how far it bobs.
+const STRIDE: f32 = 0.9 * TF;
+const BOB: f32 = 6.0;
+
+/// What only a player's walk has (`Walker::drive`). `step` leaves it at rest, so the
+/// generated walks' cameras have no bob.
+#[derive(Default)]
+struct Body {
+    /// Falling speed (y is down), the floor jumped from (while in the air) and the
+    /// last frame's yaw, for how fast the view turned.
+    vy: f32,
+    took_off: Option<f32>,
+    sprinting: bool,
+    last_yaw: Option<f32>,
+    /// Radians along the bob's cycle, and how much of it shows (0 standing, 1 walking).
+    bob: f32,
+    bob_amount: f32,
+}
 
 pub struct Walker {
     pub x: f32,
@@ -38,6 +66,7 @@ pub struct Walker {
     fog_far: i32,
     torch: [f32; 3],
     torch_radius: i32,
+    body: Body,
 }
 
 fn centre(c: Node) -> (f32, f32) {
@@ -82,6 +111,7 @@ impl Walker {
             fog_far: (fog_near + rng.fr(3.0, 6.0) * TF) as i32,
             torch: if rng.chance(0.75) { torch_colour(rng) } else { [0.0; 3] },
             torch_radius: (rng.fr(2.0, 4.0) * TF) as i32,
+            body: Body::default(),
         })
     }
 
@@ -104,6 +134,7 @@ impl Walker {
             fog_far: (fog_near + rng.fr(4.0, 6.0) * TF) as i32,
             torch: torch_colour(rng),
             torch_radius: (3.0 * TF) as i32,
+            body: Body::default(),
         })
     }
 
@@ -142,6 +173,20 @@ impl Walker {
         ok.then_some(fy)
     }
 
+    /// Can a body in the air with its feet at `feet` move to (x, z)? It can land on floor
+    /// up to a step above its feet, but not over one lower than where it jumped from can
+    /// step down to: nothing it jumps into is deeper than it could walk back out of.
+    fn free_in_air(scene: &Scene, x: f32, z: f32, feet: f32, took_off: f32) -> bool {
+        let Some(fy) = scene.walkable_y(x, feet, z) else { return false };
+        let reach = MAX_STEP + RADIUS * std::f32::consts::SQRT_2;
+        fy >= feet - MAX_STEP
+            && fy <= took_off + MAX_STEP
+            && !scene.door_blocks(x, z, feet.min(fy), RADIUS)
+            && [(-RADIUS, -RADIUS), (RADIUS, -RADIUS), (-RADIUS, RADIUS), (RADIUS, RADIUS)]
+                .iter()
+                .all(|&(dx, dz)| scene.walkable_y(x + dx, feet, z + dz).is_some_and(|f| (f - fy).abs() <= reach))
+    }
+
     /// Straight walk from here to (tx, tz) without touching walls or ledges?
     fn clear_line(&self, scene: &Scene, tx: f32, tz: f32) -> bool {
         let (dx, dz) = (tx - self.x, tz - self.z);
@@ -155,7 +200,7 @@ impl Walker {
 
     pub fn camera(&self) -> Camera {
         Camera {
-            pos: [self.x as i32, self.y as i32, self.z as i32],
+            pos: [self.x as i32, (self.y + self.bob()) as i32, self.z as i32],
             yaw: self.yaw.round() as i32,
             pitch: self.pitch.round() as i32,
             roll: 0,
@@ -221,6 +266,32 @@ impl Walker {
             });
         }
         None
+    }
+
+    /// How far the walking bob moves the camera now (world units, down is positive).
+    pub fn bob(&self) -> f32 {
+        self.body.bob.sin() * BOB * self.body.bob_amount
+    }
+
+    pub fn airborne(&self) -> bool {
+        self.body.took_off.is_some()
+    }
+
+    pub fn sprinting(&self) -> bool {
+        self.body.sprinting
+    }
+
+    /// Leave the ground, if standing on it; `drive` carries the jump through.
+    pub fn jump(&mut self, scene: &Scene) {
+        if self.body.took_off.is_none() {
+            self.body.took_off = Some(scene.floor_y(self.x, self.feet(), self.z).unwrap_or(self.feet()));
+            self.body.vy = -JUMP;
+        }
+    }
+
+    /// Run until the walk forward stops or the view turns too fast (see `SPRINT_TURN`).
+    pub fn start_sprint(&mut self) {
+        self.body.sprinting = true;
     }
 
     pub fn step(&mut self, scene: &Scene, rng: &mut Rng) {
@@ -292,21 +363,67 @@ impl Walker {
         self.target_pitch = look;
         self.pitch += (look - self.pitch) * 0.15;
         self.yaw += turn * MAX_TURN;
+        let turned = self.body.last_yaw.map_or(0.0, |y| (self.yaw - y).abs());
+        self.body.last_yaw = Some(self.yaw);
+        if forward < 0.3 || turned > SPRINT_TURN {
+            self.body.sprinting = false;
+        }
+        let speed = if self.body.sprinting { SPEED * SPRINT } else { SPEED };
         let a = self.yaw / 4096.0 * std::f32::consts::TAU;
         let (s, c) = a.sin_cos();
         // Forward is (-sin, cos) as in `yaw_towards`; right is down x forward.
-        let dx = (-s * forward + c * strafe) * SPEED;
-        let dz = (c * forward + s * strafe) * SPEED;
+        let dx = (-s * forward + c * strafe) * speed;
+        let dz = (c * forward + s * strafe) * speed;
         let from = scene.floor_y(self.x, self.feet(), self.z).unwrap_or(0.0);
+        let feet = self.feet();
+        let took_off = self.body.took_off;
+        let (x0, z0) = (self.x, self.z);
         for (mx, mz) in [(dx, dz), (dx, 0.0), (0.0, dz)] {
-            if (mx != 0.0 || mz != 0.0) && Self::free(scene, self.x + mx, self.z + mz, from).is_some() {
-                self.x += mx;
-                self.z += mz;
+            let (x, z) = (self.x + mx, self.z + mz);
+            let free = match took_off {
+                Some(t) => Self::free_in_air(scene, x, z, feet, t),
+                None => Self::free(scene, x, z, from).is_some(),
+            };
+            if (mx != 0.0 || mz != 0.0) && free {
+                self.x = x;
+                self.z = z;
                 break;
             }
         }
-        if let Some(fy) = scene.floor_y(self.x, self.feet(), self.z) {
+        if took_off.is_some() {
+            self.fall(scene);
+        } else if let Some(fy) = scene.floor_y(self.x, self.feet(), self.z) {
             self.y += (fy - EYE - self.y) * 0.35;
+        }
+        let moved = (self.x - x0).hypot(self.z - z0);
+        let walking = (moved > 0.5 && self.body.took_off.is_none()) as i32 as f32;
+        self.body.bob = (self.body.bob + moved / STRIDE * std::f32::consts::TAU) % std::f32::consts::TAU;
+        self.body.bob_amount += (walking - self.body.bob_amount) * 0.2;
+    }
+
+    /// One frame of a jump: rise and fall, stopping at the ceiling and landing on the floor.
+    fn fall(&mut self, scene: &Scene) {
+        let before = self.feet();
+        self.body.vy = (self.body.vy + GRAVITY).min(FASTEST_FALL);
+        self.y += self.body.vy;
+        if let Some(c) = scene.ceiling_y(self.x, before, self.z) {
+            if self.y < c + HEAD {
+                self.y = c + HEAD;
+                self.body.vy = self.body.vy.max(0.0);
+            }
+        }
+        match scene.floor_y(self.x, before, self.z) {
+            Some(fy) if self.feet() >= fy && self.body.vy > 0.0 => {
+                self.y = fy - EYE;
+                self.body.vy = 0.0;
+                self.body.took_off = None;
+            }
+            // Pushed into rock somehow: stand where it was.
+            None => {
+                self.body.vy = 0.0;
+                self.body.took_off = None;
+            }
+            _ => {}
         }
     }
 }
@@ -314,6 +431,105 @@ impl Walker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::level::{Entity, EntityKind, Level};
+
+    /// A long room, 12 layers high, with the player at one end facing along it.
+    fn hall() -> (Scene, Walker) {
+        let mut l = Level::new("hall");
+        for z in 0..20 {
+            for x in 0..3 {
+                l.open(x, z, 0, 12);
+            }
+        }
+        l.entities.push(Entity { id: 1, kind: EntityKind::PlayerStart, pos: [1.5 * TF, 0.0, 1.5 * TF], yaw: 0.0 });
+        let scene = l.to_scene();
+        let w = Walker::at(&scene, [1.5 * TF, 0.0, 1.5 * TF], 0.0, &mut Rng::new(1)).expect("standing");
+        (scene, w)
+    }
+
+    #[test]
+    fn a_jump_rises_and_lands_where_it_started() {
+        let (scene, mut w) = hall();
+        let (standing, mut top) = (w.y, w.y);
+        w.jump(&scene);
+        assert!(w.airborne());
+        for _ in 0..40 {
+            w.drive(&scene, 0.0, 0.0, 0.0, 0.0);
+            top = top.min(w.y);
+        }
+        assert!(!w.airborne(), "still in the air");
+        assert_eq!(w.y, standing);
+        let height = (standing - top) / TF;
+        assert!((0.3..0.55).contains(&height), "jumped {height} tiles");
+    }
+
+    #[test]
+    fn no_second_jump_in_the_air() {
+        let (scene, mut w) = hall();
+        w.jump(&scene);
+        for _ in 0..3 {
+            w.drive(&scene, 0.0, 0.0, 0.0, 0.0);
+        }
+        let v = w.body.vy;
+        w.jump(&scene);
+        assert_eq!(w.body.vy, v);
+    }
+
+    #[test]
+    fn sprint_is_faster_and_stops_when_turning_fast() {
+        let (scene, mut w) = hall();
+        let z0 = w.z;
+        w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        let walked = w.z - z0;
+        w.start_sprint();
+        let z1 = w.z;
+        w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        assert!((w.z - z1) > walked * 1.5, "{} against {walked}", w.z - z1);
+        // Turning slowly keeps it going, and a fast turn ends it.
+        w.yaw += SPRINT_TURN * 0.5;
+        w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        assert!(w.sprinting());
+        w.yaw += SPRINT_TURN * 2.0;
+        w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        assert!(!w.sprinting());
+    }
+
+    #[test]
+    fn sprint_stops_with_the_walk() {
+        let (scene, mut w) = hall();
+        w.start_sprint();
+        w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        assert!(w.sprinting());
+        w.drive(&scene, 0.0, 0.0, 0.0, 0.0);
+        assert!(!w.sprinting());
+    }
+
+    #[test]
+    fn the_camera_bobs_only_while_walking() {
+        let (scene, mut w) = hall();
+        let standing = w.y;
+        let mut most = 0f32;
+        for _ in 0..30 {
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+            most = most.max(w.bob().abs());
+        }
+        assert!(most > BOB * 0.5, "bobbed {most}");
+        assert_eq!(w.y, standing, "the bob is the camera's, not the body's");
+        for _ in 0..60 {
+            w.drive(&scene, 0.0, 0.0, 0.0, 0.0);
+        }
+        assert!(w.bob().abs() < 0.1);
+    }
+
+    #[test]
+    fn step_keeps_the_camera_as_it_was() {
+        let (scene, mut w) = hall();
+        let mut rng = Rng::new(3);
+        for _ in 0..60 {
+            w.step(&scene, &mut rng);
+            assert_eq!(w.bob(), 0.0);
+        }
+    }
 
     /// Corridors plan their climbs, so every room should be walkable from the first.
     #[test]
