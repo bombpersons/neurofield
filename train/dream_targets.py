@@ -37,11 +37,8 @@ from PIL import Image
 from transformers import CLIPModel, CLIPTokenizer
 
 from creatures import composite
-from dream import NEGATIVE_ID, PALETTE, Q_PHRASE, VOCAB, DreamCrops, fields
+from dream import NEGATIVE_ID, NOISE_CHANNELS, PALETTE, Q_PHRASE, VOCAB, DreamCrops, fields, lighting
 from train_dream import BAND, CLIP, CORE, MEAN, STD, backdrops, cutouts, embed
-
-# Field channels: presence, then the part-fixed noise (dream.fields).
-NOISE_CHANNELS = slice(9, 17)
 
 
 class Pyramid(nn.Module):
@@ -57,10 +54,10 @@ class Pyramid(nn.Module):
         return sum(F.interpolate(p, size=(n, n), mode="bilinear", align_corners=False) for p in self.levels)
 
 
-def draw(o, presence, palette):
+def draw(o, presence, palette, light):
     """The net's drawing (DreamNet.forward) from its raw output `o` [b, PALETTE + 2, n, n]."""
     mix = torch.einsum("bkhw,bkc->bchw", torch.softmax(o[:, :PALETTE] * 3, 1), palette)
-    rgb = (mix * (0.35 + 1.3 * torch.sigmoid(o[:, PALETTE : PALETTE + 1] + 0.3))).clamp(0, 1)
+    rgb = (mix * (0.35 + 1.3 * torch.sigmoid(o[:, PALETTE : PALETTE + 1] + 0.3)) * light).clamp(0, 1)
     alpha = torch.sigmoid(10 * torch.tanh((o[:, PALETTE + 1 :] + 6 * presence - 3) / 10))
     return torch.cat([rgb, alpha], 1)
 
@@ -101,6 +98,7 @@ def optimise(clip, text, batch, steps, keep, cuts, amp, lr=0.03):
     feats, _, dmin, _ = fields(q, cam, palette, n)
     presence = feats[:, :1]
     noise = feats[:, NOISE_CHANNELS]
+    light = lighting(feats)
     # The fixed start: colour mix and shading from the part's noise (the same projection
     # for every crop and run).
     g = torch.Generator().manual_seed(0)
@@ -115,7 +113,7 @@ def optimise(clip, text, batch, steps, keep, cuts, amp, lr=0.03):
     near, far = (dmin < CORE)[:, None].float(), (dmin > BAND)[:, None].float()
     kept = []
     for step in range(steps + 1):
-        layer = draw(base + torch.cat([mix(), shade(), alpha()], 1), presence, palette)
+        layer = draw(base + torch.cat([mix(), shade(), alpha()], 1), presence, palette, light)
         if step in keep:
             kept.append(layer.detach())
         if step == steps:

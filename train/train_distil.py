@@ -77,7 +77,7 @@ class Targets(Dataset):
 
 class Trainer:
     def __init__(self, data, out, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.5, ema_decay=0.999,
-                 clip_from=None, cuts=4, part_weight=0.1, whole_weight=0.5, negative_weight=0.3):
+                 clip_from=None, cuts=4, part_weight=0.25, whole_weight=0.5, negative_weight=0.3, halo_weight=0.5):
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,7 +101,7 @@ class Trainer:
         self.position = torch.zeros(len(VOCAB), dtype=torch.long, device=self.device)
         self.position[self.candidates] = torch.arange(len(self.candidates), device=self.device)
         self.clip_from, self.cuts = clip_from, cuts
-        self.part_weight, self.whole_weight, self.negative_weight = part_weight, whole_weight, negative_weight
+        self.part_weight, self.whole_weight, self.negative_weight, self.halo_weight = part_weight, whole_weight, negative_weight, halo_weight
         self.model = DreamNet(text_dim=self.text.shape[1]).to(self.device)
         self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.99))
@@ -158,7 +158,10 @@ class Trainer:
             part_s, whole_s, neg, ce = scores(self.clip, self.text, self.candidates, self.position, composite(back, pred),
                                               q, whole, judged, self.cuts, self.amp)
             part_s = part_s.nan_to_num(0).sum() / (~part_s.isnan()).sum().clamp(min=1)
-            loss = loss + clip_weight * (self.part_weight * ce - self.whole_weight * whole_s.mean() + self.negative_weight * neg.mean())
+            # CLIP left horizontal streaks in the faint alpha round the creatures: keep it smooth there.
+            halo = (ta < 0.3).float()
+            streaks = ((pa[:, :, 1:] - pa[:, :, :-1]).abs() * halo[:, :, 1:]).mean() + ((pa[:, :, :, 1:] - pa[:, :, :, :-1]).abs() * halo[:, :, :, 1:]).mean()
+            loss = loss + clip_weight * (self.part_weight * ce - self.whole_weight * whole_s.mean() + self.negative_weight * neg.mean() + self.halo_weight * streaks)
             clip_terms = (ce, part_s, whole_s.mean(), neg.mean())
         return (loss, l1, perceptual, *clip_terms)
 

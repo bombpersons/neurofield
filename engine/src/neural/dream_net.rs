@@ -15,7 +15,7 @@ type Result<T> = std::result::Result<T, String>;
 const MAX_PARTS: usize = 96;
 const AXIS_POINTS: usize = 5;
 const PALETTE: usize = 12;
-const PHRASE_DIM: usize = 32;
+const PHRASE_DIM: usize = 64;
 /// dream.py's `Q_PARAMS`, and where its fields are.
 pub const Q_PARAMS: usize = 22;
 const Q_HALF: usize = 9;
@@ -25,10 +25,12 @@ const Q_PHRASE: usize = 19;
 const Q_SEED: usize = 20;
 const Q_VALID: usize = 21;
 /// Floats per part in `mem` (dream_net.wgsl).
-const PART_FLOATS: usize = 66;
+const PART_FLOATS: usize = 104;
 /// Planes the `dream_fields` kernel writes; the first `NET_IN` are the net's input.
-const FIELD_PLANES: usize = 79;
-const NET_IN: usize = 61;
+const FIELD_PLANES: usize = 117;
+const FIELDS: usize = 39;
+const NET_IN: usize = FIELDS + PHRASE_DIM;
+const PLANE_FOG: usize = 115;
 /// Floats per pixel of the finished layer: rgb, alpha, fog, depth.
 const LAYER: usize = 6;
 /// Of `Dream.forward`'s share of phrases, the part that dreams instead of following its motif.
@@ -36,8 +38,6 @@ const DREAM_SHARE: f32 = 0.25;
 const MAX_OPS: u64 = 128;
 const SLOT: u64 = 256;
 const GELU: u32 = 1;
-/// `Params.flags` of the fields and finish kernels (dream_net.wgsl).
-const SOLID: u32 = 1;
 /// Alpha at which the drawn layer starts and finishes being opaque (`edge`).
 const EDGE: (f32, f32) = (0.3, 0.7);
 
@@ -48,8 +48,10 @@ enum Kernel {
     Fields,
     Upsample,
     Finish,
+    Pool,
+    Film,
 }
-const KERNELS: [&str; 5] = ["conv3x3", "add", "dream_fields", "upsample2", "dream_finish"];
+const KERNELS: [&str; 7] = ["conv3x3", "add", "dream_fields", "upsample2", "dream_finish", "dream_pool2", "dream_film"];
 
 /// A convolution's weights in `mem`.
 #[derive(Clone, Copy)]
@@ -102,6 +104,7 @@ pub struct DreamNet {
     up: [Conv; 2],
     dec: [Vec<ResBlock>; 2],
     out: Conv,
+    film: [Conv; 3],
     phrases: Vec<f32>,
     kind_ids: Vec<f32>,
     kind_start: Vec<f32>,
@@ -141,6 +144,7 @@ impl DreamNet {
         let down = [conv(&mut t, "down.0")?, conv(&mut t, "down.1")?];
         let up = [conv(&mut t, "up.0")?, conv(&mut t, "up.1")?];
         let out = conv(&mut t, "out")?;
+        let film = [conv(&mut t, "film.0")?, conv(&mut t, "film.1")?, conv(&mut t, "film.2")?];
         drop(conv);
         let phrases = take(&mut t, "phrase")?.1;
         let kind_ids = take(&mut t, "kind_ids")?.1;
@@ -155,7 +159,7 @@ impl DreamNet {
         let scratch = parts_at + (MAX_PARTS * PART_FLOATS).div_ceil(64) as u32 * 64;
         // The planes of the biggest box: full, half and quarter size, and the layer.
         let plane = (MAX_W * H) as usize;
-        let planes = FIELD_PLANES + 6 + 144 + 96 + 48 + (224 + 192 + 96) / 4 + (128 + 256) / 16 + LAYER;
+        let planes = FIELD_PLANES + 6 + 144 + 96 + 48 + (224 + 192 + 96) / 4 + (128 + 256) / 16 + (PHRASE_DIM + 192) / 4 + (PHRASE_DIM + 256) / 16 + 96 + LAYER;
         let bytes = (scratch as u64 + (planes * plane) as u64 + 64 * 32) * 4;
 
         let instance = wgpu::Instance::default();
@@ -272,6 +276,7 @@ impl DreamNet {
             up,
             dec,
             out,
+            film,
             phrases,
             kind_ids,
             kind_start,
@@ -354,9 +359,8 @@ impl DreamNet {
 
     /// The layer of the parts `q` seen from a crop at (x0, y0), `w` x `h` (multiples of 4): each
     /// part is projected here and handed to the shaders with its phrase vector and scheme.
-    /// `solid`: as round limbs that hide each other and take light by their shape.
     #[allow(clippy::too_many_arguments)]
-    pub fn draw(&mut self, q: &[f32], palette: &[f32], cam: [f32; 6], x0: usize, y0: usize, w: usize, h: usize, solid: bool) -> Result<Layer> {
+    pub fn draw(&mut self, q: &[f32], palette: &[f32], cam: [f32; 6], x0: usize, y0: usize, w: usize, h: usize) -> Result<Layer> {
         let [vh, width, fog_near, fog_far, ..] = cam;
         let n = q.len() / Q_PARAMS;
         let mut rows = vec![0f32; n * PART_FLOATS];
@@ -378,7 +382,10 @@ impl DreamNet {
             row[18..21].copy_from_slice(&p[Q_LIGHT..Q_LIGHT + 3]);
             row[21] = p[Q_VALID];
             row[22..22 + PHRASE_DIM].copy_from_slice(&self.phrases[p[Q_PHRASE] as usize * PHRASE_DIM..][..PHRASE_DIM]);
-            row[54..54 + PALETTE].copy_from_slice(&palette[i * PALETTE..][..PALETTE]);
+            row[86..86 + PALETTE].copy_from_slice(&palette[i * PALETTE..][..PALETTE]);
+            let (ax, ay) = ([p[3], p[4], p[5]], [p[6], p[7], p[8]]);
+            row[98..101].copy_from_slice(&ax);
+            row[101..104].copy_from_slice(&[ax[1] * ay[2] - ax[2] * ay[1], ax[2] * ay[0] - ax[0] * ay[2], ax[0] * ay[1] - ax[1] * ay[0]]);
         }
         self.queue.write_buffer(&self.mem, self.parts_at as u64 * 4, bytemuck::cast_slice(&rows));
 
@@ -401,14 +408,15 @@ impl DreamNet {
         let (t1a, t1b) = (alloc(96, half), alloc(96, half));
         let (t2a, t2b) = (alloc(128, quarter), alloc(128, quarter));
         let (d0, d1) = (alloc(48, full), alloc(96, half));
+        let (emb1, emb2) = (alloc(PHRASE_DIM, half), alloc(PHRASE_DIM, quarter));
+        let (film0, film1, film2) = (alloc(96, full), alloc(192, half), alloc(256, quarter));
         let net_out = alloc(6, full);
         let layer = alloc(LAYER, full);
 
-        let flags = if solid { SOLID } else { 0 };
         let mut ops = Ops::default();
         ops.push(
             Kernel::Fields,
-            Params { m: h as u32, n: w as u32, k: n as u32, a_off: self.parts_at, c_off: fields, f0: vh, f1: fog_near, f2: fog_far, flags, ..Default::default() },
+            Params { m: h as u32, n: w as u32, k: n as u32, a_off: self.parts_at, c_off: fields, f0: vh, f1: fog_near, f2: fog_far, f3: width / 2.0, x0: x0 as u32, x1: y0 as u32, ..Default::default() },
             [w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1],
         );
         debug_assert_eq!(self.inp.cin as usize, NET_IN);
@@ -418,15 +426,21 @@ impl DreamNet {
         ops.blocks(&self.enc[1], x1p, t1a, t1b, half);
         ops.conv(self.down[1], x1p, x2p, quarter, GELU, 2);
         ops.blocks(&self.enc[2], x2p, t2a, t2b, quarter);
+        let emb0 = fields + (FIELDS * area(full)) as u32;
+        ops.pool(emb0, emb1, half, PHRASE_DIM as u32);
+        ops.pool(emb1, emb2, quarter, PHRASE_DIM as u32);
+        ops.film(self.film[2], emb2, film2, x2p, quarter);
         ops.upsample(x2p, u1, half, 128);
         ops.conv(self.up[1], u1, d1, half, GELU, 1);
         ops.blocks(&self.dec[1], d1, t1a, t1b, half);
+        ops.film(self.film[1], emb1, film1, d1, half);
         ops.upsample(d1, u0, full, 96);
         ops.conv(self.up[0], u0, d0, full, GELU, 1);
         ops.blocks(&self.dec[0], d0, t0a, t0b, full);
+        ops.film(self.film[0], emb0, film0, d0, full);
         ops.conv(self.out, d0, net_out, full, 0, 1);
         let pixels = area(full) as u32;
-        ops.push(Kernel::Finish, Params { m: pixels, a_off: net_out, b_off: fields, c_off: layer, flags, ..Default::default() }, [pixels.div_ceil(64), 1, 1]);
+        ops.push(Kernel::Finish, Params { m: pixels, a_off: net_out, b_off: fields, c_off: layer, ..Default::default() }, [pixels.div_ceil(64), 1, 1]);
         let data = self.run(&ops, layer, area(full) * LAYER)?;
         Ok(Layer { x0, y0, w, h, data })
     }
@@ -462,7 +476,7 @@ impl DreamNet {
             return Ok(None);
         }
         let camera = [vh, width as f32, cam.fog_near as f32 / T as f32, cam.fog_far as f32 / T as f32, 0.0, 0.0];
-        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0, true).map(Some)
+        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0).map(Some)
     }
 
     /// Compare the port with PyTorch on an `export_dream.py --fixture` crop: a line each for the
@@ -478,7 +492,7 @@ impl DreamNet {
         let valid = q.chunks_exact(Q_PARAMS).filter(|p| p[Q_VALID] > 0.0).count();
         let palette: Vec<f32> = (0..valid).flat_map(|_| scheme.iter().copied()).collect();
         let camera = [cam[2], cam[3], cam[4], cam[5], 0.0, 0.0];
-        let got = self.draw(&q[..valid * Q_PARAMS], &palette, camera, cam[0] as usize, cam[1] as usize, n, n, false)?;
+        let got = self.draw(&q[..valid * Q_PARAMS], &palette, camera, cam[0] as usize, cam[1] as usize, n, n)?;
         let want: Vec<f32> = (0..n * n).flat_map(|i| (0..4).map(|c| layer[c * n * n + i]).collect::<Vec<_>>()).collect();
         let mine: Vec<f32> = got.data.chunks_exact(LAYER).flat_map(|p| p[..4].to_vec()).collect();
         let planes = self.run(&Ops::default(), self.scratch, FIELD_PLANES * n * n)?;
@@ -494,8 +508,8 @@ impl DreamNet {
         for c in 0..feats.0[0] {
             report += &line(&format!("field {c}"), &planes[c * n * n..][..n * n], &feats.1[c * n * n..][..n * n]);
         }
-        report += &line("phrase vectors", &planes[29 * n * n..][..32 * n * n], &emb);
-        report += &line("fog", &planes[73 * n * n..][..n * n], &fog);
+        report += &line("phrase vectors", &planes[FIELDS * n * n..][..PHRASE_DIM * n * n], &emb);
+        report += &line("fog", &planes[PLANE_FOG * n * n..][..n * n], &fog);
         report += &line("layer", &mine, &want);
         Ok(report)
     }
@@ -566,6 +580,20 @@ impl Ops {
             let floats = b.b.cout as usize * size.0 * size.1;
             self.push(Kernel::Add, Params { m: floats as u32, a_off: tb, c_off: x, ..Default::default() }, [floats.div_ceil(64).min(65535) as u32, floats.div_ceil(65535 * 64) as u32, 1]);
         }
+    }
+
+    /// Halves `channels` planes at `a` to `size` (rows, columns).
+    fn pool(&mut self, a: u32, to: u32, size: (usize, usize), channels: u32) {
+        let p = Params { m: size.0 as u32, n: size.1 as u32, a_off: a, c_off: to, ..Default::default() };
+        self.push(Kernel::Pool, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, channels]);
+    }
+
+    /// DreamNet.modulate: the planes at `x` shaped by the phrase vectors at `emb`, with `to` for scratch.
+    fn film(&mut self, c: Conv, emb: u32, to: u32, x: u32, size: (usize, usize)) {
+        self.conv(c, emb, to, size, 0, 1);
+        let k = c.cout / 2;
+        let p = Params { m: size.0 as u32, n: size.1 as u32, k, a_off: x, b_off: to, ..Default::default() };
+        self.push(Kernel::Film, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, k]);
     }
 
     fn upsample(&mut self, a: u32, to: u32, size: (usize, usize), channels: u32) {
