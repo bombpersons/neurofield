@@ -12,7 +12,7 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, String>;
 
-const MAX_PARTS: usize = 32;
+const MAX_PARTS: usize = 96;
 const AXIS_POINTS: usize = 5;
 const PALETTE: usize = 12;
 const PHRASE_DIM: usize = 32;
@@ -316,7 +316,7 @@ impl DreamNet {
         parts
     }
 
-    /// The parts seen from `cam` on a screen `width` wide: up to MAX_PARTS, nearest first, as dream.py's q
+    /// The parts seen from `cam` on a screen `width` wide: up to MAX_PARTS, the biggest on screen first, as dream.py's q
     /// [n, Q_PARAMS], with their colour schemes [n, PALETTE].
     fn view(&self, parts: &Parts, cam: &Camera, width: u32) -> (Vec<f32>, Vec<f32>) {
         let m = view_matrix(cam);
@@ -331,7 +331,7 @@ impl DreamNet {
             let z = c[2].max(0.05);
             let (px, py, rp) = (c[0] / z * vh + width as f32 / 2.0, c[1] / z * vh + H as f32 / 2.0, 3.0 * reach / z * vh);
             if c[2] + reach > 0.05 && px + rp > 0.0 && px - rp < width as f32 && py + rp > 0.0 && py - rp < H as f32 {
-                near.push((c[0] * c[0] + c[1] * c[1] + c[2] * c[2], i, c));
+                near.push((-reach / z, i, c));
             }
         }
         near.sort_by(|a, b| a.0.total_cmp(&b.0));

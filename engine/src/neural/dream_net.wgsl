@@ -10,7 +10,7 @@ const PART_LIGHT: u32 = 18u;
 const PART_PHRASE: u32 = 22u;
 const PART_PALETTE: u32 = 54u;
 const PHRASE_DIM: u32 = 32u;
-const MAX_PARTS: u32 = 32u;
+const MAX_PARTS: u32 = 96u;
 const FIELDS: u32 = 29u; // dream.py FIELD_CHANNELS
 // Planes `fields` writes: the net's input (fields, then the phrase vectors), the nearest
 // part's colour scheme, its fog and its depth.
