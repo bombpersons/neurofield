@@ -17,7 +17,7 @@
 //!     again; Esc again quits)
 //!     Gamepad: left stick walk and strafe, right stick look, cross jump, L3 sprint,
 //!     R2 attack, circle use, d-pad use the hotbar, start pause
-//!     Debug keys: F1 network / rasteriser   F2 both side by side   F3 hurt   Tab auto-walk
+//!     Debug keys: F1 network / rasteriser   F2 both side by side   F3 be hit   Tab auto-walk
 //!     H show the effects panel   N new level   P pause
 //!     Debug on the pad, holding select: d-pad walk and turn, L2 sprint, triangle
 //!     network / rasteriser, square auto-walk, L1 / R1 strangeness down / up, circle
@@ -72,12 +72,28 @@ const LOOK: f32 = 1.2;
 /// Right stick look speed at full tilt: yaw and pitch units per second.
 const PAD_YAW: f32 = 2600.0;
 const PAD_PITCH: f32 = 1400.0;
+/// Affliction reaches the level in this many steps: each bakes the level's lights again.
+const AFFLICTION_STEPS: f32 = 50.0;
+/// Seconds the strangeness takes to drain away, or come back, under the network.
+const CALM_SECS: f32 = 1.5;
+/// Seconds the network's calm picture takes to fade to the plain one, and back.
+const FADE_SECS: f32 = 0.8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Network,
     Raster,
     Both,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Network => "network",
+            Mode::Raster => "rasteriser",
+            Mode::Both => "rasteriser | network",
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -95,13 +111,21 @@ struct Sim {
     tris: usize,
     /// The network's frame width, following the window's shape (`layout`).
     width: u32,
-    /// How strange levels are at their base (the egui slider; new levels keep it).
+    /// How strange the level is at its base, before affliction (the egui slider sets it).
     strangeness: f32,
+    /// The step of affliction the level was last lit for (`apply_affliction`).
+    applied: Option<i32>,
+    /// How much of the strangeness has drained away, 0..1, and after that how far the
+    /// network has faded to the plain picture, 0..1.
+    calm: f32,
+    veil: f32,
     /// A hand-built level being played, and where to start in it (else its player start).
     file: Option<PathBuf>,
     start: Option<([f32; 3], f32)>,
-    /// Bumped whenever the scene changes (new level, strangeness), so its meshes are rebuilt.
+    /// Bumped for a new level: its meshes are rebuilt and its creatures start afresh.
     version: u64,
+    /// Bumped when the level's lights are baked again, which its meshes will have to show.
+    look: u64,
     /// Keys picked up in this level: entity ids and names.
     held: Vec<(u32, String)>,
     /// What last happened (a door, a key), and seconds left to show it.
@@ -116,8 +140,55 @@ impl Sim {
     fn set_strangeness(&mut self, s: f32) {
         self.strangeness = s.clamp(0.0, 1.0);
         engine::world::scene::force_strangeness(Some(self.strangeness));
-        self.level.set_strangeness(self.strangeness);
-        self.version += 1;
+        self.applied = None;
+        self.apply_affliction();
+    }
+
+    /// Light the level for its base strangeness and the player's affliction, which takes
+    /// it from there towards fully strange. Only a new step of affliction does anything.
+    fn apply_affliction(&mut self) {
+        // A jump in the strangeness would show as it drains: it can wait until that's done.
+        if self.player.clarity > 0.0 && self.calm < 1.0 {
+            return;
+        }
+        let step = (self.player.affliction * AFFLICTION_STEPS).round() as i32;
+        if self.applied == Some(step) {
+            return;
+        }
+        self.applied = Some(step);
+        let base = self.strangeness;
+        self.level.set_strangeness(base + (1.0 - base) * step as f32 / AFFLICTION_STEPS);
+        self.look += 1;
+    }
+
+    /// What is on the screen, once any fade is over: with clarity, the dungeon as it is.
+    fn shown(&self) -> Mode {
+        if self.veil >= 1.0 && self.mode == Mode::Network { Mode::Raster } else { self.mode }
+    }
+
+    /// Whether the rasteriser is needed, showing through a fade as well.
+    fn raster_on(&self) -> bool {
+        self.shown() != Mode::Network || self.veil > 0.0
+    }
+
+    /// Clarity drains the strangeness with the network still drawing, then fades to the
+    /// plain picture; when it runs out, the same backwards.
+    fn fade(&mut self, dt: f32) {
+        let calm = self.calm;
+        if self.player.clarity > 0.0 {
+            if self.calm < 1.0 {
+                self.calm = (self.calm + dt / CALM_SECS).min(1.0);
+            } else {
+                self.veil = (self.veil + dt / FADE_SECS).min(1.0);
+            }
+        } else if self.veil > 0.0 {
+            self.veil = (self.veil - dt / FADE_SECS).max(0.0);
+        } else {
+            self.calm = (self.calm - dt / CALM_SECS).max(0.0);
+        }
+        if self.calm != calm {
+            self.level.set_strange_amount(1.0 - self.calm);
+        }
     }
 
     fn toggle_renderer(&mut self) {
@@ -133,20 +204,24 @@ impl Sim {
         }
     }
 
-    /// A new level, or the file again (it may have been edited), keeping strangeness.
+    /// A new level, or the file again (it may have been edited), its own strangeness
+    /// (a file keeps the slider's) with the player's affliction on top.
     fn reload(&mut self) {
         self.version += 1;
         self.held.clear();
         match &self.file {
             Some(f) => match load_level(f, self.start, &mut self.rng) {
-                Ok(mut level) => {
-                    level.set_strangeness(self.strangeness);
-                    self.level = level;
-                }
+                Ok(level) => self.level = level,
                 Err(e) => eprintln!("{e}"),
             },
-            None => self.level = Level::new(&mut self.rng),
+            None => {
+                self.level = Level::new(&mut self.rng);
+                self.strangeness = self.level.scene.strange.base;
+            }
         }
+        self.level.set_strange_amount(1.0 - self.calm);
+        self.applied = None;
+        self.apply_affliction();
     }
 
     fn say(&mut self, what: String) {
@@ -166,13 +241,15 @@ impl Sim {
     fn use_slot(&mut self, slot: usize) {
         if let Some(what) = self.player.use_slot(slot) {
             self.say(what);
+            self.apply_affliction();
         }
     }
 
-    /// Lose some health and mana, so the bars can be tried before anything can hurt.
+    /// What a hit will do, so it can all be tried before anything can hurt.
     fn debug_hurt(&mut self) {
         self.player.hurt(5);
         self.player.spend_mp(2);
+        self.player.afflict(0.1);
     }
 
     /// The walker's feet, and which way it faces in radians.
@@ -195,12 +272,13 @@ struct Frame(Handle<Image>);
 #[derive(Component)]
 struct NetworkSprite;
 
-/// The scene's meshes in psx-bevy, and the `Sim::version` they were built from,
+/// The scene's meshes in psx-bevy, and the versions of the scene they were built from,
 /// and the version of each moving part's meshes (`Scene::things`).
 #[derive(Resource, Default)]
 struct Parts {
     entities: Vec<Entity>,
-    version: Option<u64>,
+    /// `Sim::version` and `Sim::look`.
+    version: Option<(u64, u64)>,
     things: Vec<u32>,
 }
 
@@ -240,6 +318,14 @@ struct Report {
     attacking: bool,
     /// The walking bob's offset of the camera, in world units.
     bob: f32,
+    affliction: f32,
+    clarity: f32,
+    /// The level's strangeness at its base, affliction included, and the picture on show.
+    strangeness: f32,
+    shown: String,
+    /// How much of the strangeness has drained, and how far the plain picture has faded in.
+    calm: f32,
+    veil: f32,
 }
 
 fn main() {
@@ -352,9 +438,13 @@ fn main() {
             tris: 0,
             width: W,
             strangeness,
+            applied: Some(0),
+            calm: 0.0,
+            veil: 0.0,
             file,
             start,
             version: 0,
+            look: 0,
             held: Vec::new(),
             said: None,
             player: Player::new(),
@@ -668,10 +758,23 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         sprinting: sim.level.walker.sprinting(),
         attacking: sim.sword.swinging(),
         bob: sim.level.walker.bob(),
+        affliction: sim.player.affliction,
+        clarity: sim.player.clarity,
+        strangeness: sim.level.scene.strange.base,
+        shown: sim.shown().name().to_string(),
+        calm: sim.calm,
+        veil: sim.veil,
     };
     if sim.paused {
         return;
     }
+    let clear = sim.player.clarity > 0.0;
+    sim.player.update(1.0 / TICK as f32);
+    if clear && sim.player.clarity == 0.0 {
+        sim.say("the dream returns".to_string());
+    }
+    sim.fade(1.0 / TICK as f32);
+    sim.apply_affliction();
     if sim.level.scene.tick_things(1.0 / TICK as f32) {
         sim.level.things_moved();
     }
@@ -744,7 +847,7 @@ fn draw(
             sim.herd.update(&mut sim.level.scene, sim.version, dt);
         }
     }
-    if sim.mode != Mode::Raster {
+    if sim.shown() != Mode::Raster {
         let t0 = std::time::Instant::now();
         let width = sim.width;
         let mut tokens = sim.level.tokens_at(width);
@@ -769,14 +872,17 @@ fn draw(
 
 /// The scene's meshes, rebuilt when it changes.
 fn build_scene(mut commands: Commands, sim: Res<Sim>, mut parts: ResMut<Parts>, mut gfx: engine::render::Gfx) {
-    if parts.version == Some(sim.version) {
+    // With no strangeness in force the lights no longer depend on `look`.
+    let now = (sim.version, if sim.calm >= 1.0 { u64::MAX } else { sim.look });
+    // New lights can wait until the rasteriser is on show.
+    if parts.version == Some(now) || (parts.version.is_some_and(|v| v.0 == now.0) && !sim.raster_on()) {
         return;
     }
     for e in parts.entities.drain(..) {
         commands.entity(e).despawn();
     }
     parts.entities = engine::render::spawn(&mut commands, &mut gfx, &sim.level.scene);
-    parts.version = Some(sim.version);
+    parts.version = Some(now);
     parts.things = sim.level.scene.things.parts.iter().map(|p| p.version).collect();
 }
 
@@ -810,7 +916,7 @@ fn move_things(
 /// The level camera follows the walker; it rests while only the network is shown.
 fn raster_camera(sim: Res<Sim>, mut view: ResMut<engine::render::View>) {
     let cam = sim.level.walker.camera();
-    let v = engine::render::View { hidden: sim.mode == Mode::Network, ..engine::render::View::of(&sim.level.scene, &cam) };
+    let v = engine::render::View { hidden: !sim.raster_on(), ..engine::render::View::of(&sim.level.scene, &cam) };
     view.set_if_neq(v);
 }
 
@@ -845,9 +951,10 @@ fn layout(
     mut display: Query<(&Sprite, &mut Transform), (Without<NetworkSprite>, Without<HudSprite>)>,
 ) {
     let Ok(window) = window.single() else { return };
-    let frames = if sim.mode == Mode::Both { 2.0 } else { 1.0 };
+    let mode = sim.shown();
+    let frames = if mode == Mode::Both { 2.0 } else { 1.0 };
     let room = window.size() / Vec2::new(frames, 1.0);
-    let half = if sim.mode == Mode::Both { room.x / 2.0 } else { 0.0 };
+    let half = if mode == Mode::Both { room.x / 2.0 } else { 0.0 };
     // The rasteriser stays 4:3; the network is as wide as the window asks, within what it knows.
     let raster = fit_scale(room, Vec2::new(W as f32, H as f32));
     for (sprite, mut t) in &mut display {
@@ -867,10 +974,14 @@ fn layout(
     let Ok((mut ns, mut nt, mut nv)) = network.single_mut() else { return };
     ns.custom_size = Some(size * scale);
     nt.translation.x = half;
-    *nv = if sim.mode == Mode::Raster { Visibility::Hidden } else { Visibility::Visible };
+    *nv = if mode == Mode::Raster { Visibility::Hidden } else { Visibility::Visible };
+    let opaque = if sim.mode == Mode::Network { 1.0 - sim.veil } else { 1.0 };
+    if ns.color.alpha() != opaque {
+        ns.color = Color::WHITE.with_alpha(opaque);
+    }
     // The HUD sits on whichever picture is shown, at its resolution.
     if let Ok((mut hs, mut ht)) = hud.single_mut() {
-        if sim.mode == Mode::Raster {
+        if mode == Mode::Raster {
             hs.rect = Some(Rect::new(0.0, 0.0, W as f32, H as f32));
             hs.custom_size = Some(Vec2::new(W as f32, H as f32) * raster);
             ht.translation.x = 0.0;
@@ -888,7 +999,7 @@ fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut i
     if !sim.paused {
         sim.sword.update(time.delta_secs(), sim.level.walker.yaw);
     }
-    let width = if sim.mode == Mode::Raster { W } else { sim.width };
+    let width = if sim.shown() == Mode::Raster { W } else { sim.width };
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
     let state = HudState::of(&sim.player, width, sim.on_pad, yaw, sim.sword.pose(sim.level.walker.bob()));
     if hud.shown.as_ref() == Some(&state) {
@@ -922,11 +1033,7 @@ fn auto_screenshot(mut commands: Commands, time: Res<Time>, mut frames: Local<u3
 fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status>>) {
     let Ok(mut text) = text.single_mut() else { return };
     let fps = 1.0 / time.delta_secs().max(1e-6);
-    let mode = match sim.mode {
-        Mode::Network => "network",
-        Mode::Raster => "rasteriser",
-        Mode::Both => "rasteriser | network",
-    };
+    let mode = sim.shown().name();
     let walk = if sim.auto_walk { "auto-walk" } else { "walking" };
     let pause = if sim.paused { " | paused" } else { "" };
     let on = sim.effects.iter().flatten().count();
@@ -936,8 +1043,8 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
     };
     let said = sim.said.as_ref().map_or(String::new(), |s| format!("\n{}", s.0));
     text.0 = format!(
-        "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | {walk}{pause}{keys}\n\
+        "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | affliction {:.0}% | {walk}{pause}{keys}\n\
          mouse: look  rmb: attack  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  f1: switch  f2: both  f3: hurt  h: panel  esc: free mouse{said}",
-        sim.net_ms, sim.tris
+        sim.net_ms, sim.tris, sim.player.affliction * 100.0
     );
 }

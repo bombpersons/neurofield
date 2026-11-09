@@ -516,6 +516,7 @@ impl Level {
     fn strange(&self) -> Strange {
         let s = &self.strangeness;
         Strange {
+            amount: 1.0,
             base: 0.0,
             grad: [0.0; 2],
             centre: [0.0; 2],
@@ -750,6 +751,24 @@ mod tests {
         let s: Strangeness = ron::from_str(old).unwrap();
         let d = Strangeness::default();
         assert_eq!((s.morph, s.lurid, s.fog_ramp, s.light_hues), (d.morph, d.lurid, d.fog_ramp, d.light_hues));
+    }
+
+    /// With none of it in force a place is not strange at all, even one pinned strange.
+    #[test]
+    fn strange_amount_scales_everything() {
+        let mut l = Level::new("t");
+        for x in 0..4 {
+            l.open(x, 0, 0, 12);
+        }
+        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [4, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Pin(0.8)) });
+        let mut scene = l.to_scene();
+        let p = [1.5 * TF, -STEP as f32, 0.5 * TF];
+        let whole = scene.strangeness(p);
+        assert!(whole > 0.5);
+        scene.set_strange_amount(0.5);
+        assert!((scene.strangeness(p) - whole * 0.5).abs() < 1e-4);
+        scene.set_strange_amount(0.0);
+        assert_eq!(scene.strangeness(p), 0.0);
     }
 
     /// An area pins strangeness inside it, fading out over a tile outside, and

@@ -1,7 +1,7 @@
 //! The HUD, drawn pixel by pixel into an image at the network frame's own resolution, so
 //! it is as chunky as the picture under it and stays solid whichever renderer is on.
 
-use crate::player::{Item, Player, SLOTS};
+use crate::player::{Item, Player, CLARITY_SECS, SLOTS};
 use crate::sword::{self, Pose, ScreenTri};
 use psx_bevy::psx::font;
 
@@ -11,6 +11,8 @@ const GAP: i32 = 2;
 /// Bar length per point of health or mana, so a bigger pool is a longer bar.
 const BAR_UNIT: i32 = 2;
 const COMPASS_R: i32 = 14;
+/// Points in the bar of clarity left, each `BAR_UNIT` long.
+const CLARITY_POINTS: i32 = 24;
 /// Headings the compass can show: it redraws only when the needle really moves.
 pub const HEADINGS: i32 = 128;
 
@@ -20,6 +22,7 @@ const FRAME: Rgba = [205, 190, 150, 255];
 const DIM: Rgba = [205, 190, 150, 90];
 const HP: Rgba = [205, 35, 30, 255];
 const MP: Rgba = [50, 85, 225, 255];
+const CLARITY: Rgba = [205, 235, 230, 255];
 const WHITE: Rgba = [240, 235, 220, 255];
 
 /// All that the HUD shows; it is redrawn when this changes.
@@ -28,6 +31,8 @@ pub struct HudState {
     pub width: u32,
     pub hp: (i32, i32),
     pub mp: (i32, i32),
+    /// Points of clarity left, out of `CLARITY_POINTS`; none and the bar is gone.
+    pub clarity: i32,
     pub slots: [Option<(Item, u32)>; SLOTS],
     /// The hotbar as a diamond for the d-pad, or a column for keys 1-4.
     pub pad: bool,
@@ -42,6 +47,7 @@ impl HudState {
             width,
             hp: (p.hp, p.max_hp),
             mp: (p.mp, p.max_mp),
+            clarity: (p.clarity / CLARITY_SECS * CLARITY_POINTS as f32).ceil() as i32,
             slots: p.hotbar.map(|s| s.map(|i| (i, p.count(i)))),
             pad,
             heading: (yaw / std::f32::consts::TAU * HEADINGS as f32).round().rem_euclid(HEADINGS as f32) as i32,
@@ -158,6 +164,7 @@ impl Canvas<'_> {
         match item {
             Item::HealingPotion => self.flask(x, y, HP),
             Item::ManaPotion => self.flask(x, y, MP),
+            Item::ClarityPotion => self.flask(x, y, CLARITY),
         }
     }
 
@@ -229,6 +236,9 @@ pub fn draw(data: &mut [u8], stride: u32, h: u32, state: &HudState) {
     }
     c.bar(MARGIN + 1, MARGIN + 1, 5, state.hp, HP);
     c.bar(MARGIN + 1, MARGIN + 9, 3, state.mp, MP);
+    if state.clarity > 0 {
+        c.bar(MARGIN + 1, MARGIN + 15, 2, (state.clarity, CLARITY_POINTS), CLARITY);
+    }
     c.compass(state.heading);
     c.hotbar(state);
     c.spell();
@@ -283,6 +293,16 @@ mod tests {
         let d = drawn(&state());
         assert_eq!(at(&d, 9 + 20, 18), MP);
         assert_ne!(at(&d, 9 + 60, 18), MP);
+    }
+
+    #[test]
+    fn the_clarity_bar_shows_only_while_it_lasts() {
+        let mut s = state();
+        assert_ne!(at(&drawn(&s), 9 + 2, 24), CLARITY);
+        s.clarity = CLARITY_POINTS / 2;
+        let half = drawn(&s);
+        assert_eq!(at(&half, 9 + 2, 24), CLARITY);
+        assert_ne!(at(&half, 9 + CLARITY_POINTS as u32 + 4, 24), CLARITY);
     }
 
     #[test]

@@ -155,6 +155,8 @@ pub struct Strange {
     pub(crate) fog_ramp: (f32, f32),
     /// Hand-built levels: areas that add to or pin strangeness inside them.
     pub(crate) areas: Vec<StrangeArea>,
+    /// How much of all this is in force, 1 down to 0 (the dungeon as it really is).
+    pub(crate) amount: f32,
 }
 
 /// An area's say in strangeness: its box in world units (y down, so `lo` is the
@@ -237,6 +239,7 @@ impl Strange {
         }
         let light = |c: [f32; 3]| (c[0] + c[1] + c[2]) / 3.0;
         Strange {
+            amount: 1.0,
             base,
             grad: [a.cos() * slope, a.sin() * slope],
             centre: [w as f32 * TF / 2.0, d as f32 * TF / 2.0],
@@ -281,7 +284,7 @@ impl Strange {
                 s += (v - s) * a.weight(p);
             }
         }
-        s.clamp(0.0, 1.0)
+        s.clamp(0.0, 1.0) * self.amount
     }
 
     /// The painted lattice at lattice coordinates `q`, smooth between points.
@@ -771,6 +774,18 @@ impl Scene {
     /// drawn through the PS1 pipeline keep the colours they were made with.)
     pub fn set_strangeness(&mut self, base: f32) {
         self.strange.base = base;
+        self.bake_lights();
+        self.things.parts.iter_mut().for_each(|p| p.version += 1);
+    }
+
+    /// Fade the level's strangeness to `amount` of itself, baking its lights again to match.
+    /// Doors and the like keep the meshes they have until something else rebuilds them.
+    pub fn set_strange_amount(&mut self, amount: f32) {
+        self.strange.amount = amount;
+        self.bake_lights();
+    }
+
+    fn bake_lights(&mut self) {
         let mut tris = std::mem::take(&mut self.tris);
         for t in &mut tris {
             for v in &mut t.v {
@@ -785,7 +800,6 @@ impl Scene {
                     v.col = self.shade(v.p, t.n, t.tint);
                 }
             }
-            p.version += 1;
         }
         self.things.parts = parts;
         let lights: Vec<_> = self.flesh.light_at.iter().map(|&c| self.light_sh(c)).collect();
@@ -943,6 +957,7 @@ impl Scene {
             ambient: [0.2; 3],
             lights: Vec::new(),
             strange: Strange {
+                amount: 1.0,
                 base: 0.0,
                 grad: [0.0; 2],
                 centre: [0.0; 2],

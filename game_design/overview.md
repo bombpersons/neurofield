@@ -57,7 +57,10 @@ strange the dungeon is around them. The neural renderer already has a
 strangeness control (the `strangeness` slider in `game/`), and affliction is
 what drives it during play.
 
-- Potions, items and other things raise or lower affliction.
+- Affliction goes from none to full. It creeps up by itself while the player is
+  in the dungeon, taking about ten minutes from nothing to full.
+- It takes the level from its own strangeness towards fully strange.
+- Being hit raises it. Potions, items and other things raise or lower it too.
 - When strangeness gets very high, special enemies spawn from time to time and
   attack the player.
 - The renderer's dream effects show what is happening to the player:
@@ -71,9 +74,12 @@ what drives it during play.
 Some items let the player see the dungeon as it really is, drawn with the
 plain PSX renderer instead of the neural one.
 
-- **Clarity potion** (name WIP). For a short time, the whole dungeon is drawn
-  with the plain PSX renderer. It can be used from the inventory or the
-  hotbar.
+- **Clarity potion** (name WIP). For 20 seconds the player sees the dungeon as
+  it is. The strangeness drains away while the neural renderer is still drawing,
+  then the picture fades to the plain PSX renderer. When it runs out, the same
+  happens backwards. A pale bar under the MP bar shows the time left.
+  It lowers affliction by a quarter of the full amount, and affliction doesn't
+  rise while it lasts. It can be used from the inventory or the hotbar.
 - **Monocle.** A lens the player moves around the screen. Only the part of the
   screen inside the lens is drawn with the PSX renderer.
   - **Using it.** Hotbar only: it can't be used from the inventory screen. Put

@@ -108,6 +108,13 @@ impl Level {
         tri_features(&self.scene, &mut self.tris);
     }
 
+    /// Fade the level's strangeness to `amount` of itself (see `Scene::set_strange_amount`).
+    pub fn set_strange_amount(&mut self, amount: f32) {
+        self.scene.set_strange_amount(amount);
+        self.tris.clear();
+        tri_features(&self.scene, &mut self.tris);
+    }
+
     /// Redo the features of the doors, keys and levers after they moved.
     pub fn things_moved(&mut self) {
         self.tris.truncate(self.scene.tris.len() * features::TRI_FEATURES);
