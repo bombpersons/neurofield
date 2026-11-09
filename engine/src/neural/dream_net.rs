@@ -43,6 +43,11 @@ const ACCUMULATE: u32 = 2;
 const CROP_MARGIN: f32 = 2.5;
 /// Alpha at which the drawn layer starts and finishes being opaque (`edge`).
 const EDGE: (f32, f32) = (0.3, 0.7);
+/// Tiles of a crop the U-Net draws, in pixels of each of its scales: one workgroup.
+const TILE: usize = 16;
+/// How near a part a tile must be to be drawn: `TILE_MARGIN` radii and `TILE_PAD` pixels.
+const TILE_MARGIN: f32 = 1.75;
+const TILE_PAD: f32 = 8.0;
 
 #[derive(Clone, Copy)]
 enum Kernel {
@@ -52,8 +57,9 @@ enum Kernel {
     Finish,
     Pool,
     Film,
+    Clear,
 }
-const KERNELS: [&str; 6] = ["conv3x3", "dream_fields", "upsample2", "dream_finish", "dream_pool2", "dream_film"];
+const KERNELS: [&str; 7] = ["conv3x3", "dream_fields", "upsample2", "dream_finish", "dream_pool2", "dream_film", "dream_clear"];
 
 /// A convolution's weights in `mem`.
 #[derive(Clone, Copy)]
@@ -99,6 +105,7 @@ pub struct DreamNet {
     readback: wgpu::Buffer,
     /// In `mem`: the parts of this frame, and where the frame's planes may start.
     parts_at: u32,
+    tiles_at: u32,
     scratch: u32,
     inp: Conv,
     enc: [Vec<ResBlock>; 3],
@@ -158,7 +165,10 @@ impl DreamNet {
         }
 
         let parts_at = (data.len().div_ceil(64) * 64) as u32;
-        let scratch = parts_at + (MAX_PARTS * PART_FLOATS).div_ceil(64) as u32 * 64;
+        let tiles_at = parts_at + (MAX_PARTS * PART_FLOATS).div_ceil(64) as u32 * 64;
+        // Each scale's tiles, drawn or cleared, as column and row.
+        let tile_floats = 3 * 2 * (MAX_W as usize).div_ceil(TILE) * (H as usize).div_ceil(TILE);
+        let scratch = tiles_at + tile_floats.div_ceil(64) as u32 * 64;
         // The planes of the biggest box: full, half and quarter size, and the layer.
         let plane = (MAX_W * H) as usize;
         let planes = FIELD_PLANES + 6 + 144 + 96 + 48 + (224 + 192 + 96) / 4 + (128 + 256) / 16 + (PHRASE_DIM + 192) / 4 + (PHRASE_DIM + 256) / 16 + 96 + LAYER;
@@ -271,6 +281,7 @@ impl DreamNet {
             bind,
             readback,
             parts_at,
+            tiles_at,
             scratch,
             inp,
             enc,
@@ -361,8 +372,9 @@ impl DreamNet {
 
     /// The layer of the parts `q` seen from a crop at (x0, y0), `w` x `h` (multiples of 4): each
     /// part is projected here and handed to the shaders with its phrase vector and scheme.
+    /// `drawn` limits the net to those of the crop's tiles, row by row (`tile_grid`).
     #[allow(clippy::too_many_arguments)]
-    pub fn draw(&mut self, q: &[f32], palette: &[f32], cam: [f32; 6], x0: usize, y0: usize, w: usize, h: usize) -> Result<Layer> {
+    pub fn draw(&mut self, q: &[f32], palette: &[f32], cam: [f32; 6], x0: usize, y0: usize, w: usize, h: usize, drawn: Option<&[bool]>) -> Result<Layer> {
         let [vh, width, fog_near, fog_far, ..] = cam;
         let n = q.len() / Q_PARAMS;
         let mut rows = vec![0f32; n * PART_FLOATS];
@@ -393,31 +405,49 @@ impl DreamNet {
 
         let (full, half, quarter) = ((h, w), (h / 2, w / 2), (h / 4, w / 4));
         let area = |s: (usize, usize)| s.0 * s.1;
+        // Each scale's planes together, those only ever read at their own pixel last: `Clear`
+        // does the rest in one go. Each skip's planes come right after the planes upsampled to
+        // join them, as `up` reads both.
         let mut at = self.scratch as usize;
         let mut alloc = |planes: usize, size: (usize, usize)| {
             let o = at as u32;
-            at += (planes * area(size)).div_ceil(64) * 64;
+            at += planes * area(size);
             o
         };
         let fields = alloc(FIELD_PLANES, full);
-        // Each skip's planes right after the planes upsampled to join them, as `up` reads both.
         let u0 = alloc(96 + 48, full);
         let x0p = u0 + (96 * area(full)) as u32;
+        let (t0, d0, film0, net_out) = (alloc(48, full), alloc(48, full), alloc(96, full), alloc(6, full));
         let u1 = alloc(128 + 96, half);
         let x1p = u1 + (128 * area(half)) as u32;
-        let x2p = alloc(128, quarter);
-        let (t0, t1, t2) = (alloc(48, full), alloc(96, half), alloc(128, quarter));
-        let (d0, d1) = (alloc(48, full), alloc(96, half));
-        let (emb1, emb2) = (alloc(PHRASE_DIM, half), alloc(PHRASE_DIM, quarter));
-        let (film0, film1, film2) = (alloc(96, full), alloc(192, half), alloc(256, quarter));
-        let net_out = alloc(6, full);
+        let (t1, d1, emb1, film1) = (alloc(96, half), alloc(96, half), alloc(PHRASE_DIM, half), alloc(192, half));
+        let (x2p, t2, emb2, film2) = (alloc(128, quarter), alloc(128, quarter), alloc(PHRASE_DIM, quarter), alloc(256, quarter));
         let layer = alloc(LAYER, full);
+        let scales = [(fields, film0, full), (u1, film1, half), (x2p, film2, quarter)];
 
-        let mut ops = Ops::default();
+        let mut ops = Ops { sizes: [full, half, quarter], ..Default::default() };
+        if let Some(drawn) = drawn {
+            let lists = tile_lists(drawn, full);
+            let mut floats = Vec::new();
+            for (s, (draw, clear)) in lists.iter().enumerate() {
+                let (from, to, size) = scales[s];
+                let at = |floats: &Vec<f32>| self.tiles_at + floats.len() as u32;
+                ops.tiles[s] = (at(&floats), draw.len() as u32);
+                floats.extend(draw.iter().flat_map(|t| [t.0 as f32, t.1 as f32]));
+                let list = at(&floats);
+                floats.extend(clear.iter().flat_map(|t| [t.0 as f32, t.1 as f32]));
+                if !clear.is_empty() {
+                    let k = (to - from) / area(size) as u32;
+                    ops.push(Kernel::Clear, Params { m: size.0 as u32, n: size.1 as u32, k, c_off: from, x2: list, ..Default::default() }, [clear.len() as u32, 1, 1]);
+                }
+            }
+            self.queue.write_buffer(&self.mem, self.tiles_at as u64 * 4, bytemuck::cast_slice(&floats));
+        }
+        let (x2, groups) = ops.groups(full, 1);
         ops.push(
             Kernel::Fields,
-            Params { m: h as u32, n: w as u32, k: n as u32, a_off: self.parts_at, c_off: fields, f0: vh, f1: fog_near, f2: fog_far, f3: width / 2.0, x0: x0 as u32, x1: y0 as u32, ..Default::default() },
-            [w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1],
+            Params { m: h as u32, n: w as u32, k: n as u32, a_off: self.parts_at, c_off: fields, f0: vh, f1: fog_near, f2: fog_far, f3: width / 2.0, x0: x0 as u32, x1: y0 as u32, x2, ..Default::default() },
+            groups,
         );
         debug_assert_eq!(self.inp.cin as usize, NET_IN);
         ops.conv(self.inp, fields, x0p, full, 0, 1);
@@ -439,9 +469,17 @@ impl DreamNet {
         ops.blocks(&self.dec[0], d0, t0, full);
         ops.film(self.film[0], emb0, film0, d0, full);
         ops.conv(self.out, d0, net_out, full, 0, 1);
-        let pixels = area(full) as u32;
-        ops.push(Kernel::Finish, Params { m: pixels, a_off: net_out, b_off: fields, c_off: layer, ..Default::default() }, [pixels.div_ceil(64), 1, 1]);
-        let data = self.run(&ops, layer, area(full) * LAYER)?;
+        let (x2, groups) = ops.groups(full, 1);
+        ops.push(Kernel::Finish, Params { m: h as u32, n: w as u32, a_off: net_out, b_off: fields, c_off: layer, x2, ..Default::default() }, groups);
+        let mut data = self.run(&ops, layer, area(full) * LAYER)?;
+        // Nothing was drawn in the other tiles: what is there is left from earlier frames.
+        if let Some(drawn) = drawn {
+            for (i, px) in data.chunks_exact_mut(LAYER).enumerate() {
+                if !drawn[(i / w / TILE) * w.div_ceil(TILE) + i % w / TILE] {
+                    px[3] = 0.0;
+                }
+            }
+        }
         Ok(Layer { x0, y0, w, h, data })
     }
 
@@ -476,7 +514,8 @@ impl DreamNet {
             return Ok(None);
         }
         let camera = [vh, width as f32, cam.fog_near as f32 / T as f32, cam.fog_far as f32 / T as f32, 0.0, 0.0];
-        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0).map(Some)
+        let drawn = tile_grid(&q, vh, width as f32, x0, y0, x1 - x0, y1 - y0);
+        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0, Some(&drawn)).map(Some)
     }
 
     /// Compare the port with PyTorch on an `export_dream.py --fixture` crop: a line each for the
@@ -492,7 +531,7 @@ impl DreamNet {
         let valid = q.chunks_exact(Q_PARAMS).filter(|p| p[Q_VALID] > 0.0).count();
         let palette: Vec<f32> = (0..valid).flat_map(|_| scheme.iter().copied()).collect();
         let camera = [cam[2], cam[3], cam[4], cam[5], 0.0, 0.0];
-        let got = self.draw(&q[..valid * Q_PARAMS], &palette, camera, cam[0] as usize, cam[1] as usize, n, n)?;
+        let got = self.draw(&q[..valid * Q_PARAMS], &palette, camera, cam[0] as usize, cam[1] as usize, n, n, None)?;
         let want: Vec<f32> = (0..n * n).flat_map(|i| (0..4).map(|c| layer[c * n * n + i]).collect::<Vec<_>>()).collect();
         let mine: Vec<f32> = got.data.chunks_exact(LAYER).flat_map(|p| p[..4].to_vec()).collect();
         let planes = self.run(&Ops::default(), self.scratch, FIELD_PLANES * n * n)?;
@@ -547,6 +586,10 @@ impl DreamNet {
 #[derive(Default)]
 struct Ops {
     list: Vec<(Kernel, Params, [u32; 3])>,
+    /// (rows, columns) of the net's three scales, and where each's list of tiles to draw is
+    /// and how long, with (0, 0) for every tile.
+    sizes: [(usize, usize); 3],
+    tiles: [(u32, u32); 3],
 }
 
 impl Ops {
@@ -554,8 +597,18 @@ impl Ops {
         self.list.push((kernel, p, groups));
     }
 
+    /// The tile list (`x2`) for planes of `size`, and the dispatch for `depth` of them.
+    fn groups(&self, size: (usize, usize), depth: u32) -> (u32, [u32; 3]) {
+        let scale = self.sizes.iter().position(|s| *s == size).expect("one of the net's scales");
+        match self.tiles[scale] {
+            (0, _) => (0, [size.1.div_ceil(TILE) as u32, size.0.div_ceil(TILE) as u32, depth]),
+            (list, n) => (list, [n, 1, depth]),
+        }
+    }
+
     /// C = act(conv(A)) with C of `size` (rows, columns); A is `step` times bigger each way.
     fn conv(&mut self, c: Conv, a: u32, to: u32, size: (usize, usize), flags: u32, step: u32) {
+        let (x2, groups) = self.groups(size, c.cout.div_ceil(8));
         let p = Params {
             m: size.0 as u32,
             n: size.1 as u32,
@@ -567,9 +620,10 @@ impl Ops {
             flags,
             x0: c.cout,
             x1: step,
+            x2,
             ..Default::default()
         };
-        self.push(Kernel::Conv3x3, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, c.cout.div_ceil(8)]);
+        self.push(Kernel::Conv3x3, p, groups);
     }
 
     /// Residual blocks on the planes at `x` (train/creatures.py Block), with `ta` for scratch.
@@ -582,22 +636,109 @@ impl Ops {
 
     /// Halves `channels` planes at `a` to `size` (rows, columns).
     fn pool(&mut self, a: u32, to: u32, size: (usize, usize), channels: u32) {
-        let p = Params { m: size.0 as u32, n: size.1 as u32, a_off: a, c_off: to, ..Default::default() };
-        self.push(Kernel::Pool, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, channels]);
+        let (x2, groups) = self.groups(size, channels);
+        let p = Params { m: size.0 as u32, n: size.1 as u32, a_off: a, c_off: to, x2, ..Default::default() };
+        self.push(Kernel::Pool, p, groups);
     }
 
     /// DreamNet.modulate: the planes at `x` shaped by the phrase vectors at `emb`, with `to` for scratch.
     fn film(&mut self, c: Conv, emb: u32, to: u32, x: u32, size: (usize, usize)) {
         self.conv(c, emb, to, size, 0, 1);
         let k = c.cout / 2;
-        let p = Params { m: size.0 as u32, n: size.1 as u32, k, a_off: x, b_off: to, ..Default::default() };
-        self.push(Kernel::Film, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, k]);
+        let (x2, groups) = self.groups(size, k);
+        let p = Params { m: size.0 as u32, n: size.1 as u32, k, a_off: x, b_off: to, x2, ..Default::default() };
+        self.push(Kernel::Film, p, groups);
     }
 
     fn upsample(&mut self, a: u32, to: u32, size: (usize, usize), channels: u32) {
-        let p = Params { m: size.0 as u32, n: size.1 as u32, a_off: a, c_off: to, ..Default::default() };
-        self.push(Kernel::Upsample, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, channels]);
+        let (x2, groups) = self.groups(size, channels);
+        let p = Params { m: size.0 as u32, n: size.1 as u32, a_off: a, c_off: to, x2, ..Default::default() };
+        self.push(Kernel::Upsample, p, groups);
     }
+}
+
+/// Which of the `TILE`-sized tiles of a crop are near enough a part in `q` to need drawing,
+/// row by row. Further out nothing shows, and the net can treat it as beyond the crop's edge.
+fn tile_grid(q: &[f32], vh: f32, width: f32, x0: usize, y0: usize, w: usize, h: usize) -> Vec<bool> {
+    let (cols, rows) = (w.div_ceil(TILE), h.div_ceil(TILE));
+    let mut drawn = vec![false; cols * rows];
+    let reach = TILE as f32 * std::f32::consts::FRAC_1_SQRT_2;
+    for p in q.chunks_exact(Q_PARAMS) {
+        let hy = p[Q_HALF + 1];
+        let radius = 0.5 * (p[Q_HALF] + p[Q_HALF + 2]);
+        let axis = |k: usize| {
+            let t = -1.0 + 0.5 * k as f32;
+            let s = (t + 1.0) / 2.0;
+            let point = [0, 1, 2].map(|c| p[c] + p[6 + c] * hy * t + p[3 + c] * p[Q_BEND] * hy * s * s);
+            let z = point[2].max(0.05);
+            [point[0] / z * vh + width / 2.0 - x0 as f32, point[1] / z * vh + H as f32 / 2.0 - y0 as f32, z]
+        };
+        for k in 0..AXIS_POINTS - 1 {
+            let (a, b) = (axis(k), axis(k + 1));
+            let ab = [b[0] - a[0], b[1] - a[1]];
+            let far = TILE_MARGIN * radius * vh / a[2].min(b[2]) + TILE_PAD + reach;
+            let span = |lo: f32, hi: f32, n: usize| {
+                let from = ((lo - far) / TILE as f32).floor().clamp(0.0, n as f32) as usize;
+                from..((hi + far) / TILE as f32).ceil().clamp(0.0, n as f32) as usize
+            };
+            for row in span(a[1].min(b[1]), a[1].max(b[1]), rows) {
+                for col in span(a[0].min(b[0]), a[0].max(b[0]), cols) {
+                    let c = [(col * TILE) as f32 + TILE as f32 / 2.0 - a[0], (row * TILE) as f32 + TILE as f32 / 2.0 - a[1]];
+                    let u = ((c[0] * ab[0] + c[1] * ab[1]) / (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-6)).clamp(0.0, 1.0);
+                    let r = TILE_MARGIN * radius * vh / (a[2] + u * (b[2] - a[2])) + TILE_PAD + reach;
+                    if (c[0] - u * ab[0]).powi(2) + (c[1] - u * ab[1]).powi(2) <= r * r {
+                        drawn[row * cols + col] = true;
+                    }
+                }
+            }
+        }
+    }
+    drawn
+}
+
+/// For each of the net's three scales, the tiles to draw and the tiles to clear for them.
+/// A tile is drawn at a scale if any it covers at the scale above is; those to clear are
+/// all a drawn tile reads besides: its neighbours, and at the scale above what it covers.
+fn tile_lists(drawn: &[bool], full: (usize, usize)) -> [(Vec<(usize, usize)>, Vec<(usize, usize)>); 3] {
+    let grid = |scale: usize| ((full.1 >> scale).div_ceil(TILE), (full.0 >> scale).div_ceil(TILE));
+    let mut on = [drawn.to_vec(), Vec::new(), Vec::new()];
+    for s in 1..3 {
+        let ((above_cols, above_rows), (cols, rows)) = (grid(s - 1), grid(s));
+        let mut here = vec![false; cols * rows];
+        for row in 0..above_rows {
+            for col in 0..above_cols {
+                if on[s - 1][row * above_cols + col] {
+                    here[row / 2 * cols + col / 2] = true;
+                }
+            }
+        }
+        on[s] = here;
+    }
+    std::array::from_fn(|s| {
+        let (cols, rows) = grid(s);
+        let mut read = on[s].clone();
+        if s < 2 {
+            let (below_cols, below_rows) = grid(s + 1);
+            for row in 0..rows {
+                for col in 0..cols {
+                    read[row * cols + col] |= row / 2 < below_rows && col / 2 < below_cols && on[s + 1][row / 2 * below_cols + col / 2];
+                }
+            }
+        }
+        let (mut draw, mut clear) = (Vec::new(), Vec::new());
+        for row in 0..rows {
+            for col in 0..cols {
+                let touched = (row.saturating_sub(1)..(row + 2).min(rows))
+                    .any(|r| (col.saturating_sub(1)..(col + 2).min(cols)).any(|c| read[r * cols + c]));
+                if on[s][row * cols + col] {
+                    draw.push((col, row));
+                } else if touched {
+                    clear.push((col, row));
+                }
+            }
+        }
+        (draw, clear)
+    })
 }
 
 /// Each pixel's camera-space depth (in tiles) of the nearest level triangle, [H][width].
@@ -727,5 +868,46 @@ impl DreamLayer {
             composite(rgb, &layer, &depth, scene.fog_colour(cam.pos), width as usize);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_drawn_tile_has_its_parents_drawn_and_what_they_read_cleared() {
+        // A crop of 8 x 4 tiles at full size with one drawn, at column 5, row 1.
+        let mut drawn = vec![false; 32];
+        drawn[8 + 5] = true;
+        let [(full, clear), (half, half_clear), (quarter, _)] = tile_lists(&drawn, (64, 128));
+        assert_eq!(full, [(5, 1)]);
+        assert_eq!(half, [(2, 0)]);
+        assert_eq!(quarter, [(1, 0)]);
+        // Round the tile, and everything round the four its parent covers (columns 4 and 5,
+        // rows 0 and 1), since the parent's strided convolution reads those.
+        for tile in [(4, 2), (6, 0), (6, 2), (3, 0), (3, 2)] {
+            assert!(clear.contains(&tile), "{tile:?}");
+        }
+        assert!(!clear.contains(&(5, 1)));
+        assert!(!clear.contains(&(1, 1)));
+        assert!(half_clear.contains(&(1, 0)) && half_clear.contains(&(3, 1)));
+    }
+
+    #[test]
+    fn tiles_are_drawn_near_a_part_only() {
+        // One straight part down the middle of a crop 160 x 64, a tile's depth away.
+        let mut q = vec![0.0; Q_PARAMS];
+        q[2] = 1.0;
+        q[7] = 1.0;
+        q[Q_HALF] = 0.01;
+        q[Q_HALF + 1] = 0.05;
+        q[Q_HALF + 2] = 0.01;
+        let vh = 160.0;
+        let (x0, y0) = (80, 88);
+        let drawn = tile_grid(&q, vh, 320.0, x0, y0, 160, 64);
+        let row: Vec<bool> = (0..10).map(|c| drawn[10 + c]).collect();
+        assert!(row[4] && row[5]);
+        assert!(!row[0] && !row[9]);
     }
 }

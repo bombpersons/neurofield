@@ -169,8 +169,9 @@ fn skin(l: Limb, base: u32, girth: vec3<f32>) -> Skin {
 // width; x0, x1: the crop's corner on the screen.
 @compute @workgroup_size(16, 16)
 fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
+    let place = tile_pixel(gid);
+    let x = place.x;
+    let y = place.y;
     if (x >= p.n || y >= p.m) { return; }
     let plane = p.m * p.n;
     let pixel = y * p.n + x;
@@ -282,11 +283,21 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     mem[p.c_off + PLANE_DEPTH * plane + pixel] = mix(near_surface, zs[partner], t);
 }
 
+// Zeroes planes [k][m][n] at c_off in the tiles at x2: what the drawn tiles read past their
+// edges, as the convolutions read zeros past the edge of the crop.
+@compute @workgroup_size(16, 16)
+fn dream_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let place = tile_pixel(gid);
+    if (place.x >= p.n || place.y >= p.m) { return; }
+    for (var c = 0u; c < p.k; c++) { mem[p.c_off + c * p.m * p.n + place.y * p.n + place.x] = 0.0; }
+}
+
 // Doubles k planes at a_off to [k][m][n] at c_off, as F.interpolate(bilinear, align_corners=False).
 @compute @workgroup_size(16, 16)
 fn upsample2(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
+    let place = tile_pixel(gid);
+    let x = place.x;
+    let y = place.y;
     let c = gid.z;
     if (x >= p.n || y >= p.m) { return; }
     let hm = i32(p.m / 2u);
@@ -308,8 +319,9 @@ fn upsample2(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Halves planes [z][2m][2n] at a_off to [z][m][n] at c_off, as F.avg_pool2d(2); z per dispatch depth.
 @compute @workgroup_size(16, 16)
 fn dream_pool2(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
+    let place = tile_pixel(gid);
+    let x = place.x;
+    let y = place.y;
     if (x >= p.n || y >= p.m) { return; }
     let wide = p.n * 2u;
     let src = p.a_off + gid.z * p.m * 2u * wide;
@@ -320,9 +332,10 @@ fn dream_pool2(@builtin(global_invocation_id) gid: vec3<u32>) {
 // DreamNet.film in place on planes [z][m][n] at a_off: x * (1 + g) + b, with g then b, [2z][m][n], at b_off.
 @compute @workgroup_size(16, 16)
 fn dream_film(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= p.n || gid.y >= p.m) { return; }
+    let place = tile_pixel(gid);
+    if (place.x >= p.n || place.y >= p.m) { return; }
     let plane = p.m * p.n;
-    let pixel = gid.y * p.n + gid.x;
+    let pixel = place.y * p.n + place.x;
     let at = p.a_off + gid.z * plane + pixel;
     let g = mem[p.b_off + gid.z * plane + pixel];
     let b = mem[p.b_off + (p.k + gid.z) * plane + pixel];
@@ -330,12 +343,13 @@ fn dream_film(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // The net's last step (DreamNet.forward): out [6][plane] at a_off and the fields' planes at
-// b_off to [plane][6] at c_off (rgb, alpha, fog, depth). m: pixels.
-@compute @workgroup_size(64)
+// b_off to [plane][6] at c_off (rgb, alpha, fog, depth).
+@compute @workgroup_size(16, 16)
 fn dream_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.m) { return; }
-    let plane = p.m;
+    let place = tile_pixel(gid);
+    if (place.x >= p.n || place.y >= p.m) { return; }
+    let plane = p.m * p.n;
+    let i = place.y * p.n + place.x;
     let o = p.a_off;
     var w = vec4<f32>(mem[o + i], mem[o + plane + i], mem[o + 2u * plane + i], mem[o + 3u * plane + i]) * 3.0;
     w = exp(w - max(max(w.x, w.y), max(w.z, w.w)));

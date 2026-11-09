@@ -276,14 +276,23 @@ fn transpose(@builtin(global_invocation_id) gid: vec3<u32>) {
 // of its 3x3 neighbourhood, with the group's weights for 32 input channels at a time in
 // workgroup memory.
 
+// The pixel of a 16x16-workgroup thread. x2, when not 0, is a list in `mem` of the tiles to
+// draw (each its column and row of tiles), and the dispatch's x is the place in that list.
+fn tile_pixel(gid: vec3<u32>) -> vec2<u32> {
+    if (p.x2 == 0u) { return gid.xy; }
+    let tile = p.x2 + gid.x / 16u * 2u;
+    return vec2<u32>(u32(mem[tile]) * 16u + gid.x % 16u, u32(mem[tile + 1u]) * 16u + gid.y % 16u);
+}
+
 var<workgroup> cw: array<vec4<f32>, 576>; // [ci < 32][tap 9][2]: 8 output channels' weights
 
 @compute @workgroup_size(16, 16)
 fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let co0 = wg.z * 8u;
     let cout = p.x0;
-    let x = gid.x;
-    let y = gid.y;
+    let pixel = tile_pixel(gid);
+    let x = pixel.x;
+    let y = pixel.y;
     let live = x < p.n && y < p.m;
     let plane = p.m * p.n;
     // x1 > 1: a strided convolution, reading a plane x1 times the size each way.
