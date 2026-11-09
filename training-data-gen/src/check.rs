@@ -62,7 +62,8 @@ pub fn dream_check(opts: &HashMap<String, String>) {
 }
 
 /// `datagen dream-walk`: frames of a camera swinging round a creature, the level network with the
-/// dream creatures over it, as `out/frame_NNNNN.png`.
+/// dream creatures over it, as `out/frame_NNNNN.png`. With `--animate 1` the creatures move and
+/// the camera follows the one it is watching.
 pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
     use engine::neural::dream::Dream;
     use engine::neural::dream_net::DreamLayer;
@@ -78,23 +79,28 @@ pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
     let mut net = Network::load(&model);
     let mut layer = DreamLayer::load(dream, seed).expect("loading the dream net");
     let mut rng = Rng::new(seed);
-    let level = Level::new(&mut rng);
+    let mut level = Level::new(&mut rng);
     let which = opts.get("creature").map_or(0, |c| c.parse().expect("--creature is a number"));
-    let (creature, start) = level
-        .scene
-        .creatures
-        .iter()
-        .cycle()
-        .skip(which)
-        .take(level.scene.creatures.len())
-        .find_map(|c| level.walker.view_of(&level.scene, c, &mut rng).map(|cam| (c, cam)))
+    let creatures = level.scene.creatures.len();
+    let (watched, start) = (0..creatures)
+        .map(|k| (which + k) % creatures)
+        .find_map(|i| level.walker.view_of(&level.scene, &level.scene.creatures[i], &mut rng).map(|cam| (i, cam)))
         .expect("no creature can be seen");
-    let (cx, cz) = (creature.base[0], creature.base[2]);
+    let (cx, cz) = (level.scene.creatures[watched].base[0], level.scene.creatures[watched].base[2]);
     let (dx, dz) = (start.pos[0] as f32 - cx, start.pos[2] as f32 - cz);
     let radius = (dx * dx + dz * dz).sqrt();
     let angle = dz.atan2(dx);
     let (mut net_ms, mut dream_ms) = (Vec::new(), Vec::new());
+    let animate = opts.contains_key("animate");
+    let mut herd = engine::world::animate::Herd::default();
     for f in 0..frames {
+        if animate {
+            herd.update(&mut level.scene, 0, 1.0 / 30.0);
+            if f == 0 {
+                println!("body plans {:?}, watching {watched}", herd.plans());
+            }
+        }
+        let (cx, cz) = (level.scene.creatures[watched].base[0], level.scene.creatures[watched].base[2]);
         let swing = 0.6 * (f as f32 / frames as f32 * std::f32::consts::TAU).sin();
         let (x, z) = (cx + radius * (angle + swing).cos(), cz + radius * (angle + swing).sin());
         let yaw = yaw_towards(cx - x, cz - z).round() as i32;

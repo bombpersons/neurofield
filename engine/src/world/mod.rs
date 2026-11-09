@@ -2,6 +2,7 @@
 //! doors, creatures with their skins), their textures and light, and walking
 //! around them. Everything the renderers draw and the network is told about.
 
+pub mod animate;
 pub mod config;
 pub mod creature;
 pub mod level;

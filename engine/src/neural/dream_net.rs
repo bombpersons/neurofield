@@ -27,7 +27,7 @@ const Q_VALID: usize = 21;
 /// Floats per part in `mem` (dream_net.wgsl).
 const PART_FLOATS: usize = 66;
 /// Planes the `dream_fields` kernel writes; the first `NET_IN` are the net's input.
-const FIELD_PLANES: usize = 75;
+const FIELD_PLANES: usize = 79;
 const NET_IN: usize = 61;
 /// Floats per pixel of the finished layer: rgb, alpha, fog, depth.
 const LAYER: usize = 6;
@@ -36,6 +36,8 @@ const DREAM_SHARE: f32 = 0.25;
 const MAX_OPS: u64 = 128;
 const SLOT: u64 = 256;
 const GELU: u32 = 1;
+/// `Params.flags` of the fields and finish kernels (dream_net.wgsl).
+const SOLID: u32 = 1;
 /// Alpha at which the drawn layer starts and finishes being opaque (`edge`).
 const EDGE: (f32, f32) = (0.3, 0.7);
 
@@ -301,7 +303,15 @@ impl DreamNet {
             parts.seed.push((rng.next() >> 8) as f32);
             let mut scheme = Rng::new(seed.wrapping_mul(37).wrapping_add(creature + 1));
             let s = scheme.next() as usize % schemes;
-            parts.palette.extend_from_slice(&self.palettes[s * PALETTE..][..PALETTE]);
+            // The creature's colours, in this part's own order: the net paints by position in the scheme.
+            let mut order = [0usize, 1, 2, 3];
+            let mut shuffle = Rng::new(seed.wrapping_mul(41).wrapping_add(i as u64 + 1));
+            for k in (1..order.len()).rev() {
+                order.swap(k, shuffle.next() as usize % (k + 1));
+            }
+            for c in order {
+                parts.palette.extend_from_slice(&self.palettes[s * PALETTE + c * 3..][..3]);
+            }
         }
         parts
     }
@@ -344,7 +354,9 @@ impl DreamNet {
 
     /// The layer of the parts `q` seen from a crop at (x0, y0), `w` x `h` (multiples of 4): each
     /// part is projected here and handed to the shaders with its phrase vector and scheme.
-    pub fn draw(&mut self, q: &[f32], palette: &[f32], cam: [f32; 6], x0: usize, y0: usize, w: usize, h: usize) -> Result<Layer> {
+    /// `solid`: as round limbs that hide each other and take light by their shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, q: &[f32], palette: &[f32], cam: [f32; 6], x0: usize, y0: usize, w: usize, h: usize, solid: bool) -> Result<Layer> {
         let [vh, width, fog_near, fog_far, ..] = cam;
         let n = q.len() / Q_PARAMS;
         let mut rows = vec![0f32; n * PART_FLOATS];
@@ -392,10 +404,11 @@ impl DreamNet {
         let net_out = alloc(6, full);
         let layer = alloc(LAYER, full);
 
+        let flags = if solid { SOLID } else { 0 };
         let mut ops = Ops::default();
         ops.push(
             Kernel::Fields,
-            Params { m: h as u32, n: w as u32, k: n as u32, a_off: self.parts_at, c_off: fields, f0: vh, f1: fog_near, f2: fog_far, ..Default::default() },
+            Params { m: h as u32, n: w as u32, k: n as u32, a_off: self.parts_at, c_off: fields, f0: vh, f1: fog_near, f2: fog_far, flags, ..Default::default() },
             [w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1],
         );
         debug_assert_eq!(self.inp.cin as usize, NET_IN);
@@ -413,7 +426,7 @@ impl DreamNet {
         ops.blocks(&self.dec[0], d0, t0a, t0b, full);
         ops.conv(self.out, d0, net_out, full, 0, 1);
         let pixels = area(full) as u32;
-        ops.push(Kernel::Finish, Params { m: pixels, a_off: net_out, b_off: fields, c_off: layer, ..Default::default() }, [pixels.div_ceil(64), 1, 1]);
+        ops.push(Kernel::Finish, Params { m: pixels, a_off: net_out, b_off: fields, c_off: layer, flags, ..Default::default() }, [pixels.div_ceil(64), 1, 1]);
         let data = self.run(&ops, layer, area(full) * LAYER)?;
         Ok(Layer { x0, y0, w, h, data })
     }
@@ -449,7 +462,7 @@ impl DreamNet {
             return Ok(None);
         }
         let camera = [vh, width as f32, cam.fog_near as f32 / T as f32, cam.fog_far as f32 / T as f32, 0.0, 0.0];
-        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0).map(Some)
+        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0, true).map(Some)
     }
 
     /// Compare the port with PyTorch on an `export_dream.py --fixture` crop: a line each for the
@@ -465,7 +478,7 @@ impl DreamNet {
         let valid = q.chunks_exact(Q_PARAMS).filter(|p| p[Q_VALID] > 0.0).count();
         let palette: Vec<f32> = (0..valid).flat_map(|_| scheme.iter().copied()).collect();
         let camera = [cam[2], cam[3], cam[4], cam[5], 0.0, 0.0];
-        let got = self.draw(&q[..valid * Q_PARAMS], &palette, camera, cam[0] as usize, cam[1] as usize, n, n)?;
+        let got = self.draw(&q[..valid * Q_PARAMS], &palette, camera, cam[0] as usize, cam[1] as usize, n, n, false)?;
         let want: Vec<f32> = (0..n * n).flat_map(|i| (0..4).map(|c| layer[c * n * n + i]).collect::<Vec<_>>()).collect();
         let mine: Vec<f32> = got.data.chunks_exact(LAYER).flat_map(|p| p[..4].to_vec()).collect();
         let planes = self.run(&Ops::default(), self.scratch, FIELD_PLANES * n * n)?;
@@ -679,7 +692,10 @@ impl DreamLayer {
         if self.parts.as_ref().is_none_or(|(v, _)| *v != version) {
             self.parts = Some((version, self.net.parts(scene, self.seed.wrapping_add(version))));
         }
-        let (_, parts) = self.parts.as_ref().expect("just set");
+        let (_, parts) = self.parts.as_mut().expect("just set");
+        // They may have moved (`world::animate`).
+        parts.rows.clear();
+        part_features(scene, &mut parts.rows);
         if let Some(layer) = self.net.render(parts, cam, width)? {
             let depth = level_depth(scene, cam, width);
             composite(rgb, &layer, &depth, scene.fog_colour(cam.pos), width as usize);

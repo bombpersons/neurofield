@@ -21,19 +21,19 @@ const IDENT: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 /// Target mesh edge length in world units.
 const EDGE: f32 = 5.0;
 
-fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn scale(a: [f32; 3], k: f32) -> [f32; 3] {
+pub(crate) fn scale(a: [f32; 3], k: f32) -> [f32; 3] {
     a.map(|c| c * k)
 }
 
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
@@ -176,14 +176,14 @@ impl Part {
 
     /// Point at `t` along the axis and angle `a` (radians) around it, `out` of the
     /// way from the axis to the surface, in the part's frame.
-    fn local(&self, t: f32, a: f32, out: f32) -> [f32; 3] {
+    pub(crate) fn local(&self, t: f32, a: f32, out: f32) -> [f32; 3] {
         let r = self.profile(t) * out;
         let s = (t + 1.0) / 2.0;
         [r * self.half[0] * a.cos() + self.bend * self.half[1] * s * s, t * self.half[1], r * self.half[2] * a.sin()]
     }
 
     /// The axis point at `t` (where the surface's radius is measured from).
-    fn axis(&self, t: f32) -> [f32; 3] {
+    pub(crate) fn axis(&self, t: f32) -> [f32; 3] {
         self.local(t, 0.0, 0.0)
     }
 
@@ -258,7 +258,7 @@ pub struct Placed {
 }
 
 impl Placed {
-    fn world(&self, local: [f32; 3]) -> [f32; 3] {
+    pub(crate) fn world(&self, local: [f32; 3]) -> [f32; 3] {
         add(self.centre, apply(self.axes, local))
     }
 }

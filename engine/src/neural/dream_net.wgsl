@@ -17,6 +17,14 @@ const FIELDS: u32 = 29u; // dream.py FIELD_CHANNELS
 const PLANE_PALETTE: u32 = 61u;
 const PLANE_FOG: u32 = 73u;
 const PLANE_DEPTH: u32 = 74u;
+// With SOLID: the surface's normal in camera space and how shut in it is by its neighbours.
+const PLANE_NORMAL: u32 = 75u;
+const PLANE_CREASE: u32 = 78u;
+// Params.flags of `dream_fields` and `dream_finish`: parts are round limbs that hide each other
+// and take light by their shape. Without it they are as train/dream.py draws them.
+const SOLID: u32 = 1u;
+// Where the drawn edge of a limb is, in its radii (the net's alpha crosses a half about here).
+const SOLID_EDGE: f32 = 1.25;
 
 fn dream_hash(i: vec2<i32>, seed: u32, channel: u32) -> f32 {
     // The third lattice coordinate is always 0 here (creatures.py hash3).
@@ -40,7 +48,7 @@ fn dream_noise(at: vec2<f32>, seed: u32, channel: u32) -> f32 {
     return mix(mix(n00, n10, f.x), mix(n01, n11, f.x), f.y) * 2.0 - 1.0;
 }
 
-// The per-pixel fields of dream.py `fields`, as planes [PLANE_DEPTH + 1][m][n] at c_off, for
+// The per-pixel fields of dream.py `fields`, as planes [PLANE_CREASE + 1][m][n] at c_off, for
 // k parts at a_off. f0: projection distance; f1, f2: fog near and far.
 @compute @workgroup_size(16, 16)
 fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -50,8 +58,13 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     let plane = p.m * p.n;
     let pixel = y * p.n + x;
     let at = vec2<f32>(f32(x) + 0.5, f32(y) + 0.5);
+    let solid = (p.flags & SOLID) != 0u;
     var ds: array<f32, MAX_PARTS>;
+    var zs: array<f32, MAX_PARTS>; // each part's surface depth here
     var dmin = 1e4;
+    var closest = 1e4; // the smallest distance, whichever part is on top
+    var near_surface = 1e9;
+    var near_dir = vec2<f32>(0.0);
     var nearest = 0u;
     var near_along = 0.0;
     var near_across = 0.0;
@@ -65,6 +78,7 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
         var across = 0.0;
         var depth = 0.0;
         var rpix = 0.0;
+        var dir = vec2<f32>(0.0);
         for (var s = 0u; s < 4u; s++) {
             let i = base + s * 3u;
             let a = vec2<f32>(mem[i], mem[i + 1u]);
@@ -72,7 +86,8 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
             let ab = b - a;
             let ap = at - a;
             let u = clamp(dot(ap, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
-            let dist = length(ap - u * ab);
+            let off = ap - u * ab;
+            let dist = length(off);
             let z = mem[i + 2u] + u * (mem[i + 5u] - mem[i + 2u]);
             let r = max(radius * p.f0 / z, 0.5);
             let d = dist / r;
@@ -82,10 +97,24 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
                 across = sign(ab.x * ap.y - ab.y * ap.x) * dist / r;
                 depth = z;
                 rpix = r;
+                dir = off / max(dist, 1e-6);
             }
         }
         ds[q] = best;
-        if (best < dmin) {
+        closest = min(closest, best);
+        let round = min(best / SOLID_EDGE, 1.0);
+        let surface = depth - radius * SOLID_EDGE * sqrt(1.0 - round * round);
+        zs[q] = surface;
+        var pick = best < dmin;
+        if (solid) {
+            // Among the limbs covering this pixel the nearest surface wins.
+            let inside = best < SOLID_EDGE;
+            let held = dmin < SOLID_EDGE;
+            pick = (inside && !held) || (inside == held && select(best < dmin, surface < near_surface, inside));
+        }
+        if (pick) {
+            near_surface = surface;
+            near_dir = dir;
             dmin = best;
             nearest = q;
             near_along = along;
@@ -99,7 +128,7 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     var out: array<f32, FIELDS>;
     let radius = mem[base + PART_RADIUS];
     if (near) {
-        out[0] = exp(-0.5 * dmin * dmin);
+        out[0] = exp(-0.5 * closest * closest); // no see-through seam where a limb crosses another
         out[1] = min(dmin, 8.0) / 4.0;
         out[2] = near_along;
         out[3] = clamp(near_across, -8.0, 8.0) / 4.0;
@@ -134,7 +163,23 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var c = 0u; c < 12u; c++) { mem[p.c_off + (PLANE_PALETTE + c) * plane + pixel] = mem[base + PART_PALETTE + c]; }
     let fog = clamp((near_depth - p.f1) / max(p.f2 - p.f1, 1e-3), 0.0, 1.0);
     mem[p.c_off + PLANE_FOG * plane + pixel] = fog;
-    mem[p.c_off + PLANE_DEPTH * plane + pixel] = near_depth;
+    mem[p.c_off + PLANE_DEPTH * plane + pixel] = select(near_depth, near_surface, solid);
+    var normal = vec3<f32>(0.0);
+    var crease = 0.0;
+    if (solid && near) {
+        let round = min(dmin / SOLID_EDGE, 1.0);
+        normal = vec3<f32>(near_dir * round, -sqrt(1.0 - round * round));
+        for (var q = 0u; q < p.k; q++) {
+            if (q != nearest && zs[q] < near_surface + radius * 0.5) {
+                // A soft ring just outside the neighbour's edge; under it, it is hidden.
+                let close = smoothstep(0.9, SOLID_EDGE, ds[q]) * (1.0 - smoothstep(SOLID_EDGE, 2.1, ds[q]));
+                let gap = 1.0 - smoothstep(0.0, radius * 4.0, abs(zs[q] - near_surface));
+                crease = max(crease, close * gap);
+            }
+        }
+    }
+    for (var c = 0u; c < 3u; c++) { mem[p.c_off + (PLANE_NORMAL + c) * plane + pixel] = normal[c]; }
+    mem[p.c_off + PLANE_CREASE * plane + pixel] = crease;
 }
 
 // Doubles k planes at a_off to [k][m][n] at c_off, as F.interpolate(bilinear, align_corners=False).
@@ -179,7 +224,15 @@ fn dream_finish(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let shade = 0.35 + 1.3 / (1.0 + exp(-(mem[o + 4u * plane + i] + 0.3)));
-    let rgb = clamp(mixed * shade, vec3<f32>(0.0), vec3<f32>(1.0));
+    var rgb = clamp(mixed * shade, vec3<f32>(0.0), vec3<f32>(1.0));
+    if ((p.flags & SOLID) != 0u) {
+        // A light above and to the left of the viewer (camera space: y is down, z is away).
+        let n = vec3<f32>(mem[p.b_off + PLANE_NORMAL * plane + i], mem[p.b_off + (PLANE_NORMAL + 1u) * plane + i], mem[p.b_off + (PLANE_NORMAL + 2u) * plane + i]);
+        let wrap = clamp((dot(n, normalize(vec3<f32>(-0.3, -0.6, -0.74))) + 0.35) / 1.35, 0.0, 1.0);
+        let rim = pow(1.0 + n.z, 3.0);
+        let crease = mem[p.b_off + PLANE_CREASE * plane + i];
+        rgb = clamp(rgb * (0.42 + 0.72 * wrap + 0.2 * rim) * (1.0 - 0.6 * crease), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     let presence = mem[p.b_off + i];
     let logit = 10.0 * tanh((mem[o + 5u * plane + i] + 6.0 * presence - 3.0) / 10.0);
     let at = p.c_off + i * 6u;

@@ -78,6 +78,7 @@ struct Sim {
     effects: [Option<f32>; effects::EFFECTS.len()],
     panel: bool,
     net_ms: f32,
+    herd: engine::world::animate::Herd,
     tris: usize,
     /// The network's frame width, following the window's shape (`layout`).
     width: u32,
@@ -283,6 +284,7 @@ fn main() {
             effects: [None; effects::EFFECTS.len()],
             panel: true,
             net_ms: 0.0,
+            herd: Default::default(),
             tris: 0,
             width: W,
             strangeness,
@@ -564,6 +566,10 @@ fn draw(
     if !sim.paused {
         let dt = time.delta_secs();
         sim.effects.iter_mut().flatten().for_each(|t| *t += dt);
+        if dream.is_some() {
+            let sim = &mut *sim;
+            sim.herd.update(&mut sim.level.scene, sim.version, dt);
+        }
     }
     if sim.mode != Mode::Raster {
         let t0 = std::time::Instant::now();
