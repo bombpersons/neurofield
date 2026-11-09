@@ -243,8 +243,11 @@ def fields(q, cam, palette, n):
     u = ((ap * ab[..., None, None, :]).sum(-1) / (ab * ab).sum(-1)[..., None, None].clamp(min=1e-6)).clamp(0, 1)
     off = ap - u[..., None] * ab[..., None, None, :]
     dist = off.norm(dim=-1)
-    cross = ab[..., None, None, 0] * ap[..., 1] - ab[..., None, None, 1] * ap[..., 0]
-    side = torch.sign(cross)
+    length = ab.norm(dim=-1)[..., None, None].clamp(min=1e-6)
+    # Signed distance from the axis's line: unlike a side and a distance, smooth past its ends.
+    cross = (ab[..., None, None, 0] * ap[..., 1] - ab[..., None, None, 1] * ap[..., 0]) / length
+    # How far past an end the pixel's direction leans along the axis: 0 beside the limb.
+    lean = (off * ab[..., None, None, :]).sum(-1) / (length * dist).clamp(min=1e-6)
     depth = za[..., None, None] + u * (zb - za)[..., None, None]
     along = ta[:, None, None] + u * (tb - ta)[:, None, None]
     radius = 0.5 * (q[..., 9] + q[..., 11])  # world units
@@ -252,8 +255,13 @@ def fields(q, cam, palette, n):
     d = dist / rpix
     d, k = d.min(2)  # nearest segment per part
     pick = lambda x: torch.gather(x, 2, k[:, :, None]).squeeze(2)  # noqa: E731
-    across = pick(side * dist) / pick(rpix)
-    depth, along, rpix = pick(depth), pick(along), pick(rpix)
+    across = pick(cross) / pick(rpix)
+    depth, along, rpix, lean = pick(depth), pick(along), pick(rpix), pick(lean)
+    # Radii along the limb, over its rounded ends too (noise is fixed to this), and that as
+    # -1..1 of the whole length: on a fat short part the bare axis would be a line across it.
+    hy_over_r = (q[..., 10] / radius.clamp(min=1e-3))[..., None, None]
+    reach = along * hy_over_r + lean * d
+    along = reach / (hy_over_r + EDGE)
     off = torch.gather(off, 2, k[:, :, None, :, :, None].expand(-1, -1, -1, -1, -1, 2)).squeeze(2)
     valid = q[..., Q_VALID] > 0
     d = torch.where(valid[..., None, None], d, torch.full_like(d, 1e4))
@@ -279,28 +287,30 @@ def fields(q, cam, palette, n):
     corner = torch.stack([cam[:, 0] - cam[:, 3] / 2, cam[:, 1] - H / 2], -1)[:, None, None]
     ray = unit(torch.cat([(p[None] + corner) / cam[:, 2, None, None, None], torch.ones_like(p[None][..., :1]).expand(B, -1, -1, -1)], -1))
 
-    # Every part's surface normal: round the limb from the pixel's side to facing the camera.
+    # Every part's surface normal: round the limb from the pixel's side to facing the camera,
+    # and over the rounded ends towards the axis.
     tangent = tangents[torch.arange(B, device=q.device)[:, None, None, None], torch.arange(P, device=q.device)[None, :, None, None], k]
     across_limb = unit(torch.linalg.cross(tangent, ray[:, None]))
-    limb_side = torch.sign((across_limb[..., :2] * off).sum(-1, keepdim=True))
+    sideways = (across_limb[..., :2] * off).sum(-1, keepdim=True) / (across_limb[..., :2].norm(dim=-1, keepdim=True) * off.norm(dim=-1, keepdim=True)).clamp(min=1e-6)
     facing = -unit(ray[:, None] - tangent * (ray[:, None] * tangent).sum(-1, keepdim=True))
     round_ = (d / EDGE).clamp(max=1)[..., None]
-    normals = across_limb * limb_side * round_ + facing * (1 - round_**2).clamp(min=0).sqrt()
+    normals = across_limb * sideways * round_ + tangent * lean[..., None] * round_ + facing * (1 - round_**2).clamp(min=0).sqrt()
+    # The same without the lean, for the angle round the limb: there is none on the axis itself.
+    girth = across_limb * sideways * round_ + facing * (1 - (sideways * round_) ** 2).clamp(min=0).sqrt()
 
     def skin(at):
-        """Part `at`'s row, its surface normal, (cos, sin) round it and the noise fixed to that."""
+        """Part `at`'s row, (cos, sin) round it and the noise fixed to that."""
         row = q[bi, at]
-        normal = torch.gather(normals, 1, at[:, None, :, :, None].expand(-1, -1, -1, -1, 3)).squeeze(1)
+        normal = torch.gather(girth, 1, at[:, None, :, :, None].expand(-1, -1, -1, -1, 3)).squeeze(1)
         around = torch.stack([(normal * row[..., Q_AX]).sum(-1), (normal * torch.linalg.cross(row[..., Q_AX], row[..., Q_AY])).sum(-1)], -1)
         around = around / around.norm(dim=-1, keepdim=True).clamp(min=1e-3)
-        hy_over_r = row[..., 10] / (0.5 * (row[..., 9] + row[..., 11])).clamp(min=1e-3)
-        place = torch.cat([(g(along, at) * hy_over_r)[..., None], around], -1)
+        place = torch.cat([g(reach, at)[..., None], around], -1)
         seed = row[..., Q_SEED].long()
         noise = torch.stack([noise3(place * 2**o, seed, c * OCTAVES + o) for c in range(NOISE) for o in range(OCTAVES)], -1)
-        return row, normal, around, noise
+        return row, around, noise
 
-    row_i, _, around_i, noise_i = skin(i)
-    row_j, _, around_j, noise_j = skin(j)
+    row_i, around_i, noise_i = skin(i)
+    row_j, around_j, noise_j = skin(j)
     t = blend.squeeze(-1)
     mix2 = lambda x: g(x, i) * (1 - t) + g(x, j) * t  # noqa: E731
     dmin, dep, alo, acr, rp = g(d, i) * (1 - t) + g(d, j) * t, mix2(depth), mix2(along), mix2(across), mix2(rpix)

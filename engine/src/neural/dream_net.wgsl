@@ -70,9 +70,11 @@ fn part_vec3(at: u32) -> vec3<f32> {
 struct Limb {
     d: f32,
     along: f32,
+    reach: f32,
     across: f32,
     depth: f32,
     rpix: f32,
+    lean: f32,
     off: vec2<f32>,
     tangent: vec3<f32>,
 }
@@ -96,25 +98,41 @@ fn limb(base: u32, at: vec2<f32>, corner: vec2<f32>) -> Limb {
         if (d < l.d) {
             l.d = d;
             l.along = -1.0 + 0.5 * (f32(s) + u);
-            l.across = sign(ab.x * ap.y - ab.y * ap.x) * dist / r;
+            l.across = (ab.x * ap.y - ab.y * ap.x) / max(length(ab), 1e-6) / r;
             l.depth = z;
             l.rpix = r;
+            l.lean = dot(off, ab) / max(max(length(ab), 1e-6) * dist, 1e-6);
             l.off = off;
             let pa = vec3<f32>((a + corner) / p.f0 * mem[i + 2u], mem[i + 2u]);
             let pb = vec3<f32>((b + corner) / p.f0 * mem[i + 5u], mem[i + 5u]);
             l.tangent = unit(pb - pa);
         }
     }
+    // Radii along the limb, over its rounded ends too (noise is fixed to this), and that as
+    // -1..1 of the whole length: on a fat short part the bare axis would be a line across it.
+    let half = mem[base + PART_HALF] / max(radius, 1e-3);
+    l.reach = l.along * half + l.lean * l.d;
+    l.along = l.reach / (half + EDGE);
     return l;
 }
 
-// The limb's surface normal: round it from the pixel's side to facing the camera.
-fn limb_normal(l: Limb, ray: vec3<f32>) -> vec3<f32> {
+// The limb's surface normal: round it from the pixel's side to facing the camera, and over
+// the rounded ends towards the axis. `girth` is the same without the lean, for the angle
+// round the limb: there is none on the axis itself.
+struct Surface {
+    normal: vec3<f32>,
+    girth: vec3<f32>,
+}
+
+fn limb_surface(l: Limb, ray: vec3<f32>) -> Surface {
     let across_limb = unit(cross(l.tangent, ray));
-    let side = sign(dot(across_limb.xy, l.off));
+    let sideways = dot(across_limb.xy, l.off) / max(length(across_limb.xy) * length(l.off), 1e-6);
     let facing = -unit(ray - l.tangent * dot(ray, l.tangent));
     let round = min(l.d / EDGE, 1.0);
-    return across_limb * side * round + facing * sqrt(max(1.0 - round * round, 0.0));
+    var out: Surface;
+    out.normal = across_limb * sideways * round + l.tangent * l.lean * round + facing * sqrt(max(1.0 - round * round, 0.0));
+    out.girth = across_limb * sideways * round + facing * sqrt(max(1.0 - sideways * round * sideways * round, 0.0));
+    return out;
 }
 
 // (cos, sin) round the limb and the noise fixed to that.
@@ -123,12 +141,12 @@ struct Skin {
     noise: array<f32, 12>,
 }
 
-fn skin(l: Limb, base: u32, normal: vec3<f32>) -> Skin {
+fn skin(l: Limb, base: u32, girth: vec3<f32>) -> Skin {
     var out: Skin;
-    let around = vec2<f32>(dot(normal, part_vec3(base + PART_AX)), dot(normal, part_vec3(base + PART_AZ)));
+    let around = vec2<f32>(dot(girth, part_vec3(base + PART_AX)), dot(girth, part_vec3(base + PART_AZ)));
     out.around = around / max(length(around), 1e-3);
     let seed = u32(mem[base + PART_SEED]);
-    let place = vec3<f32>(l.along * mem[base + PART_HALF] / max(mem[base + PART_RADIUS], 1e-3), out.around.x, out.around.y);
+    let place = vec3<f32>(l.reach, out.around.x, out.around.y);
     for (var c = 0u; c < NOISE; c++) {
         for (var o = 0u; o < OCTAVES; o++) {
             out.noise[c * OCTAVES + o] = dream_noise(place * f32(1u << o), seed, c * OCTAVES + o);
@@ -161,7 +179,7 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
         let base = p.a_off + q * PART_FLOATS;
         let l = limb(base, at, corner);
         ds[q] = l.d;
-        ns[q] = limb_normal(l, ray);
+        ns[q] = limb_surface(l, ray).normal;
         closest = min(closest, l.d);
         let round = min(l.d / EDGE, 1.0);
         let surface = l.depth - mem[base + PART_RADIUS] * EDGE * sqrt(max(1.0 - round * round, 0.0));
@@ -204,8 +222,8 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (near) {
         let a = limb(base, at, corner);
         let b = limb(base_b, at, corner);
-        let sa = skin(a, base, ns[nearest]);
-        let sb = skin(b, base_b, ns[partner]);
+        let sa = skin(a, base, limb_surface(a, ray).girth);
+        let sb = skin(b, base_b, limb_surface(b, ray).girth);
         near_depth = mix(a.depth, b.depth, t);
         out[0] = exp(-0.5 * melted * melted);
         out[1] = min(mix(a.d, b.d, t), 8.0) / 4.0;
