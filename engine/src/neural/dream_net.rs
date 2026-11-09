@@ -48,6 +48,8 @@ const TILE: usize = 16;
 /// How near a part a tile must be to be drawn: `TILE_MARGIN` radii and `TILE_PAD` pixels.
 const TILE_MARGIN: f32 = 1.75;
 const TILE_PAD: f32 = 8.0;
+/// Passes of the net a frame may take, so that one creature can fade over another.
+const MAX_LAYERS: usize = 2;
 
 #[derive(Clone, Copy)]
 enum Kernel {
@@ -335,8 +337,8 @@ impl DreamNet {
     }
 
     /// The parts seen from `cam` on a screen `width` wide: up to MAX_PARTS, the biggest on screen first, as dream.py's q
-    /// [n, Q_PARAMS], with their colour schemes [n, PALETTE].
-    fn view(&self, parts: &Parts, cam: &Camera, width: u32) -> (Vec<f32>, Vec<f32>) {
+    /// [n, Q_PARAMS], with their colour schemes [n, PALETTE] and which creature each is of.
+    fn view(&self, parts: &Parts, cam: &Camera, width: u32) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
         let m = view_matrix(cam);
         let r = |i: usize, j: usize| m.m[i][j] as f32 / 4096.0;
         let pos = cam.pos.map(|c| c as f32 / T as f32);
@@ -354,7 +356,7 @@ impl DreamNet {
         }
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         near.truncate(MAX_PARTS);
-        let (mut q, mut palette) = (Vec::new(), Vec::new());
+        let (mut q, mut palette, mut creatures) = (Vec::new(), Vec::new(), Vec::new());
         for &(_, i, c) in &near {
             let row = &parts.rows[i * PART_FEATURES..][..PART_FEATURES];
             let axis = |col: usize| [0, 1, 2].map(|k| r(k, 0) * row[6 + col] + r(k, 1) * row[9 + col] + r(k, 2) * row[12 + col]);
@@ -366,8 +368,9 @@ impl DreamNet {
             q.extend_from_slice(&row[35..38]);
             q.extend_from_slice(&[row[48], parts.phrase[i], parts.seed[i], 1.0]);
             palette.extend_from_slice(&parts.palette[i * PALETTE..][..PALETTE]);
+            creatures.push(row[48] as u32);
         }
-        (q, palette)
+        (q, palette, creatures)
     }
 
     /// The layer of the parts `q` seen from a crop at (x0, y0), `w` x `h` (multiples of 4): each
@@ -483,14 +486,21 @@ impl DreamNet {
         Ok(Layer { x0, y0, w, h, data })
     }
 
-    /// The layer for `cam`, in the smallest box (aligned to 4 pixels, so the U-Net's grid stays
-    /// put on the screen) round the parts it can see; None when none are in view.
-    pub fn render(&mut self, parts: &Parts, cam: &Camera, width: u32) -> Result<Option<Layer>> {
-        let (q, palette) = self.view(parts, cam, width);
-        let n = q.len() / Q_PARAMS;
-        if n == 0 {
-            return Ok(None);
+    /// The layers for `cam`, in no particular order: one, or one more for each creature that
+    /// has to fade over another (`depth_groups`). Empty when no part is in view.
+    pub fn render(&mut self, parts: &Parts, cam: &Camera, width: u32) -> Result<Vec<Layer>> {
+        let (q, palette, creatures) = self.view(parts, cam, width);
+        let mut layers = Vec::new();
+        for group in depth_groups(&q, &creatures, cam.h as f32, width as f32) {
+            let rows = |all: &[f32], size: usize| group.iter().flat_map(|&i| all[i * size..][..size].to_vec()).collect::<Vec<f32>>();
+            layers.extend(self.crop(&rows(&q, Q_PARAMS), &rows(&palette, PALETTE), cam, width)?);
         }
+        Ok(layers)
+    }
+
+    /// The layer of the parts `q`, in the smallest box (aligned to 4 pixels, so the U-Net's grid
+    /// stays put on the screen) round them; None when that is off the screen.
+    fn crop(&mut self, q: &[f32], palette: &[f32], cam: &Camera, width: u32) -> Result<Option<Layer>> {
         let vh = cam.h as f32;
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
         for p in q.chunks_exact(Q_PARAMS) {
@@ -514,8 +524,8 @@ impl DreamNet {
             return Ok(None);
         }
         let camera = [vh, width as f32, cam.fog_near as f32 / T as f32, cam.fog_far as f32 / T as f32, 0.0, 0.0];
-        let drawn = tile_grid(&q, vh, width as f32, x0, y0, x1 - x0, y1 - y0);
-        self.draw(&q, &palette, camera, x0, y0, x1 - x0, y1 - y0, Some(&drawn)).map(Some)
+        let drawn = tile_grid(q, vh, width as f32, x0, y0, x1 - x0, y1 - y0);
+        self.draw(q, palette, camera, x0, y0, x1 - x0, y1 - y0, Some(&drawn)).map(Some)
     }
 
     /// Compare the port with PyTorch on an `export_dream.py --fixture` crop: a line each for the
@@ -696,6 +706,37 @@ fn tile_grid(q: &[f32], vh: f32, width: f32, x0: usize, y0: usize, w: usize, h: 
     drawn
 }
 
+/// The rows of `q` to draw together, a group to a pass of the net. Creatures that share no
+/// tiles share a pass; one that shares tiles with a nearer one goes in the pass after it, so
+/// each can fade over the other. Past `MAX_LAYERS` the furthest share the last pass.
+fn depth_groups(q: &[f32], creatures: &[u32], vh: f32, width: f32) -> Vec<Vec<usize>> {
+    let mut ids = creatures.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut each: Vec<(f32, Vec<usize>, Vec<bool>)> = ids
+        .iter()
+        .map(|&id| {
+            let rows: Vec<usize> = (0..creatures.len()).filter(|&i| creatures[i] == id).collect();
+            let own: Vec<f32> = rows.iter().flat_map(|&i| q[i * Q_PARAMS..][..Q_PARAMS].to_vec()).collect();
+            let depth = rows.iter().map(|&i| q[i * Q_PARAMS + 2]).sum::<f32>() / rows.len() as f32;
+            (depth, rows, tile_grid(&own, vh, width, 0, 0, width as usize, H as usize))
+        })
+        .collect();
+    each.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut pass_of: Vec<usize> = Vec::new();
+    for (i, (_, rows, grid)) in each.iter().enumerate() {
+        let shares = |j: &usize| each[*j].2.iter().zip(grid).any(|(a, b)| *a && *b);
+        let pass = (0..i).filter(shares).map(|j| pass_of[j] + 1).max().unwrap_or(0).min(MAX_LAYERS - 1);
+        pass_of.push(pass);
+        if groups.len() == pass {
+            groups.push(Vec::new());
+        }
+        groups[pass].extend_from_slice(rows);
+    }
+    groups
+}
+
 /// For each of the net's three scales, the tiles to draw and the tiles to clear for them.
 /// A tile is drawn at a scale if any it covers at the scale above is; those to clear are
 /// all a drawn tile reads besides: its neighbours, and at the scale above what it covers.
@@ -818,21 +859,33 @@ fn edge(alpha: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The layer (fogged to `fog`) over the level network's frame `rgb` [H][width][3], where its
-/// parts are nearer than the level (`depth`); in linear light, as train/creatures.py `composite`.
-pub fn composite(rgb: &mut [f32], layer: &Layer, depth: &[f32], fog: [f32; 3], width: usize) {
-    for y in 0..layer.h {
-        for x in 0..layer.w {
-            let px = &layer.data[(y * layer.w + x) * LAYER..][..LAYER];
-            let at = (y + layer.y0) * width + x + layer.x0;
-            let alpha = edge(px[3]);
-            if alpha <= 0.0 || px[5] >= depth[at] {
-                continue;
+/// The layers (fogged to `fog`) over the level network's frame `rgb` [H][width][3], where their
+/// parts are nearer than the level (`depth`), furthest first at each pixel; in linear light,
+/// as train/creatures.py `composite`.
+pub fn composite(rgb: &mut [f32], layers: &[Layer], depth: &[f32], fog: [f32; 3], width: usize) {
+    let (x0, y0) = (layers.iter().map(|l| l.x0).min().unwrap_or(0), layers.iter().map(|l| l.y0).min().unwrap_or(0));
+    let (x1, y1) = (layers.iter().map(|l| l.x0 + l.w).max().unwrap_or(0), layers.iter().map(|l| l.y0 + l.h).max().unwrap_or(0));
+    let mut here: Vec<&[f32]> = Vec::with_capacity(layers.len());
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let at = y * width + x;
+            here.clear();
+            for l in layers {
+                if (l.x0..l.x0 + l.w).contains(&x) && (l.y0..l.y0 + l.h).contains(&y) {
+                    let px = &l.data[((y - l.y0) * l.w + x - l.x0) * LAYER..][..LAYER];
+                    if edge(px[3]) > 0.0 && px[5] < depth[at] {
+                        here.push(px);
+                    }
+                }
             }
-            for c in 0..3 {
-                let colour = px[c] * (1.0 - px[4]) + fog[c] * px[4];
-                let under = rgb[at * 3 + c].clamp(0.0, 1.0);
-                rgb[at * 3 + c] = enc(lin(under) * (1.0 - alpha) + lin(colour) * alpha);
+            here.sort_by(|a, b| b[5].total_cmp(&a[5]));
+            for px in &here {
+                let alpha = edge(px[3]);
+                for c in 0..3 {
+                    let colour = px[c] * (1.0 - px[4]) + fog[c] * px[4];
+                    let under = rgb[at * 3 + c].clamp(0.0, 1.0);
+                    rgb[at * 3 + c] = enc(lin(under) * (1.0 - alpha) + lin(colour) * alpha);
+                }
             }
         }
     }
@@ -863,9 +916,10 @@ impl DreamLayer {
         // They may have moved (`world::animate`).
         parts.rows.clear();
         part_features(scene, &mut parts.rows);
-        if let Some(layer) = self.net.render(parts, cam, width)? {
+        let layers = self.net.render(parts, cam, width)?;
+        if !layers.is_empty() {
             let depth = level_depth(scene, cam, width);
-            composite(rgb, &layer, &depth, scene.fog_colour(cam.pos), width as usize);
+            composite(rgb, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
         }
         Ok(())
     }
@@ -892,6 +946,48 @@ mod tests {
         assert!(!clear.contains(&(5, 1)));
         assert!(!clear.contains(&(1, 1)));
         assert!(half_clear.contains(&(1, 0)) && half_clear.contains(&(3, 1)));
+    }
+
+    /// A short upright part `depth` away, `x` tiles' widths right of the middle of the screen.
+    fn part_at(x: f32, depth: f32) -> Vec<f32> {
+        let mut q = vec![0.0; Q_PARAMS];
+        q[0] = x * 16.0 / 160.0 * depth;
+        q[2] = depth;
+        q[7] = 1.0;
+        q[Q_HALF] = 0.01;
+        q[Q_HALF + 1] = 0.05;
+        q[Q_HALF + 2] = 0.01;
+        q
+    }
+
+    #[test]
+    fn only_creatures_sharing_tiles_get_their_own_pass() {
+        let apart = [part_at(-6.0, 1.0), part_at(6.0, 2.0)].concat();
+        assert_eq!(depth_groups(&apart, &[0, 1], 160.0, 320.0), [vec![0, 1]]);
+        let over = [part_at(0.0, 2.0), part_at(0.0, 1.0)].concat();
+        assert_eq!(depth_groups(&over, &[0, 1], 160.0, 320.0), [vec![1], vec![0]]);
+        // One creature's parts always stay together.
+        assert_eq!(depth_groups(&over, &[3, 3], 160.0, 320.0), [vec![0, 1]]);
+    }
+
+    #[test]
+    fn past_the_most_passes_the_furthest_share_the_last() {
+        let stack = [part_at(0.0, 3.0), part_at(0.0, 1.0), part_at(0.0, 2.0)].concat();
+        assert_eq!(depth_groups(&stack, &[0, 1, 2], 160.0, 320.0), [vec![1], vec![2, 0]]);
+    }
+
+    #[test]
+    fn layers_blend_furthest_first_whatever_their_order() {
+        let px = |grey: f32, alpha: f32, z: f32| Layer { x0: 0, y0: 0, w: 1, h: 1, data: vec![grey, grey, grey, alpha, 0.0, z] };
+        let draw = |layers: &[Layer]| {
+            let mut rgb = vec![0.0; 3];
+            composite(&mut rgb, layers, &[9.0], [0.0; 3], 1);
+            rgb[0]
+        };
+        let (near, far) = (px(1.0, 1.0, 1.0), px(0.5, 1.0, 2.0));
+        assert!((draw(&[near, far]) - 1.0).abs() < 1e-3);
+        let (near, far) = (px(1.0, 1.0, 1.0), px(0.5, 1.0, 2.0));
+        assert!((draw(&[far, near]) - 1.0).abs() < 1e-3);
     }
 
     #[test]
