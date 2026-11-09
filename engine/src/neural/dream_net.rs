@@ -38,20 +38,22 @@ const DREAM_SHARE: f32 = 0.25;
 const MAX_OPS: u64 = 128;
 const SLOT: u64 = 256;
 const GELU: u32 = 1;
+const ACCUMULATE: u32 = 2;
+/// How far round each part the drawn box reaches, in its radii: nothing shows further out.
+const CROP_MARGIN: f32 = 2.5;
 /// Alpha at which the drawn layer starts and finishes being opaque (`edge`).
 const EDGE: (f32, f32) = (0.3, 0.7);
 
 #[derive(Clone, Copy)]
 enum Kernel {
     Conv3x3,
-    Add,
     Fields,
     Upsample,
     Finish,
     Pool,
     Film,
 }
-const KERNELS: [&str; 7] = ["conv3x3", "add", "dream_fields", "upsample2", "dream_finish", "dream_pool2", "dream_film"];
+const KERNELS: [&str; 6] = ["conv3x3", "dream_fields", "upsample2", "dream_finish", "dream_pool2", "dream_film"];
 
 /// A convolution's weights in `mem`.
 #[derive(Clone, Copy)]
@@ -404,9 +406,7 @@ impl DreamNet {
         let u1 = alloc(128 + 96, half);
         let x1p = u1 + (128 * area(half)) as u32;
         let x2p = alloc(128, quarter);
-        let (t0a, t0b) = (alloc(48, full), alloc(48, full));
-        let (t1a, t1b) = (alloc(96, half), alloc(96, half));
-        let (t2a, t2b) = (alloc(128, quarter), alloc(128, quarter));
+        let (t0, t1, t2) = (alloc(48, full), alloc(96, half), alloc(128, quarter));
         let (d0, d1) = (alloc(48, full), alloc(96, half));
         let (emb1, emb2) = (alloc(PHRASE_DIM, half), alloc(PHRASE_DIM, quarter));
         let (film0, film1, film2) = (alloc(96, full), alloc(192, half), alloc(256, quarter));
@@ -421,22 +421,22 @@ impl DreamNet {
         );
         debug_assert_eq!(self.inp.cin as usize, NET_IN);
         ops.conv(self.inp, fields, x0p, full, 0, 1);
-        ops.blocks(&self.enc[0], x0p, t0a, t0b, full);
+        ops.blocks(&self.enc[0], x0p, t0, full);
         ops.conv(self.down[0], x0p, x1p, half, GELU, 2);
-        ops.blocks(&self.enc[1], x1p, t1a, t1b, half);
+        ops.blocks(&self.enc[1], x1p, t1, half);
         ops.conv(self.down[1], x1p, x2p, quarter, GELU, 2);
-        ops.blocks(&self.enc[2], x2p, t2a, t2b, quarter);
+        ops.blocks(&self.enc[2], x2p, t2, quarter);
         let emb0 = fields + (FIELDS * area(full)) as u32;
         ops.pool(emb0, emb1, half, PHRASE_DIM as u32);
         ops.pool(emb1, emb2, quarter, PHRASE_DIM as u32);
         ops.film(self.film[2], emb2, film2, x2p, quarter);
         ops.upsample(x2p, u1, half, 128);
         ops.conv(self.up[1], u1, d1, half, GELU, 1);
-        ops.blocks(&self.dec[1], d1, t1a, t1b, half);
+        ops.blocks(&self.dec[1], d1, t1, half);
         ops.film(self.film[1], emb1, film1, d1, half);
         ops.upsample(d1, u0, full, 96);
         ops.conv(self.up[0], u0, d0, full, GELU, 1);
-        ops.blocks(&self.dec[0], d0, t0a, t0b, full);
+        ops.blocks(&self.dec[0], d0, t0, full);
         ops.film(self.film[0], emb0, film0, d0, full);
         ops.conv(self.out, d0, net_out, full, 0, 1);
         let pixels = area(full) as u32;
@@ -464,7 +464,7 @@ impl DreamNet {
                 let point = [0, 1, 2].map(|c| p[c] + p[6 + c] * hy * t + p[3 + c] * p[Q_BEND] * hy * s * s);
                 let z = point[2].max(0.05);
                 let (x, y) = (point[0] / z * vh + width as f32 / 2.0, point[1] / z * vh + H as f32 / 2.0);
-                let r = 4.0 * radius * vh / z;
+                let r = CROP_MARGIN * radius * vh / z;
                 lo = [lo[0].min(x - r), lo[1].min(y - r)];
                 hi = [hi[0].max(x + r), hi[1].max(y + r)];
             }
@@ -572,13 +572,11 @@ impl Ops {
         self.push(Kernel::Conv3x3, p, [size.1.div_ceil(16) as u32, size.0.div_ceil(16) as u32, c.cout.div_ceil(8)]);
     }
 
-    /// Residual blocks on the planes at `x` (train/creatures.py Block), with `ta` and `tb` for scratch.
-    fn blocks(&mut self, blocks: &[ResBlock], x: u32, ta: u32, tb: u32, size: (usize, usize)) {
+    /// Residual blocks on the planes at `x` (train/creatures.py Block), with `ta` for scratch.
+    fn blocks(&mut self, blocks: &[ResBlock], x: u32, ta: u32, size: (usize, usize)) {
         for b in blocks {
             self.conv(b.a, x, ta, size, GELU, 1);
-            self.conv(b.b, ta, tb, size, 0, 1);
-            let floats = b.b.cout as usize * size.0 * size.1;
-            self.push(Kernel::Add, Params { m: floats as u32, a_off: tb, c_off: x, ..Default::default() }, [floats.div_ceil(64).min(65535) as u32, floats.div_ceil(65535 * 64) as u32, 1]);
+            self.conv(b.b, ta, x, size, ACCUMULATE, 1);
         }
     }
 

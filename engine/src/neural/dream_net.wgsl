@@ -81,33 +81,42 @@ struct Limb {
 
 fn limb(base: u32, at: vec2<f32>, corner: vec2<f32>) -> Limb {
     let radius = mem[base + PART_RADIUS];
+    // Find the nearest segment first: what it says is worked out for that one only.
     var l: Limb;
     l.d = 1e9;
+    var nearest = 0u;
     for (var s = 0u; s < 4u; s++) {
         let i = base + s * 3u;
         let a = vec2<f32>(mem[i], mem[i + 1u]);
-        let b = vec2<f32>(mem[i + 3u], mem[i + 4u]);
-        let ab = b - a;
+        let ab = vec2<f32>(mem[i + 3u], mem[i + 4u]) - a;
         let ap = at - a;
         let u = clamp(dot(ap, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
-        let off = ap - u * ab;
-        let dist = length(off);
         let z = mem[i + 2u] + u * (mem[i + 5u] - mem[i + 2u]);
-        let r = max(radius * p.f0 / z, 0.5);
-        let d = dist / r;
+        let d = length(ap - u * ab) / max(radius * p.f0 / z, 0.5);
         if (d < l.d) {
             l.d = d;
-            l.along = -1.0 + 0.5 * (f32(s) + u);
-            l.across = (ab.x * ap.y - ab.y * ap.x) / max(length(ab), 1e-6) / r;
-            l.depth = z;
-            l.rpix = r;
-            l.lean = dot(off, ab) / max(max(length(ab), 1e-6) * dist, 1e-6);
-            l.off = off;
-            let pa = vec3<f32>((a + corner) / p.f0 * mem[i + 2u], mem[i + 2u]);
-            let pb = vec3<f32>((b + corner) / p.f0 * mem[i + 5u], mem[i + 5u]);
-            l.tangent = unit(pb - pa);
+            nearest = s;
         }
     }
+    let i = base + nearest * 3u;
+    let a = vec2<f32>(mem[i], mem[i + 1u]);
+    let b = vec2<f32>(mem[i + 3u], mem[i + 4u]);
+    let ab = b - a;
+    let ap = at - a;
+    let u = clamp(dot(ap, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    let off = ap - u * ab;
+    let dist = length(off);
+    let z = mem[i + 2u] + u * (mem[i + 5u] - mem[i + 2u]);
+    let r = max(radius * p.f0 / z, 0.5);
+    l.along = -1.0 + 0.5 * (f32(nearest) + u);
+    l.across = (ab.x * ap.y - ab.y * ap.x) / max(length(ab), 1e-6) / r;
+    l.depth = z;
+    l.rpix = r;
+    l.lean = dot(off, ab) / max(max(length(ab), 1e-6) * dist, 1e-6);
+    l.off = off;
+    let pa = vec3<f32>((a + corner) / p.f0 * mem[i + 2u], mem[i + 2u]);
+    let pb = vec3<f32>((b + corner) / p.f0 * mem[i + 5u], mem[i + 5u]);
+    l.tangent = unit(pb - pa);
     // Radii along the limb, over its rounded ends too (noise is fixed to this), and that as
     // -1..1 of the whole length: on a fat short part the bare axis would be a line across it.
     let half = mem[base + PART_HALF] / max(radius, 1e-3);
@@ -179,7 +188,8 @@ fn dream_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
         let base = p.a_off + q * PART_FLOATS;
         let l = limb(base, at, corner);
         ds[q] = l.d;
-        ns[q] = limb_surface(l, ray).normal;
+        // Further off its weight in the normal's blend is nothing next to any part in reach.
+        if (l.d < 6.0) { ns[q] = limb_surface(l, ray).normal; }
         closest = min(closest, l.d);
         let round = min(l.d / EDGE, 1.0);
         let surface = l.depth - mem[base + PART_RADIUS] * EDGE * sqrt(max(1.0 - round * round, 0.0));

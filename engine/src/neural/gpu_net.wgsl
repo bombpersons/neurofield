@@ -292,6 +292,44 @@ fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
     let inn = p.n * step;
     var acc0 = vec4<f32>(0.0);
     var acc1 = vec4<f32>(0.0);
+    // The nine taps' places in a plane and whether each is inside it, once per pixel: the
+    // loops below are over channels, and these are the same for every channel.
+    let dy0 = i32(y * step) + -1;
+    let dx0 = i32(x * step) + -1;
+    let in0 = dy0 >= 0 && dy0 < i32(im) && dx0 >= 0 && dx0 < i32(inn);
+    let at0 = u32(clamp(dy0, 0, i32(im) - 1)) * inn + u32(clamp(dx0, 0, i32(inn) - 1));
+    let dy1 = i32(y * step) + -1;
+    let dx1 = i32(x * step) + 0;
+    let in1 = dy1 >= 0 && dy1 < i32(im) && dx1 >= 0 && dx1 < i32(inn);
+    let at1 = u32(clamp(dy1, 0, i32(im) - 1)) * inn + u32(clamp(dx1, 0, i32(inn) - 1));
+    let dy2 = i32(y * step) + -1;
+    let dx2 = i32(x * step) + 1;
+    let in2 = dy2 >= 0 && dy2 < i32(im) && dx2 >= 0 && dx2 < i32(inn);
+    let at2 = u32(clamp(dy2, 0, i32(im) - 1)) * inn + u32(clamp(dx2, 0, i32(inn) - 1));
+    let dy3 = i32(y * step) + 0;
+    let dx3 = i32(x * step) + -1;
+    let in3 = dy3 >= 0 && dy3 < i32(im) && dx3 >= 0 && dx3 < i32(inn);
+    let at3 = u32(clamp(dy3, 0, i32(im) - 1)) * inn + u32(clamp(dx3, 0, i32(inn) - 1));
+    let dy4 = i32(y * step) + 0;
+    let dx4 = i32(x * step) + 0;
+    let in4 = dy4 >= 0 && dy4 < i32(im) && dx4 >= 0 && dx4 < i32(inn);
+    let at4 = u32(clamp(dy4, 0, i32(im) - 1)) * inn + u32(clamp(dx4, 0, i32(inn) - 1));
+    let dy5 = i32(y * step) + 0;
+    let dx5 = i32(x * step) + 1;
+    let in5 = dy5 >= 0 && dy5 < i32(im) && dx5 >= 0 && dx5 < i32(inn);
+    let at5 = u32(clamp(dy5, 0, i32(im) - 1)) * inn + u32(clamp(dx5, 0, i32(inn) - 1));
+    let dy6 = i32(y * step) + 1;
+    let dx6 = i32(x * step) + -1;
+    let in6 = dy6 >= 0 && dy6 < i32(im) && dx6 >= 0 && dx6 < i32(inn);
+    let at6 = u32(clamp(dy6, 0, i32(im) - 1)) * inn + u32(clamp(dx6, 0, i32(inn) - 1));
+    let dy7 = i32(y * step) + 1;
+    let dx7 = i32(x * step) + 0;
+    let in7 = dy7 >= 0 && dy7 < i32(im) && dx7 >= 0 && dx7 < i32(inn);
+    let at7 = u32(clamp(dy7, 0, i32(im) - 1)) * inn + u32(clamp(dx7, 0, i32(inn) - 1));
+    let dy8 = i32(y * step) + 1;
+    let dx8 = i32(x * step) + 1;
+    let in8 = dy8 >= 0 && dy8 < i32(im) && dx8 >= 0 && dx8 < i32(inn);
+    let at8 = u32(clamp(dy8, 0, i32(im) - 1)) * inn + u32(clamp(dx8, 0, i32(inn) - 1));
     for (var c0 = 0u; c0 < p.k; c0 += 32u) {
         let kc = min(32u, p.k - c0);
         workgroupBarrier();
@@ -307,16 +345,25 @@ fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
         if (live) {
             for (var ci = 0u; ci < kc; ci++) {
                 let src = p.a_off + (c0 + ci) * im * inn;
-                for (var tap = 0u; tap < 9u; tap++) {
-                    let yy = i32(y * step) + i32(tap / 3u) - 1;
-                    let xx = i32(x * step) + i32(tap % 3u) - 1;
-                    let inside = yy >= 0 && yy < i32(im) && xx >= 0 && xx < i32(inn);
-                    let at = u32(clamp(yy, 0, i32(im) - 1)) * inn + u32(clamp(xx, 0, i32(inn) - 1));
-                    let v = select(0.0, mem[src + at], inside);
-                    let w = (ci * 9u + tap) * 2u;
-                    acc0 += v * cw[w];
-                    acc1 += v * cw[w + 1u];
-                }
+                let w = ci * 18u;
+                let v0 = select(0.0, mem[src + at0], in0);
+                let v1 = select(0.0, mem[src + at1], in1);
+                let v2 = select(0.0, mem[src + at2], in2);
+                let v3 = select(0.0, mem[src + at3], in3);
+                let v4 = select(0.0, mem[src + at4], in4);
+                let v5 = select(0.0, mem[src + at5], in5);
+                let v6 = select(0.0, mem[src + at6], in6);
+                let v7 = select(0.0, mem[src + at7], in7);
+                let v8 = select(0.0, mem[src + at8], in8);
+                acc0 += v0 * cw[w + 0u]; acc1 += v0 * cw[w + 1u];
+                acc0 += v1 * cw[w + 2u]; acc1 += v1 * cw[w + 3u];
+                acc0 += v2 * cw[w + 4u]; acc1 += v2 * cw[w + 5u];
+                acc0 += v3 * cw[w + 6u]; acc1 += v3 * cw[w + 7u];
+                acc0 += v4 * cw[w + 8u]; acc1 += v4 * cw[w + 9u];
+                acc0 += v5 * cw[w + 10u]; acc1 += v5 * cw[w + 11u];
+                acc0 += v6 * cw[w + 12u]; acc1 += v6 * cw[w + 13u];
+                acc0 += v7 * cw[w + 14u]; acc1 += v7 * cw[w + 15u];
+                acc0 += v8 * cw[w + 16u]; acc1 += v8 * cw[w + 17u];
             }
         }
     }
@@ -334,6 +381,8 @@ fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
             let yy = 2u * y + (co % 4u) / 2u;
             let xx = 2u * x + co % 2u;
             mem[p.c_off + (c * 2u * p.m + yy) * 2u * p.n + xx] = s;
+        } else if ((p.flags & ACCUMULATE) != 0u) {
+            mem[p.c_off + co * plane + y * p.n + x] += s;
         } else {
             mem[p.c_off + co * plane + y * p.n + x] = s;
         }
