@@ -79,7 +79,6 @@ impl NeuralView {
                     }
                 };
                 _ = tx.send(Reply::Loaded(net.adapter().to_string()));
-                let dream = Dream::calm();
                 while let Ok(mut job) = rx.recv() {
                     // Only the newest view matters.
                     while let Ok(newer) = rx.try_recv() {
@@ -87,7 +86,7 @@ impl NeuralView {
                     }
                     let t0 = Instant::now();
                     let t = tokens::tokens(&job.tris, &job.view);
-                    let reply = match net.try_render(&t, &dream) {
+                    let reply = match net.try_render(&t, &Dream::calm(t.width)) {
                         Ok(rgb) => Reply::Frame { key: job.key, rgb, ms: t0.elapsed().as_secs_f32() * 1000.0 },
                         Err(e) => Reply::Failed(e),
                     };

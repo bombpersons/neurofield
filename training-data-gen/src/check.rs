@@ -51,3 +51,68 @@ fn check(net: &mut Network, seed: u64, frames: usize, out: &Path, effect: usize,
         );
     }
 }
+
+/// `datagen dream-check`: the dream net's WGSL port against PyTorch (train/export_dream.py --fixture).
+pub fn dream_check(opts: &HashMap<String, String>) {
+    let dream = Path::new(opts.get("dream").expect("--dream FILE is required"));
+    let fixture = Path::new(opts.get("fixture").expect("--fixture FILE is required"));
+    let mut net = engine::neural::dream_net::DreamNet::load(dream).expect("loading the dream net");
+    println!("running on {}", net.adapter);
+    print!("{}", net.check(fixture).expect("comparing"));
+}
+
+/// `datagen dream-walk`: frames of a camera swinging round a creature, the level network with the
+/// dream creatures over it, as `out/frame_NNNNN.png`.
+pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
+    use engine::neural::dream::Dream;
+    use engine::neural::dream_net::DreamLayer;
+    use engine::neural::features::view_features;
+    use engine::world::scene::Camera;
+    use engine::world::walker::yaw_towards;
+
+    let config = engine::world::config::Config::load();
+    let model = engine::neural::model_path(opts, &config);
+    let seed: u64 = opts.get("seed").map_or(7, |s| s.parse().expect("--seed is a number"));
+    let dream = Path::new(opts.get("dream").expect("--dream FILE is required"));
+    std::fs::create_dir_all(out).unwrap();
+    let mut net = Network::load(&model);
+    let mut layer = DreamLayer::load(dream, seed).expect("loading the dream net");
+    let mut rng = Rng::new(seed);
+    let level = Level::new(&mut rng);
+    let which = opts.get("creature").map_or(0, |c| c.parse().expect("--creature is a number"));
+    let (creature, start) = level
+        .scene
+        .creatures
+        .iter()
+        .cycle()
+        .skip(which)
+        .take(level.scene.creatures.len())
+        .find_map(|c| level.walker.view_of(&level.scene, c, &mut rng).map(|cam| (c, cam)))
+        .expect("no creature can be seen");
+    let (cx, cz) = (creature.base[0], creature.base[2]);
+    let (dx, dz) = (start.pos[0] as f32 - cx, start.pos[2] as f32 - cz);
+    let radius = (dx * dx + dz * dz).sqrt();
+    let angle = dz.atan2(dx);
+    let (mut net_ms, mut dream_ms) = (Vec::new(), Vec::new());
+    for f in 0..frames {
+        let swing = 0.6 * (f as f32 / frames as f32 * std::f32::consts::TAU).sin();
+        let (x, z) = (cx + radius * (angle + swing).cos(), cz + radius * (angle + swing).sin());
+        let yaw = yaw_towards(cx - x, cz - z).round() as i32;
+        let cam = Camera { pos: [x as i32, start.pos[1], z as i32], yaw, roll: 0, ..start };
+        let mut v = Vec::new();
+        view_features(&level.scene, 0, &cam, W, &mut v);
+        let t = tokens::tokens(&level.tris, &v);
+        let t0 = Instant::now();
+        let mut rgb = net.render(&t, &Dream::calm(W));
+        net_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        let t0 = Instant::now();
+        layer.draw(&level.scene, 0, &cam, &mut rgb, W).expect("dream layer");
+        dream_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        let bytes: Vec<u8> = rgb.iter().map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8).collect();
+        crate::write_png(&out.join(format!("frame_{f:05}.png")), W, H, &bytes);
+    }
+    for (name, v) in [("level net", &mut net_ms), ("dream layer", &mut dream_ms)] {
+        v.sort_by(f64::total_cmp);
+        println!("{name}: median {:.1} ms, slowest {:.1} ms", v[v.len() / 2], v[v.len() - 1]);
+    }
+}

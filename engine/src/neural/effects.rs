@@ -99,7 +99,7 @@ fn waves(tok: &mut Tokens, tris: &[f32], t: f32, amount: f32) {
 /// Disturb the tokens (of a scene with raw triangle features `tris`) with every effect that
 /// has a time (seconds since it was turned on); returns the network-side disturbance.
 pub fn apply_set(times: &[Option<f32>; EFFECTS.len()], tok: &mut Tokens, tris: &[f32]) -> Dream {
-    let mut dream = Dream::calm();
+    let mut dream = Dream::calm(tok.width);
     for (e, t) in times.iter().enumerate() {
         if let Some(t) = *t {
             apply_one(e, t, tok, tris, &mut dream);

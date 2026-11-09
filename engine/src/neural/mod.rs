@@ -4,6 +4,7 @@
 //! (Vulkan, Metal or DX12), and `effects` disturb it in dreamlike ways.
 
 pub mod dream;
+pub mod dream_net;
 pub mod effects;
 pub mod features;
 pub mod gpu_net;

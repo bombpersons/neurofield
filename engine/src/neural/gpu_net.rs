@@ -37,31 +37,31 @@ const MAX_OPS: u64 = 1024;
 /// One dispatch's sizes and offsets (in floats into `mem`); see gpu_net.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    m: u32,
-    k: u32,
-    n: u32,
-    batch: u32,
-    a_off: u32,
-    a_bs: u32,
-    a_rs: u32,
-    a_cs: u32,
-    b_off: u32,
-    b_bs: u32,
-    b_rs: u32,
-    b_cs: u32,
-    c_off: u32,
-    c_bs: u32,
-    c_rs: u32,
-    bias_off: u32,
-    flags: u32,
-    x0: u32,
-    x1: u32,
-    x2: u32,
-    f0: f32,
-    f1: f32,
-    f2: f32,
-    f3: f32,
+pub(super) struct Params {
+    pub(super) m: u32,
+    pub(super) k: u32,
+    pub(super) n: u32,
+    pub(super) batch: u32,
+    pub(super) a_off: u32,
+    pub(super) a_bs: u32,
+    pub(super) a_rs: u32,
+    pub(super) a_cs: u32,
+    pub(super) b_off: u32,
+    pub(super) b_bs: u32,
+    pub(super) b_rs: u32,
+    pub(super) b_cs: u32,
+    pub(super) c_off: u32,
+    pub(super) c_bs: u32,
+    pub(super) c_rs: u32,
+    pub(super) bias_off: u32,
+    pub(super) flags: u32,
+    pub(super) x0: u32,
+    pub(super) x1: u32,
+    pub(super) x2: u32,
+    pub(super) f0: f32,
+    pub(super) f1: f32,
+    pub(super) f2: f32,
+    pub(super) f3: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -217,7 +217,7 @@ impl Weights {
 }
 
 /// The safetensors file's tensors as (shape, values), and its metadata.
-fn read_safetensors(path: &Path) -> Result<(HashMap<String, (Vec<usize>, Vec<f32>)>, HashMap<String, String>)> {
+pub(super) fn read_safetensors(path: &Path) -> Result<(HashMap<String, (Vec<usize>, Vec<f32>)>, HashMap<String, String>)> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let (_, meta) = safetensors::SafeTensors::read_metadata(&bytes).map_err(|e| e.to_string())?;
     let st = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| e.to_string())?;
@@ -631,12 +631,10 @@ impl GpuNet {
         }
         write(s.cams, &t.cam);
         write(s.mix, &dream.tex_mix);
-        // The dream's pushes are per patch of a 4:3 grid; other widths go without.
-        if dream.q_noise.len() == patches * DREAM_DIRS {
-            write(s.noise, &dream.q_noise);
-        } else {
-            write(s.noise, &vec![0.0; patches * DREAM_DIRS]);
+        if dream.q_noise.len() != patches * DREAM_DIRS {
+            return Err(format!("dream pushes for {} patches, the frame has {patches}", dream.q_noise.len() / DREAM_DIRS));
         }
+        write(s.noise, &dream.q_noise);
 
         let mut ops = Ops::default();
         let (d, heads) = (self.d, self.heads);

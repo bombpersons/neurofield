@@ -459,6 +459,15 @@ fn main() {
         check::run(&opts, frames, &out);
         return;
     }
+    if cmd == "dream-check" {
+        check::dream_check(&opts);
+        return;
+    }
+    if cmd == "dream-walk" {
+        engine::world::config::Config::load().load_textures(&opts);
+        check::dream_walk(&opts, num("frames", 180) as usize, &out);
+        return;
+    }
     if let Some(dir) = opts.get("photos") {
         engine::world::photo::load(Path::new(dir));
     }

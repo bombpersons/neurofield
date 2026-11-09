@@ -45,7 +45,7 @@ fn centre(c: Node) -> (f32, f32) {
 }
 
 /// Yaw that faces along (dx, dz); the inverse of the GTE rot_y forward (-sin, cos).
-fn yaw_towards(dx: f32, dz: f32) -> f32 {
+pub fn yaw_towards(dx: f32, dz: f32) -> f32 {
     (-dx).atan2(dz) / std::f32::consts::TAU * 4096.0
 }
 

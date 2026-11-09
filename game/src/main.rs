@@ -4,6 +4,8 @@
 //!     The model, skins and textures come from `neurofield.ron` (`engine::world::config`);
 //!     options of the same name override it: `--model x.safetensors`, `--photos DIR`,
 //!     `--strange DIR`, `--level DIR` (level textures alone).
+//!     `--dream x.safetensors` draws the creatures with the dream net (train/export_dream.py).
+//!     `--window 1280x720` sets the window's starting size; the frame follows its shape.
 //!     `--view raster` (or `both`) starts on the rasteriser instead of the network.
 //!     `--strangeness 0.7` sets how strange each level is (otherwise random).
 //!     `--level-file levels/x.ron` plays a hand-built level (see `engine::world::level`) from its
@@ -18,8 +20,10 @@
 //!     strangeness down / up, select new level (or reload), start pause
 //!
 //! The dream effects panel (egui) turns effects on and off in any combination; free the
-//! mouse with Esc to use it. The network runs in the main world each frame and its 320x240
-//! image is uploaded to a texture, drawn with nearest sampling and scaled to fit the window.
+//! mouse with Esc to use it. The network runs in the main world each frame and its image, 240
+//! high and from 320 to 576 wide to match the window's shape (the widths it was trained on;
+//! beyond them there are bars), is uploaded to a texture, drawn with nearest sampling and
+//! scaled to fill the window.
 //! The rasteriser is psx-bevy drawing the level (`engine::render`) into its 320x240 screen.
 //! `GAME_SHOT=out.png:5` saves a screenshot after 5 seconds and quits.
 //!
@@ -47,6 +51,7 @@ use psx_bevy::psx::{fit_scale, PsxPlugin, PsxScreen, DISPLAY_LAYER};
 use psx_bevy::shell::{GameSystems, ShellPlugin, TickRate};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use engine::neural::gpu_net::MAX_W;
 use engine::neural::{effects, Level, Network, TICK};
 
 /// Mouse sensitivity: yaw units (4096 per turn) per pixel of mouse movement.
@@ -74,6 +79,8 @@ struct Sim {
     panel: bool,
     net_ms: f32,
     tris: usize,
+    /// The network's frame width, following the window's shape (`layout`).
+    width: u32,
     /// How strange levels are at their base (the egui slider; new levels keep it).
     strangeness: f32,
     /// A hand-built level being played, and where to start in it (else its player start).
@@ -200,6 +207,12 @@ fn main() {
         engine::world::scene::force_strangeness(Some(s.parse().expect("--strangeness 0..1")));
     }
     let net = Network::load(&model);
+    // The dream creatures, drawn by their own network over the level network's frames.
+    let dream = opts.get("dream").map(|d| {
+        let layer = engine::neural::dream_net::DreamLayer::load(std::path::Path::new(d), seed).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("dream creatures on {}", layer.adapter());
+        layer
+    });
     let mut rng = Rng::new(seed);
     let start = opts.get("start").map(|s| {
         let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().expect("--start x,y,z,yaw")).collect();
@@ -213,11 +226,16 @@ fn main() {
     };
     let strangeness = level.scene.strange.base;
 
+    let window_size = opts.get("window").map_or((960, 720), |w| {
+        let (x, y) = w.split_once('x').expect("--window WIDTHxHEIGHT");
+        (x.parse::<u32>().expect("--window WIDTHxHEIGHT"), y.parse::<u32>().expect("--window WIDTHxHEIGHT"))
+    });
+
     let mut app = App::new();
     let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary_window: (!headless)
-                .then(|| Window { title: "neurofield".into(), resolution: (960, 720).into(), ..default() }),
+                .then(|| Window { title: "neurofield".into(), resolution: window_size.into(), ..default() }),
             exit_condition: if headless {
                 bevy::window::ExitCondition::DontExit
             } else {
@@ -266,6 +284,7 @@ fn main() {
             panel: true,
             net_ms: 0.0,
             tris: 0,
+            width: W,
             strangeness,
             file,
             start,
@@ -282,6 +301,9 @@ fn main() {
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
         .add_systems(FixedUpdate, walk.in_set(GameSystems::Game))
         .add_systems(EguiPrimaryContextPass, panel);
+    if let Some(layer) = dream {
+        app.insert_non_send(layer);
+    }
     #[cfg(feature = "dev-mcp")]
     if mcp {
         app.add_plugins(psx_bevy::dev_mcp::GameMcpPlugin);
@@ -291,8 +313,10 @@ fn main() {
     app.run();
 }
 
+/// As wide as the network can draw, whatever the window: the sprite shows the part in use
+/// (changing the texture's size left the sprite stuck on the first frame of the new size).
 fn frame_image() -> Image {
-    let size = Extent3d { width: W, height: H, depth_or_array_layers: 1 };
+    let size = Extent3d { width: MAX_W, height: H, depth_or_array_layers: 1 };
     let mut image = Image::new_fill(
         size,
         TextureDimension::D2,
@@ -514,29 +538,50 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
 }
 
 /// RGB floats (roughly 0..1, the network's) into an RGBA8 image.
-fn upload_floats(image: &mut Image, rgb: &[f32]) {
+fn upload_floats(image: &mut Image, rgb: &[f32], width: u32) {
+    let stride = MAX_W as usize * 4;
     let data = image.data.get_or_insert_with(Vec::new);
-    data.resize(rgb.len() / 3 * 4, 255);
-    for (px, c) in data.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
-        for i in 0..3 {
-            px[i] = (c[i].clamp(0.0, 1.0) * 255.0) as u8;
+    data.resize(stride * H as usize, 255);
+    for (row, from) in data.chunks_exact_mut(stride).zip(rgb.chunks_exact(width as usize * 3)) {
+        for (px, c) in row.chunks_exact_mut(4).zip(from.chunks_exact(3)) {
+            for i in 0..3 {
+                px[i] = (c[i].clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            px[3] = 255;
         }
-        px[3] = 255;
     }
 }
 
-fn draw(time: Res<Time>, mut sim: ResMut<Sim>, mut net: NonSendMut<Network>, frame: Res<Frame>, mut images: ResMut<Assets<Image>>) {
+fn draw(
+    time: Res<Time>,
+    mut sim: ResMut<Sim>,
+    mut net: NonSendMut<Network>,
+    mut dream: Option<NonSendMut<engine::neural::dream_net::DreamLayer>>,
+    frame: Res<Frame>,
+    mut images: ResMut<Assets<Image>>,
+    mut sprite: Query<&mut Sprite, With<NetworkSprite>>,
+) {
     if !sim.paused {
         let dt = time.delta_secs();
         sim.effects.iter_mut().flatten().for_each(|t| *t += dt);
     }
     if sim.mode != Mode::Raster {
         let t0 = std::time::Instant::now();
-        let mut tokens = sim.level.tokens();
-        let dream = effects::apply_set(&sim.effects, &mut tokens, &sim.level.tris);
-        let rgb = net.render(&tokens, &dream);
+        let width = sim.width;
+        let mut tokens = sim.level.tokens_at(width);
+        let calm = effects::apply_set(&sim.effects, &mut tokens, &sim.level.tris);
+        let mut rgb = net.render(&tokens, &calm);
+        if let Some(layer) = dream.as_mut() {
+            let cam = sim.level.walker.camera();
+            if let Err(e) = layer.draw(&sim.level.scene, sim.version, &cam, &mut rgb, width) {
+                eprintln!("dream layer: {e}");
+            }
+        }
         if let Some(mut image) = images.get_mut(&frame.0) {
-            upload_floats(&mut image, &rgb);
+            upload_floats(&mut image, &rgb, width);
+        }
+        if let Ok(mut sprite) = sprite.single_mut() {
+            sprite.rect = Some(Rect::new(0.0, 0.0, width as f32, H as f32));
         }
         sim.tris = tokens.len();
         sim.net_ms = sim.net_ms * 0.9 + 0.1 * t0.elapsed().as_secs_f32() * 1000.0;
@@ -609,24 +654,36 @@ fn egui_on_display(
 /// Fit the shown frame(s) to the window, keeping 4:3: psx-bevy's display of its
 /// screen for the rasteriser, the network's sprite over it. Both: rasteriser on
 /// the left, network on the right.
+/// The narrowest and widest frames the level network was trained on, at 240 high.
+const NET_WIDTHS: (f32, f32) = (W as f32, MAX_W as f32);
+
 fn layout(
-    sim: Res<Sim>,
+    mut sim: ResMut<Sim>,
     screen: Res<PsxScreen>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut network: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<NetworkSprite>>,
     mut display: Query<(&Sprite, &mut Transform), Without<NetworkSprite>>,
 ) {
     let Ok(window) = window.single() else { return };
-    let size = Vec2::new(W as f32, H as f32);
     let frames = if sim.mode == Mode::Both { 2.0 } else { 1.0 };
-    let scale = fit_scale(window.size() / Vec2::new(frames, 1.0), size);
-    let half = if sim.mode == Mode::Both { size.x * scale / 2.0 } else { 0.0 };
+    let room = window.size() / Vec2::new(frames, 1.0);
+    let half = if sim.mode == Mode::Both { room.x / 2.0 } else { 0.0 };
+    // The rasteriser stays 4:3; the network is as wide as the window asks, within what it knows.
+    let raster = fit_scale(room, Vec2::new(W as f32, H as f32));
     for (sprite, mut t) in &mut display {
         if sprite.image == screen.image {
-            t.scale = Vec3::splat(scale);
+            t.scale = Vec3::splat(raster);
             t.translation.x = -half;
         }
     }
+    let wanted = (room.x / room.y.max(1.0) * H as f32).clamp(NET_WIDTHS.0, NET_WIDTHS.1);
+    // The frame is a multiple of 16 wide, and stretched by at most 2.5% to fill the window.
+    let width = ((wanted / 16.0).round() as u32 * 16).clamp(W, MAX_W);
+    if sim.width != width {
+        sim.width = width;
+    }
+    let size = Vec2::new(wanted, H as f32);
+    let scale = fit_scale(room, size);
     let Ok((mut ns, mut nt, mut nv)) = network.single_mut() else { return };
     ns.custom_size = Some(size * scale);
     nt.translation.x = half;

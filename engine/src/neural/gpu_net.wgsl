@@ -286,6 +286,10 @@ fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
     let y = gid.y;
     let live = x < p.n && y < p.m;
     let plane = p.m * p.n;
+    // x1 > 1: a strided convolution, reading a plane x1 times the size each way.
+    let step = max(p.x1, 1u);
+    let im = p.m * step;
+    let inn = p.n * step;
     var acc0 = vec4<f32>(0.0);
     var acc1 = vec4<f32>(0.0);
     for (var c0 = 0u; c0 < p.k; c0 += 32u) {
@@ -302,12 +306,12 @@ fn conv3x3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
         workgroupBarrier();
         if (live) {
             for (var ci = 0u; ci < kc; ci++) {
-                let src = p.a_off + (c0 + ci) * plane;
+                let src = p.a_off + (c0 + ci) * im * inn;
                 for (var tap = 0u; tap < 9u; tap++) {
-                    let yy = i32(y) + i32(tap / 3u) - 1;
-                    let xx = i32(x) + i32(tap % 3u) - 1;
-                    let inside = yy >= 0 && yy < i32(p.m) && xx >= 0 && xx < i32(p.n);
-                    let at = u32(clamp(yy, 0, i32(p.m) - 1)) * p.n + u32(clamp(xx, 0, i32(p.n) - 1));
+                    let yy = i32(y * step) + i32(tap / 3u) - 1;
+                    let xx = i32(x * step) + i32(tap % 3u) - 1;
+                    let inside = yy >= 0 && yy < i32(im) && xx >= 0 && xx < i32(inn);
+                    let at = u32(clamp(yy, 0, i32(im) - 1)) * inn + u32(clamp(xx, 0, i32(inn) - 1));
                     let v = select(0.0, mem[src + at], inside);
                     let w = (ci * 9u + tap) * 2u;
                     acc0 += v * cw[w];
