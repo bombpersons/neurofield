@@ -1,13 +1,62 @@
-//! The player's state: health, mana, what they carry and what is on the hotbar. No Bevy
-//! here, so the rules can be tested alone.
+//! The player's state: health, mana, what they carry and wear, and what is on the hotbar.
+//! No Bevy here, so the rules can be tested alone.
 
-/// Every kind of item. Its use is in `Player::use_item`.
+/// Every kind of item. Its use is in `Player::use_item`; what can be worn has a `Slot`.
+/// The gear is a stand-in until the real items are designed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     HealingPotion,
     ManaPotion,
     ClearSeeingPotion,
     CalmingPotion,
+    Sword,
+    Buckler,
+    LeatherCap,
+    LeatherVest,
+    WorkGloves,
+    CopperRing,
+}
+
+/// Where something is worn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Weapon,
+    Shield,
+    Helmet,
+    Armour,
+    Gloves,
+    Ring,
+}
+
+/// The equipment slots in order, as the inventory lists them: two for rings.
+pub const EQUIPMENT: [Slot; 7] = [Slot::Weapon, Slot::Shield, Slot::Helmet, Slot::Armour, Slot::Gloves, Slot::Ring, Slot::Ring];
+
+impl Slot {
+    pub fn name(self) -> &'static str {
+        match self {
+            Slot::Weapon => "Weapon",
+            Slot::Shield => "Shield",
+            Slot::Helmet => "Helmet",
+            Slot::Armour => "Armour",
+            Slot::Gloves => "Gloves",
+            Slot::Ring => "Ring",
+        }
+    }
+}
+
+/// Attack, defence and magic, the player's own or what a piece of gear adds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub attack: i32,
+    pub defence: i32,
+    pub magic: i32,
+}
+
+impl std::ops::Add for Stats {
+    type Output = Stats;
+    fn add(self, o: Stats) -> Stats {
+        Stats { attack: self.attack + o.attack, defence: self.defence + o.defence, magic: self.magic + o.magic }
+    }
 }
 
 impl Item {
@@ -17,11 +66,62 @@ impl Item {
             Item::ManaPotion => "mana potion",
             Item::ClearSeeingPotion => "clear seeing potion",
             Item::CalmingPotion => "calming potion",
+            Item::Sword => "sword",
+            Item::Buckler => "buckler",
+            Item::LeatherCap => "leather cap",
+            Item::LeatherVest => "leather vest",
+            Item::WorkGloves => "work gloves",
+            Item::CopperRing => "copper ring",
+        }
+    }
+
+    /// What it does, in a line or two of the inventory screen.
+    pub fn about(self) -> &'static str {
+        match self {
+            Item::HealingPotion => "Heals 15 HP.",
+            Item::ManaPotion => "Restores 6 MP.",
+            Item::ClearSeeingPotion => "See the dungeon as it really is, for a little while.",
+            Item::CalmingPotion => "Takes away all affliction.",
+            Item::Sword => "A plain sword, well kept.",
+            Item::Buckler => "A small round shield.",
+            Item::LeatherCap => "Better than nothing.",
+            Item::LeatherVest => "Stiff leather over the chest.",
+            Item::WorkGloves => "Rough gloves that grip well.",
+            Item::CopperRing => "It hums faintly.",
+        }
+    }
+
+    /// Where it's worn, for gear.
+    pub fn slot(self) -> Option<Slot> {
+        match self {
+            Item::Sword => Some(Slot::Weapon),
+            Item::Buckler => Some(Slot::Shield),
+            Item::LeatherCap => Some(Slot::Helmet),
+            Item::LeatherVest => Some(Slot::Armour),
+            Item::WorkGloves => Some(Slot::Gloves),
+            Item::CopperRing => Some(Slot::Ring),
+            _ => None,
+        }
+    }
+
+    /// What wearing it adds.
+    pub fn stats(self) -> Stats {
+        let s = |attack, defence, magic| Stats { attack, defence, magic };
+        match self {
+            Item::Sword => s(5, 0, 0),
+            Item::Buckler => s(0, 2, 0),
+            Item::LeatherCap => s(0, 1, 0),
+            Item::LeatherVest => s(0, 3, 0),
+            Item::WorkGloves => s(1, 1, 0),
+            Item::CopperRing => s(0, 0, 1),
+            _ => Stats::default(),
         }
     }
 }
 
 pub const SLOTS: usize = 4;
+/// The most of one item that can be carried.
+pub const MOST: u32 = 99;
 const HEAL: i32 = 15;
 const RESTORE: i32 = 6;
 /// How fast affliction rises by itself, per second: from nothing to all in ten minutes.
@@ -42,33 +142,117 @@ pub struct Player {
     /// What is carried and how many, in the order first picked up.
     pub items: Vec<(Item, u32)>,
     pub hotbar: [Option<Item>; SLOTS],
+    /// What is worn, by `EQUIPMENT` slot; worn things aren't in `items`.
+    pub equipped: [Option<Item>; EQUIPMENT.len()],
 }
 
 impl Player {
     pub fn new() -> Player {
-        let mut p = Player { hp: 40, max_hp: 40, mp: 12, max_mp: 12, affliction: 0.0, clarity: 0.0, items: Vec::new(), hotbar: [None; SLOTS] };
+        let mut p = Player {
+            hp: 40,
+            max_hp: 40,
+            mp: 12,
+            max_mp: 12,
+            affliction: 0.0,
+            clarity: 0.0,
+            items: Vec::new(),
+            hotbar: [None; SLOTS],
+            equipped: [None; EQUIPMENT.len()],
+        };
+        p.equipped[0] = Some(Item::Sword);
         p.add(Item::HealingPotion, 3);
         p.add(Item::ManaPotion, 2);
         p.add(Item::ClearSeeingPotion, 2);
         p.add(Item::CalmingPotion, 1);
+        p.add(Item::Buckler, 1);
+        p.add(Item::LeatherCap, 1);
+        p.add(Item::LeatherVest, 1);
+        p.add(Item::WorkGloves, 1);
+        p.add(Item::CopperRing, 2);
         p
+    }
+
+    /// The player's own stats, with all they wear.
+    pub fn stats(&self) -> Stats {
+        self.equipped.iter().flatten().fold(Stats::default(), |s, i| s + i.stats())
+    }
+
+    /// The stats with `item` worn in equipment slot `at` instead of what is there.
+    pub fn stats_with(&self, at: usize, item: Option<Item>) -> Stats {
+        let mut p = self.equipped;
+        p[at] = item;
+        p.iter().flatten().fold(Stats::default(), |s, i| s + i.stats())
+    }
+
+    /// Wear one of `item` in equipment slot `at`, the one there going back into the bag.
+    /// False if it doesn't go there, none is carried, or there's no room for the old one.
+    pub fn equip(&mut self, item: Item, at: usize) -> bool {
+        if item.slot() != Some(EQUIPMENT[at]) || self.count(item) == 0 {
+            return false;
+        }
+        if let Some(old) = self.equipped[at] {
+            if old != item && self.count(old) >= MOST {
+                return false;
+            }
+        }
+        self.remove_one(item);
+        if let Some(old) = self.equipped[at].replace(item) {
+            self.add(old, 1);
+        }
+        true
+    }
+
+    /// Where `item` would go on: its slot, or for a ring the first free ring slot.
+    pub fn slot_for(&self, item: Item) -> Option<usize> {
+        let fits: Vec<usize> = (0..EQUIPMENT.len()).filter(|&i| Some(EQUIPMENT[i]) == item.slot()).collect();
+        fits.iter().copied().find(|&i| self.equipped[i].is_none()).or(fits.first().copied())
+    }
+
+    /// Take off what is in equipment slot `at`; false if there's nothing, or no room for it.
+    pub fn unequip(&mut self, at: usize) -> bool {
+        match self.equipped[at] {
+            Some(item) if self.count(item) < MOST => {
+                self.equipped[at] = None;
+                self.add(item, 1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop one of `item`: false if none is carried.
+    pub fn drop_one(&mut self, item: Item) -> bool {
+        let had = self.count(item) > 0;
+        self.remove_one(item);
+        had
+    }
+
+    pub fn weapon(&self) -> Option<Item> {
+        self.equipped[0]
     }
 
     pub fn count(&self, item: Item) -> u32 {
         self.items.iter().find(|s| s.0 == item).map_or(0, |s| s.1)
     }
 
-    /// Carry `n` more of `item`, on the first free hotbar slot if it isn't on one.
-    pub fn add(&mut self, item: Item, n: u32) {
-        match self.items.iter_mut().find(|s| s.0 == item) {
-            Some(s) => s.1 += n,
-            None => self.items.push((item, n)),
+    /// Carry up to `n` more of `item`, as many as there's room for up to `MOST`, and put
+    /// what can be used on the first free hotbar slot if it isn't on one. Gives how many
+    /// there was no room for.
+    pub fn add(&mut self, item: Item, n: u32) -> u32 {
+        let took = n.min(MOST - self.count(item));
+        if took == 0 {
+            return n;
         }
-        if !self.hotbar.contains(&Some(item)) {
+        match self.items.iter_mut().find(|s| s.0 == item) {
+            Some(s) => s.1 += took,
+            None => self.items.push((item, took)),
+        }
+        if item.slot().is_none() && !self.hotbar.contains(&Some(item)) {
             if let Some(free) = self.hotbar.iter_mut().find(|s| s.is_none()) {
                 *free = Some(item);
             }
         }
+        n - took
     }
 
     /// Lose one of `item`, and its hotbar slot with the last of them.
@@ -106,8 +290,24 @@ impl Player {
         Some(self.use_item(item))
     }
 
+    /// The hotbar slot `item` is on, if any.
+    pub fn slot_of(&self, item: Item) -> Option<usize> {
+        self.hotbar.iter().position(|s| *s == Some(item))
+    }
+
+    /// Put `item` on hotbar slot `slot`, moving it from any other slot and taking off
+    /// whatever was there.
+    pub fn put_on_hotbar(&mut self, item: Item, slot: usize) {
+        self.take_off_hotbar(item);
+        self.hotbar[slot] = Some(item);
+    }
+
+    pub fn take_off_hotbar(&mut self, item: Item) {
+        self.hotbar.iter_mut().filter(|s| **s == Some(item)).for_each(|s| *s = None);
+    }
+
     /// Use one of `item`. One that would do nothing isn't used up.
-    fn use_item(&mut self, item: Item) -> String {
+    pub fn use_item(&mut self, item: Item) -> String {
         match item {
             Item::HealingPotion if self.hp >= self.max_hp => "you are not hurt".into(),
             Item::HealingPotion => {
@@ -133,6 +333,7 @@ impl Player {
                 self.remove_one(item);
                 "your head clears".into()
             }
+            _ => format!("the {} can't be used", item.name()),
         }
     }
 }
@@ -186,6 +387,75 @@ mod tests {
         p.hotbar = [Some(Item::HealingPotion); SLOTS];
         p.add(Item::ManaPotion, 1);
         assert_eq!(p.count(Item::ManaPotion), 3);
+    }
+
+    #[test]
+    fn an_item_moves_between_hotbar_slots_and_takes_the_place_of_another() {
+        let mut p = Player::new();
+        p.put_on_hotbar(Item::HealingPotion, 2);
+        assert_eq!(p.hotbar, [None, Some(Item::ManaPotion), Some(Item::HealingPotion), Some(Item::CalmingPotion)]);
+        assert_eq!(p.slot_of(Item::ClearSeeingPotion), None);
+        assert_eq!(p.count(Item::ClearSeeingPotion), 2);
+        p.take_off_hotbar(Item::ManaPotion);
+        assert_eq!(p.slot_of(Item::ManaPotion), None);
+        assert_eq!(p.use_slot(1), None);
+    }
+
+    #[test]
+    fn no_more_than_the_most_is_carried() {
+        let mut p = Player::new();
+        assert_eq!(p.add(Item::HealingPotion, 100), 4);
+        assert_eq!(p.count(Item::HealingPotion), MOST);
+        assert_eq!(p.add(Item::HealingPotion, 1), 1);
+    }
+
+    #[test]
+    fn gear_is_worn_in_its_slot_and_the_old_piece_comes_back() {
+        let mut p = Player::new();
+        assert_eq!(p.stats(), Stats { attack: 5, defence: 0, magic: 0 });
+        assert!(!p.equip(Item::Buckler, 2));
+        p.items.retain(|s| s.0 != Item::LeatherVest);
+        assert!(!p.equip(Item::LeatherVest, 3));
+        assert!(p.equip(Item::Buckler, 1));
+        assert_eq!(p.count(Item::Buckler), 0);
+        assert_eq!(p.stats().defence, 2);
+        assert!(p.unequip(0));
+        assert_eq!(p.count(Item::Sword), 1);
+        assert_eq!(p.stats().attack, 0);
+        assert_eq!(p.stats_with(0, Some(Item::Sword)).attack, 5);
+        assert!(!p.unequip(0));
+    }
+
+    #[test]
+    fn two_rings_go_in_the_two_ring_slots() {
+        let mut p = Player::new();
+        let first = p.slot_for(Item::CopperRing).unwrap();
+        assert!(p.equip(Item::CopperRing, first));
+        let second = p.slot_for(Item::CopperRing).unwrap();
+        assert_ne!(first, second);
+        assert!(p.equip(Item::CopperRing, second));
+        assert_eq!(p.count(Item::CopperRing), 0);
+        assert_eq!(p.stats().magic, 2);
+        assert!(!p.items.iter().any(|s| s.0 == Item::CopperRing));
+    }
+
+    #[test]
+    fn gear_doesnt_go_on_the_hotbar_by_itself_and_cant_be_used() {
+        let mut p = Player::new();
+        p.hotbar = [None; SLOTS];
+        p.items.clear();
+        p.add(Item::LeatherVest, 1);
+        assert_eq!(p.hotbar, [None; SLOTS]);
+        assert_eq!(p.use_item(Item::LeatherVest), "the leather vest can't be used");
+        assert_eq!(p.count(Item::LeatherVest), 1);
+    }
+
+    #[test]
+    fn dropping_takes_one_and_its_slot_with_the_last() {
+        let mut p = Player::new();
+        assert!(p.drop_one(Item::CalmingPotion));
+        assert_eq!(p.slot_of(Item::CalmingPotion), None);
+        assert!(!p.drop_one(Item::CalmingPotion));
     }
 
     #[test]

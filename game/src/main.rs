@@ -18,12 +18,14 @@
 //!     E (or circle) opens and closes the door in front, or pulls the lever; walking over a
 //!     key picks it up, and locked doors open for their key.
 //!     Mouse: look   Right click: attack   WASD: walk and strafe   Arrows: walk and turn   Space: jump
-//!     Shift: sprint   1-4: use the hotbar   Esc: free the mouse (click to capture it
-//!     again; Esc again quits)
+//!     Shift: sprint   1-4: use the hotbar   Esc: the pause menu (`menu`), which frees the mouse
 //!     Gamepad: left stick walk and strafe, right stick look, cross jump, L3 sprint,
-//!     R2 attack, circle use, d-pad use the hotbar, start pause
-//!     Debug keys: F1 network / rasteriser   F2 both side by side   F3 be hit   Tab auto-walk
-//!     H show the effects panel   N new level   P pause
+//!     R2 attack, circle use, d-pad use the hotbar, start the pause menu
+//!     In the menus: arrows or WASD (d-pad) move, Enter, Space or E (cross) choose, Esc or
+//!     Backspace (circle) go back; the mouse points and clicks, right click goes back. In the
+//!     inventory, 1-4 (square + d-pad) put the item picked on that hotbar slot.
+//!     Debug keys: F1 network / rasteriser   F2 both side by side   F3 be hit   F4 free or
+//!     capture the mouse   Tab auto-walk   H show the effects panel   N new level   P freeze
 //!     Debug on the pad, holding select: d-pad walk and turn, L2 sprint, triangle
 //!     network / rasteriser, square auto-walk, L1 / R1 strangeness down / up, circle
 //!     hurt, cross new level (or reload)
@@ -67,9 +69,12 @@ use engine::neural::gpu_net::MAX_W;
 use engine::neural::{effects, Level, Network, TICK};
 
 mod hud;
+mod drops;
+mod menu;
 mod player;
 mod sword;
 use hud::HudState;
+use menu::{Menu, Outcome, Press};
 use player::Player;
 use sword::Sword;
 
@@ -154,6 +159,12 @@ struct Sim {
     sword: Sword,
     /// Whether the controller was the last thing used, for the shape of the hotbar.
     on_pad: bool,
+    /// The pause menu, while it's open; the game stands still under it.
+    menu: Option<Menu>,
+    /// What the player has dropped in this level.
+    drops: Vec<drops::Dropped>,
+    /// Quit game was chosen.
+    quit: bool,
 }
 
 impl Sim {
@@ -217,6 +228,7 @@ impl Sim {
     fn reload(&mut self) {
         self.version += 1;
         self.held.clear();
+        self.drops.clear();
         match &self.file {
             Some(f) => match load_level(f, self.start, &mut self.rng) {
                 Ok(level) => self.level = level,
@@ -247,9 +259,46 @@ impl Sim {
         self.said = Some((what, 3.0));
     }
 
-    /// Whether the player's own actions count: not paused, not on auto-walk.
+    /// Whether the game stands still: frozen by the debug key, or under the menu.
+    fn frozen(&self) -> bool {
+        self.paused || self.menu.is_some()
+    }
+
+    /// Whether the player's own actions count: not standing still, not on auto-walk.
     fn in_control(&self) -> bool {
-        !self.paused && !self.auto_walk
+        !self.frozen() && !self.auto_walk
+    }
+
+    fn toggle_menu(&mut self) {
+        self.menu = if self.menu.is_some() { None } else { Some(Menu::new()) };
+    }
+
+    fn menu_press(&mut self, press: Press) {
+        let Some(menu) = &mut self.menu else { return };
+        match menu.press(press, &mut self.player) {
+            Outcome::Nothing => {}
+            Outcome::Close => self.menu = None,
+            Outcome::Quit => self.quit = true,
+            Outcome::Drop(item) => {
+                let (feet, yaw) = self.feet();
+                self.drops.push(drops::drop(&self.level.scene, item, feet, yaw));
+            }
+        }
+    }
+
+    /// Pick up whatever dropped thing the feet have come back to, if there's room for it.
+    fn pick_up(&mut self) {
+        let (feet, _) = self.feet();
+        for i in drops::in_reach(&mut self.drops, feet).into_iter().rev() {
+            let item = self.drops[i].item;
+            if self.player.add(item, 1) == 0 {
+                self.drops.remove(i);
+                self.say(format!("picked up the {}", item.name()));
+            } else {
+                drops::disarm(&mut self.drops[i]);
+                self.say(format!("you can't carry more of the {}", item.name()));
+            }
+        }
     }
 
     fn jump(&mut self) {
@@ -308,6 +357,8 @@ struct Status;
 struct Hud {
     image: Handle<Image>,
     shown: Option<HudState>,
+    /// Where the mouse can point in the menu, in the HUD's pixels.
+    hits: Vec<hud::Hit>,
 }
 
 /// Shows the HUD, over the network's frame.
@@ -347,6 +398,13 @@ struct Report {
     veil: f32,
     /// How many tentacles are out.
     growths: usize,
+    /// The menu's screen and selection, empty while it's closed.
+    menu: String,
+    /// What is worn, by equipment slot, and the stats it makes.
+    equipped: Vec<String>,
+    stats: [i32; 3],
+    /// What lies dropped, and where.
+    drops: Vec<(String, Vec3)>,
 }
 
 fn main() {
@@ -490,11 +548,14 @@ fn main() {
             player,
             sword: Sword::default(),
             on_pad: false,
+            menu: None,
+            drops: Vec::new(),
+            quit: false,
         })
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
-        .add_systems(Update, (keys, mouse, draw, build_scene, move_things, pose_sculpted, raster_camera, status, update_hud, auto_screenshot).chain())
+        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, raster_camera, status, update_hud, auto_screenshot).chain())
         .add_systems(Update, egui_on_display)
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
@@ -558,7 +619,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         RenderLayers::layer(DISPLAY_LAYER),
         HudSprite,
     ));
-    commands.insert_resource(Hud { image: hud, shown: None });
+    commands.insert_resource(Hud { image: hud, shown: None, hits: Vec::new() });
     commands.spawn((
         Text::new(""),
         TextFont { font_size: bevy::text::FontSize::Px(14.0), ..default() },
@@ -598,24 +659,31 @@ fn keys(
     gamepads: Query<&Gamepad>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    if key.get_just_pressed().next().is_some() {
+        sim.on_pad = false;
+    }
+    if sim.quit {
+        exit.write(AppExit::Success);
+    }
+    if sim.menu.is_some() {
+        menu_keys(&key, &mut sim);
+        return;
+    }
+    if key.just_pressed(KeyCode::Escape) {
+        sim.toggle_menu();
+        return;
+    }
     if let Ok(mut cursor) = cursor.single_mut() {
         let captured = cursor.grab_mode != CursorGrabMode::None;
-        if captured && button.just_pressed(MouseButton::Right) && sim.in_control() {
+        if captured && button.just_pressed(MouseButton::Right) && sim.in_control() && sim.player.weapon().is_some() {
             sim.sword.attack();
-        }
-        if key.just_pressed(KeyCode::Escape) {
-            if captured {
-                set_captured(&mut cursor, false);
-            } else {
-                exit.write(AppExit::Success);
-            }
         }
         if button.just_pressed(MouseButton::Left) && !captured && !egui.is_pointer_over_area() {
             set_captured(&mut cursor, true);
         }
-    }
-    if key.get_just_pressed().next().is_some() {
-        sim.on_pad = false;
+        if key.just_pressed(KeyCode::F4) {
+            set_captured(&mut cursor, !captured);
+        }
     }
     if key.just_pressed(KeyCode::F1) {
         sim.toggle_renderer();
@@ -659,18 +727,77 @@ fn keys(
     }
 }
 
+/// The keyboard in the menus.
+fn menu_keys(key: &ButtonInput<KeyCode>, sim: &mut Sim) {
+    let mut moves = vec![
+        (KeyCode::ArrowUp, Press::Up),
+        (KeyCode::KeyW, Press::Up),
+        (KeyCode::ArrowDown, Press::Down),
+        (KeyCode::KeyS, Press::Down),
+        (KeyCode::Enter, Press::Confirm),
+        (KeyCode::NumpadEnter, Press::Confirm),
+        (KeyCode::Space, Press::Confirm),
+        (KeyCode::KeyE, Press::Confirm),
+        (KeyCode::Escape, Press::Back),
+        (KeyCode::Backspace, Press::Back),
+    ];
+    moves.extend([(KeyCode::ArrowLeft, Press::Left), (KeyCode::KeyA, Press::Left), (KeyCode::ArrowRight, Press::Right), (KeyCode::KeyD, Press::Right)]);
+    for (slot, k) in [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4].into_iter().enumerate() {
+        moves.push((k, Press::Slot(slot)));
+    }
+    for (k, press) in moves {
+        if key.just_pressed(k) {
+            sim.menu_press(press);
+        }
+    }
+}
+
+/// The pad in the menus. While a hotbar slot is being picked, or with square held, a d-pad
+/// direction is its hotbar slot, as in play: square and a direction puts the item picked in
+/// the list on that slot.
+fn menu_pad(pad: &ControllerState, sim: &mut Sim) {
+    if pad.pressed(Button::Start) {
+        sim.menu = None;
+        return;
+    }
+    let picking = sim.menu.as_ref().is_some_and(Menu::picking) || pad.held(Button::Square);
+    let dpad = [Button::Up, Button::Right, Button::Down, Button::Left];
+    for (i, b) in dpad.into_iter().enumerate() {
+        if pad.pressed(b) {
+            match (picking, b) {
+                (true, _) => sim.menu_press(Press::Slot(i)),
+                (false, Button::Up) => sim.menu_press(Press::Up),
+                (false, Button::Down) => sim.menu_press(Press::Down),
+                (false, Button::Left) => sim.menu_press(Press::Left),
+                (false, _) => sim.menu_press(Press::Right),
+            }
+        }
+    }
+    if pad.pressed(Button::Cross) {
+        sim.menu_press(Press::Confirm);
+    }
+    if pad.pressed(Button::Circle) {
+        sim.menu_press(Press::Back);
+    }
+}
+
 /// Pad buttons, sampled once per tick by psx-bevy's shell (where the developer
 /// MCP's buttons arrive too).
 fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
     if pad.left_stick != Vec2::ZERO || pad.right_stick != Vec2::ZERO || !pad.buttons().is_empty() {
         sim.on_pad = true;
     }
+    if sim.menu.is_some() {
+        menu_pad(pad, sim);
+        return;
+    }
     if pad.held(Button::Select) {
         debug_chords(pad, sim);
         return;
     }
     if pad.pressed(Button::Start) {
-        sim.paused = !sim.paused;
+        sim.toggle_menu();
+        return;
     }
     if !sim.in_control() {
         return;
@@ -681,7 +808,7 @@ fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
     if pad.pressed(Button::Circle) {
         sim.use_thing();
     }
-    if pad.pressed(Button::R2) {
+    if pad.pressed(Button::R2) && sim.player.weapon().is_some() {
         sim.sword.attack();
     }
     // Holding triangle will give the d-pad to the quick-change list.
@@ -756,6 +883,61 @@ fn panel(mut contexts: EguiContexts, mut sim: ResMut<Sim>) -> Result {
     Ok(())
 }
 
+/// The mouse in the menus: hovering picks a row, a click chooses it and right click goes back.
+fn menu_mouse(
+    button: Res<ButtonInput<MouseButton>>,
+    egui: Res<EguiWantsInput>,
+    hud: Res<Hud>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    shown: Query<(&Sprite, &Transform), With<HudSprite>>,
+    mut last: Local<Option<Vec2>>,
+    mut sim: ResMut<Sim>,
+) {
+    if sim.menu.is_none() || egui.is_pointer_over_area() {
+        return;
+    }
+    if button.just_pressed(MouseButton::Right) {
+        sim.menu_press(Press::Back);
+        return;
+    }
+    let (Ok(window), Ok((sprite, t))) = (window.single(), shown.single()) else { return };
+    let (Some(cursor), Some(size), Some(rect)) = (window.cursor_position(), sprite.custom_size, sprite.rect) else { return };
+    // The sprite is centred on its translation, with y up; the cursor is from the top left.
+    let corner = window.size() / 2.0 + Vec2::new(t.translation.x, -t.translation.y) - size / 2.0;
+    let at = (cursor - corner) / size * rect.size();
+    let hit = hud.hits.iter().find(|([x, y, w, h], _)| {
+        (*x as f32..(x + w) as f32).contains(&at.x) && (*y as f32..(y + h) as f32).contains(&at.y)
+    });
+    let moved = *last != Some(cursor);
+    *last = Some(cursor);
+    let Some(&(_, index)) = hit else { return };
+    let clicked = button.just_pressed(MouseButton::Left);
+    if moved || clicked {
+        sim.menu.as_mut().unwrap().point(index);
+    }
+    if clicked {
+        sim.menu_press(Press::Confirm);
+    }
+}
+
+/// Frees the mouse while the menu is open, and takes it back after if it had it before.
+fn menu_cursor(sim: Res<Sim>, mut was: Local<Option<bool>>, mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>) {
+    let Ok(mut cursor) = cursor.single_mut() else { return };
+    match (sim.menu.is_some(), *was) {
+        (true, None) => {
+            *was = Some(cursor.grab_mode != CursorGrabMode::None);
+            set_captured(&mut cursor, false);
+        }
+        (false, Some(captured)) => {
+            *was = None;
+            if captured {
+                set_captured(&mut cursor, true);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Mouse and right-stick look, every frame (not at the walk's 30 Hz) so it stays smooth.
 fn mouse(
     motion: Res<AccumulatedMouseMotion>,
@@ -764,7 +946,7 @@ fn mouse(
     mut sim: ResMut<Sim>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
 ) {
-    if sim.auto_walk || sim.paused {
+    if sim.auto_walk || sim.frozen() {
         return;
     }
     let captured = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
@@ -808,8 +990,12 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         calm: sim.calm,
         veil: sim.veil,
         growths: sim.growths.as_ref().map_or(0, Growths::count),
+        menu: sim.menu.as_ref().map_or(String::new(), |m| format!("{:?}", m.screen)),
+        equipped: sim.player.equipped.iter().map(|s| s.map_or(String::new(), |i| i.name().to_string())).collect(),
+        stats: { let s = sim.player.stats(); [s.attack, s.defence, s.magic] },
+        drops: sim.drops.iter().map(|d| (d.item.name().to_string(), Vec3::from(d.at))).collect(),
     };
-    if sim.paused {
+    if sim.frozen() {
         return;
     }
     let clear = sim.player.clarity > 0.0;
@@ -833,6 +1019,7 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         sim.level.things_moved();
     }
     let (feet, _) = sim.feet();
+    sim.pick_up();
     for (id, name) in sim.level.scene.take_pickups(feet) {
         sim.said = Some((format!("picked up the {name}"), 3.0));
         sim.held.push((id, name));
@@ -893,7 +1080,7 @@ fn draw(
     mut images: ResMut<Assets<Image>>,
     mut sprite: Query<&mut Sprite, With<NetworkSprite>>,
 ) {
-    if !sim.paused {
+    if !sim.frozen() {
         let dt = time.delta_secs();
         sim.effects.iter_mut().flatten().for_each(|t| *t += dt);
         sim.dream_time += dt;
@@ -1116,18 +1303,21 @@ fn layout(
 /// Redraw the HUD's image when what it shows has changed.
 fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut images: ResMut<Assets<Image>>) {
     let sim = &mut *sim;
-    if !sim.paused {
+    if !sim.frozen() {
         sim.sword.update(time.delta_secs(), sim.level.walker.yaw);
     }
     let width = if sim.shown() == Mode::Raster { W } else { sim.width };
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
-    let state = HudState::of(&sim.player, width, sim.on_pad, yaw, sim.sword.pose(sim.level.walker.bob()));
+    let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.sword.pose(sim.level.walker.bob()));
+    if !sim.drops.is_empty() {
+        state.drops = drops::triangles(&sim.drops, &sim.level.scene, &sim.level.walker.camera(), width);
+    }
     if hud.shown.as_ref() == Some(&state) {
         return;
     }
     let Some(mut image) = images.get_mut(&hud.image) else { return };
     if let Some(data) = image.data.as_mut() {
-        hud::draw(data, MAX_W, H, &state);
+        hud.hits = hud::draw(data, MAX_W, H, &state);
         hud.shown = Some(state);
     }
 }
@@ -1155,7 +1345,7 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
     let fps = 1.0 / time.delta_secs().max(1e-6);
     let mode = sim.shown().name();
     let walk = if sim.auto_walk { "auto-walk" } else { "walking" };
-    let pause = if sim.paused { " | paused" } else { "" };
+    let pause = if sim.paused { " | frozen" } else if sim.menu.is_some() { " | menu" } else { "" };
     let on = sim.effects.iter().flatten().count();
     let keys = match sim.held.len() {
         0 => String::new(),
@@ -1165,7 +1355,7 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
     let dial = if sim.sculpted.is_some() { format!("flesh {:.0}% | ", sim.dial * 100.0) } else { String::new() };
     text.0 = format!(
         "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | affliction {:.0}% | {dial}{walk}{pause}{keys}\n\
-         mouse: look  rmb: attack  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  f1: switch  f2: both  f3: hurt  h: panel  esc: free mouse{said}",
+         mouse: look  rmb: attack  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  esc: menu  f1: switch  f2: both  f3: hurt  f4: free mouse  h: panel{said}",
         sim.net_ms, sim.tris, sim.player.affliction * 100.0
     );
 }

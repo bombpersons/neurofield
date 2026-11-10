@@ -107,9 +107,15 @@ plain PSX renderer instead of the neural one.
 
 ## Player, inventory and equipment
 
-- The player has an inventory and equipment slots (weapon, shield, armour, and
-  so on).
+- The player has an inventory and equipment slots: weapon, shield, helmet,
+  armour (body), gloves and two rings.
 - The player has health (HP) and mana (MP). Spells use MP.
+- **Stats** for now: Attack, Defence and Magic. What is worn adds to them.
+- There is no limit on how many kinds of item the player carries, but at most
+  99 of any one.
+- **Dropping** an item puts it on the floor in front of the player, where it
+  can be picked up again by walking over it. For now it is a little cube drawn
+  PS1-style over either renderer.
 
 ## Movement and camera
 
@@ -207,18 +213,27 @@ It has:
 ```
 
 - **Left: items.** A list of everything the player is carrying. Each row has an
-  icon, the item's name and how many the player has.
+  icon, the item's name and how many the player has. An item on the hotbar shows
+  its slot number on its icon.
   - Confirming an item opens a modal window on top asking what to do with it.
-    The options depend on the item (use, drop, and so on).
+    The options depend on the item: something usable can be used, put on (or
+    moved on, or taken off) the hotbar, or dropped; gear can be equipped or
+    dropped.
+  - **Hotbar shortcut.** While an item is selected, pressing a hotbar slot's
+    own button puts it on that slot: 1–4 on the keyboard. On a controller the
+    d-pad also moves through the list, so hold Square and press the slot's
+    d-pad direction.
 - **Right column**, from top to bottom: the player model, the equipment slots,
   then stats.
 - **Player model.** A 3D model of the player character wearing whatever is
-  equipped.
+  equipped. It needs the same kind of human model as the people in the castle
+  and the dungeon.
 - **Equipment slots.** The current equipment. Pressing right moves the
-  selection from the item list over to the slots.
+  selection from the item list over to the slots, and left moves it back.
   - Clicking or confirming a slot opens a modal window that lists the items the
     player has that can go in that slot.
-  - The window shows how each item would change the player's stats.
+  - The window shows how each item would change the player's stats. It can
+    also take off what is worn.
   - Confirming an item equips it and closes the window.
 - **Stats.** The player's current stats. There is no separate Stats screen;
   this is where the player sees them.
@@ -257,3 +272,6 @@ options:
 - Does "cast now" from the pause menu cast the spell the moment the menu
   closes? This would allow mid-fight healing without the game running.
 - What the artifact is, and why the dungeon is strange.
+- What goes in Options. psx-bevy's controls menu rebinds keys the game doesn't
+  read through it, and its display menu changes the screen size the networks
+  draw at.

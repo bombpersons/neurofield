@@ -189,7 +189,7 @@ fn model() -> Vec<ModelTri> {
 }
 
 /// A triangle on the frame: whole pixels and a colour at each corner.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenTri {
     pub p: [(i32, i32); 3],
     pub colour: [[u8; 3]; 3],
