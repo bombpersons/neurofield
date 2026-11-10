@@ -28,6 +28,13 @@
 //!     against `train/data.py` and PyTorch. The model and textures are
 //!     `neurofield.ron`'s unless given.
 //!
+//! With `--sculpt EYE_DIR`, `gen` instead makes the level net's sculpted targets
+//! (`world::dreamed`): no creatures, every level turning to flesh and each view at
+//! its own place on the dial and moment. The plain triangles stay the input;
+//! `turning.npy`, `organs.npy` and `amounts.npy` say what the net can't guess. It
+//! needs `--strange` to be the painted textures with height maps. A share
+//! `--organ-views` (default 0.4) of the views stand in front of an eye or sphincter.
+//!
 //! `gen` keeps the creatures apart from the frame (see `format.json`); the rest
 //! draw them over it, as the game does.
 //!
@@ -51,6 +58,7 @@ use engine::neural::features::{part_features, tri_features, view_features, PART_
 use engine::render::headless::{Frame, Renderer};
 use engine::world::level::Level;
 use engine::world::creature::Creature;
+use engine::world::dreamed::{self, Dreamed, ORGAN_FEATURES, TURNING_FEATURES};
 use engine::world::rng::Rng;
 use engine::world::scene::{Camera, Scene};
 use engine::world::view::{H, W};
@@ -80,6 +88,10 @@ const FORMAT: &str = r#"{
   "creature_boxes.npy": "int32 [V, 4] per view: x0, y0, x1, y1, the pixels creatures touch (x0 <= x < x1, y0 <= y < y1); empty (x0 = x1) when none do",
   "creatures.npy": "uint8 [sum of box area * 4]: per view its box's pixels, rows top to bottom, as rgba: the colour of the creature samples in the pixel (2x2 per pixel), averaged, and alpha = samples covered / 4 (0, 64, 128, 191 or 255); rgb is 0 where alpha is. In gen every creature is whole, however much of the level stands in front of it; in walk the level hides them as on screen. The game lays them over the frame as mix(frame, rgb, alpha) in linear light (the screen is sRGB); view v starts at creature_offsets[v]",
   "creature_offsets.npy": "int64 [V + 1]: byte offsets of each view's box in creatures.npy",
+  "turning.npy": "sculpted data only. float32 [T, 15] per triangle of tris.npy: how much of the dial reaches each corner (0-2); the corners on the flesh textures, in repeats (3-8); height of the folds in tiles at the corners and at the middles of edges ab, ac, bc (9-14). Zeros on what stays stone",
+  "amounts.npy": "sculpted data only. float32 [V]: how far the level has turned in this view, 0 plain stone to 1 all of it",
+  "organs.npy": "sculpted data only. float32 [O, 19] per eye, sphincter or length of vein in a view: kind 0 eye, 1 sphincter, 2 vein (0); where it is now, tiles (1-3); what it faces (4-6); across and up (7-12; an eye's are the image's right and up, a vein's along it and to the side); half its size along those, tiles (13-14; a vein's half length and radius now); state (15-18): eye showing, blink frame as a share (0 open), gaze across and down 0..1; sphincter showing and clench; vein beat",
+  "organ_offsets.npy": "sculpted data only. int64 [V + 1]: view v owns organs[organ_offsets[v] : organ_offsets[v + 1]]",
   "projection": "view = R (p - pos); screen = (width / 2 + H * view.x / view.z, 120 + H * view.y / view.z); triangles are clipped at view.z = 0.02 tiles",
   "shading": "level, per vertex: colour = baked + tint * torch * max(0, 1 - d / reach)^2 * max(0, n . l), d and l toward the camera; per pixel: texel * colour / 128 (affine), toward the fog colour by clamp((distance - fog near) / (fog far - fog near), 0, 1), dithered to 15 bits. Creatures are drawn over that in full colour, anti-aliased (see engine/src/render/flesh.wesl)"
 }
@@ -120,6 +132,11 @@ struct Batch {
     creature_offsets: Vec<i64>,
     /// The first 4:3 frames, for the preview sheet.
     frames: Vec<Vec<u8>>,
+    /// Sculpted data only: what the net is told beyond the plain triangles.
+    turning: Vec<f32>,
+    amounts: Vec<f32>,
+    organs: Vec<f32>,
+    organ_offsets: Vec<i64>,
 }
 
 /// The box round the pixels of a `width`-wide RGBA layer with any alpha, as
@@ -153,6 +170,10 @@ impl Batch {
             creatures: Vec::new(),
             creature_offsets: vec![0],
             frames: Vec::new(),
+            turning: Vec::new(),
+            amounts: Vec::new(),
+            organs: Vec::new(),
+            organ_offsets: vec![0],
         }
     }
 
@@ -195,6 +216,13 @@ impl Batch {
         npy::write(&dir.join("creature_boxes.npy"), &[nv, 4], &self.boxes).unwrap();
         npy::write(&dir.join("creatures.npy"), &[self.creatures.len()], &self.creatures).unwrap();
         npy::write(&dir.join("creature_offsets.npy"), &[nv + 1], &self.creature_offsets).unwrap();
+        if !self.amounts.is_empty() {
+            assert_eq!(self.turning.len() / TURNING_FEATURES, self.tris.len() / TRI_FEATURES);
+            npy::write(&dir.join("turning.npy"), &[self.turning.len() / TURNING_FEATURES, TURNING_FEATURES], &self.turning).unwrap();
+            npy::write(&dir.join("amounts.npy"), &[nv], &self.amounts).unwrap();
+            npy::write(&dir.join("organs.npy"), &[self.organs.len() / ORGAN_FEATURES, ORGAN_FEATURES], &self.organs).unwrap();
+            npy::write(&dir.join("organ_offsets.npy"), &[nv + 1], &self.organ_offsets).unwrap();
+        }
         contact_sheet(&dir.join("preview.png"), &self.frames);
     }
 }
@@ -223,6 +251,30 @@ struct Sources {
     level_share: f32,
     /// Every view this wide, or (None) each its own width at random.
     width: Option<u32>,
+    /// Where the filmed eye's frames are, to draw sculpted targets, and the share of views
+    /// to stand in front of its eyes and sphincters.
+    sculpt: Option<PathBuf>,
+    organ_views: f32,
+}
+
+/// One view to draw: where from, how wide, and for sculpted data the moment and the dial.
+struct Shot {
+    cam: Camera,
+    width: u32,
+    time: f32,
+    amount: f32,
+}
+
+/// Where on the dial a view is: mostly anywhere, with both ends common, since the game
+/// spends a lot of its time at them.
+fn pick_amount(rng: &mut Rng) -> f32 {
+    if rng.chance(0.1) {
+        0.0
+    } else if rng.chance(0.35) {
+        1.0
+    } else {
+        rng.f()
+    }
 }
 
 /// A view's screen width: a multiple of 16 from 320 to `DRAW_W`.
@@ -238,8 +290,9 @@ fn level_scene(level: &Level, rng: &mut Rng) -> Option<(Scene, engine::world::wa
 }
 
 /// Scene `i` of a run and the cameras (with their widths) to draw it from.
-fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, Vec<(Camera, u32)>) {
+fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, Option<Dreamed>, Vec<Shot>) {
     let mut rng = Rng::new(seed.wrapping_mul(1_000_003) ^ i as u64);
+    let mut dreamed = None;
     let (scene, cams) = match src.mode {
         CameraMode::Free => {
             let scene = Scene::generate(&mut rng);
@@ -253,7 +306,17 @@ fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, 
                     level_scene(level, &mut rng)
                 })
                 .flatten();
-            let (scene, mut walker) = from_level.unwrap_or_else(|| walkable_scene(&mut rng, 6));
+            let (mut scene, mut walker) = from_level.unwrap_or_else(|| walkable_scene(&mut rng, 6));
+            if let Some(eyes) = &src.sculpt {
+                // The level net draws the level alone.
+                scene.creatures.clear();
+                scene.flesh.tris.clear();
+                scene.flesh.skins.clear();
+                scene.flesh.lights.clear();
+                scene.flesh.light_at.clear();
+                dreamed = Some(dreamed::sculpt(&mut scene, rng.next() as u64, Some(eyes)));
+            }
+            let sights = dreamed.as_ref().map(dreamed::sights).unwrap_or_default();
             for _ in 0..rng.range(0, 60) {
                 walker.step(&scene, &mut rng);
             }
@@ -264,7 +327,14 @@ fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, 
                 }
                 // Creature views come in orbits of 1-3 round the same one, so
                 // the network sees it from several sides.
-                let orbit: Vec<Camera> = if rng.chance(src.creature_views) {
+                let orbit: Vec<Camera> = if !sights.is_empty() {
+                    if rng.chance(src.organ_views) {
+                        let (at, n) = sights[rng.next() as usize % sights.len()];
+                        walker.view_of_wall(&scene, at, n, &mut rng).into_iter().collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else if rng.chance(src.creature_views) {
                     let n = rng.range(1, 4).min((views - out.len()) as i32) as usize;
                     pick_creature(&scene, &mut rng)
                         .map(|c| (0..n).filter_map(|_| walker.view_of(&scene, c, &mut rng)).collect())
@@ -281,22 +351,27 @@ fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, 
             (scene, out)
         }
     };
-    let cams = cams.into_iter().map(|c| (c, pick_width(src, &mut rng))).collect();
-    (scene, cams)
+    let shots = cams
+        .into_iter()
+        .map(|cam| Shot { cam, width: pick_width(src, &mut rng), time: rng.fr(0.0, 60.0), amount: pick_amount(&mut rng) })
+        .filter(|s| !dreamed.as_ref().is_some_and(|d| dreamed::crowds(d, &s.cam, s.amount)))
+        .collect();
+    (scene, dreamed, shots)
 }
 
 /// Scenes are built on every core, a batch at a time in order, while this
 /// thread draws the last batch's views on the GPU; shards are written behind.
 fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, src: Sources) {
     let batch_len = rayon::current_num_threads() * 2;
-    let (send, recv) = std::sync::mpsc::sync_channel::<Vec<(usize, Scene, Vec<(Camera, u32)>)>>(1);
+    let sculpted = src.sculpt.is_some();
+    let (send, recv) = std::sync::mpsc::sync_channel::<Vec<(usize, Scene, Option<Dreamed>, Vec<Shot>)>>(1);
     let builder = std::thread::spawn(move || {
         for start in (0..scenes).step_by(batch_len) {
             let built = (start..(start + batch_len).min(scenes))
                 .into_par_iter()
                 .map(|i| {
-                    let (scene, cams) = scene_and_views(i, seed, views, &src);
-                    (i, scene, cams)
+                    let (scene, dreamed, shots) = scene_and_views(i, seed, views, &src);
+                    (i, scene, dreamed, shots)
                 })
                 .collect();
             if send.send(built).is_err() {
@@ -304,7 +379,8 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
             }
         }
     });
-    let mut renderer = Renderer::layers(DRAW_W);
+    // The flesh of a sculpted level is part of its frame.
+    let mut renderer = if sculpted { Renderer::with_width(DRAW_W) } else { Renderer::layers(DRAW_W) };
     let mut writers = Vec::new();
     let mut batch = Batch::new();
     let finish = |batch: Batch, s: usize, writers: &mut Vec<std::thread::JoinHandle<()>>| {
@@ -319,16 +395,33 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
         let t = std::time::Instant::now();
         let Ok(built) = recv.recv() else { break };
         waiting += t.elapsed().as_secs_f64();
-        for (i, scene, cams) in built {
+        for (i, mut scene, dreamed, shots) in built {
             let t = std::time::Instant::now();
             let si = batch.add_scene(&scene);
-            renderer.set_scene(&scene);
-            let only: Vec<Camera> = cams.iter().map(|c| c.0).collect();
-            for ((cam, width), frame) in cams.iter().zip(renderer.render_all(&scene, &only)) {
-                batch.add_view(si, &scene, cam, &frame.crop(*width), *width);
+            if let Some(mut d) = dreamed {
+                dreamed::turning_features(&scene, &d, &mut batch.turning);
+                for s in &shots {
+                    d.amount = s.amount;
+                    dreamed::pose(&mut scene, &d, &s.cam, s.time);
+                    scene.flesh.tris.extend(dreamed::walls(&d));
+                    renderer.set_scene(&scene);
+                    let mut frame = renderer.render(&scene, &s.cam).crop(s.width);
+                    // All of it is the target: there is no layer to keep apart.
+                    frame.creatures.fill(0);
+                    batch.add_view(si, &scene, &s.cam, &frame, s.width);
+                    batch.amounts.push(s.amount);
+                    dreamed::organs(&d, &s.cam, s.width, s.time, &mut batch.organs);
+                    batch.organ_offsets.push((batch.organs.len() / ORGAN_FEATURES) as i64);
+                }
+            } else {
+                renderer.set_scene(&scene);
+                let only: Vec<Camera> = shots.iter().map(|s| s.cam).collect();
+                for (s, frame) in shots.iter().zip(renderer.render_all(&scene, &only)) {
+                    batch.add_view(si, &scene, &s.cam, &frame.crop(s.width), s.width);
+                }
             }
             drawing += t.elapsed().as_secs_f64();
-            drawn += cams.len();
+            drawn += shots.len();
             if (i + 1) % shard_scenes == 0 || i + 1 == scenes {
                 finish(std::mem::replace(&mut batch, Batch::new()), i / shard_scenes, &mut writers);
             }
@@ -538,6 +631,8 @@ fn main() {
                 levels: Arc::new(opts.get("levels").map(|d| load_levels(Path::new(d))).unwrap_or_default()),
                 level_share: frac("level-share", 0.3),
                 width,
+                sculpt: opts.get("sculpt").map(PathBuf::from),
+                organ_views: frac("organ-views", 0.4),
             };
             std::fs::create_dir_all(&out).unwrap();
             gen(&out, num("scenes", 1000) as usize, num("views", 8) as usize, num("shard-scenes", 100) as usize, num("seed", 1), src);

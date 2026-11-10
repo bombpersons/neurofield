@@ -30,7 +30,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from data import Shards, WidthBatches, collate
-from model import Renderer, loss_fn, migrate
+from model import Renderer, loss_fn, migrate, migrate_head
 
 # Steps of learning-rate warm-up after the optimizer starts afresh.
 WARMUP = 500
@@ -42,6 +42,7 @@ WARMUP_NEW_HEAD = 3000
 class Trainer:
     def __init__(
         self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1, ema_decay=0.999,
+        up="shuffle",
     ):
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,7 @@ class Trainer:
         self.train_set = Shards(data, range(n_shards - 1))
         self.val_set = Shards(data, [n_shards - 1])
         self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
+        self.cfg["up"] = up
         ckpt = self.out / "ckpt.pt"
         state = torch.load(ckpt, map_location=self.device) if ckpt.exists() else None
         migrated, warmup = False, WARMUP
@@ -62,6 +64,10 @@ class Trainer:
             if "q_pos" in weights:  # the old patch head goes: its replacement needs the long warm-up
                 warmup = WARMUP_NEW_HEAD
             weights, cfg, migrated = migrate(weights, self.cfg)
+            weights, cfg, new_head = migrate_head(weights, cfg, up)
+            if new_head:
+                warmup = WARMUP_NEW_HEAD
+                migrated = True
             if migrated:
                 state = {**state, "model": weights, "ema": weights, "opt": None}
                 self.cfg = cfg
@@ -69,7 +75,7 @@ class Trainer:
         # A perceptual loss on top of L1, against the blur that L1 alone settles for.
         self.lpips_weight = lpips_weight
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(self.device).eval().requires_grad_(False)
-        covers = ("cover", "part_cover")
+        covers = ("cover", "part_cover", "organ_cover")
         main = [p for n, p in self.model.named_parameters() if n not in covers]
         self.opt = torch.optim.AdamW(main, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
         self.opt.add_param_group({"params": [getattr(self.model, n) for n in covers], "weight_decay": 0.0})
@@ -125,8 +131,9 @@ class Trainer:
     def forward(self, batch, model=None):
         """(prediction, target) for a batch: the level alone."""
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch[:5])
+        organs = tuple(x.to(self.device, non_blocking=True) for x in batch[6])
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            pred = (model or self.model)(feats, tex, pad, cams, width=images.shape[3])
+            pred = (model or self.model)(feats, tex, pad, cams, width=images.shape[3], organs=organs)
         return pred.float(), images
 
     def losses(self, pred, target):
@@ -222,6 +229,7 @@ if __name__ == "__main__":
     ap.add_argument("--sample-every", type=int, default=10**9)
     ap.add_argument("--lpips", type=float, default=0.1, help="weight of the perceptual loss")
     ap.add_argument("--decay", action="store_true", help="cosine learning-rate decay over this run")
+    ap.add_argument("--up", default="shuffle", choices=["shuffle", "resize"], help="the upsampling head; another than the checkpoint's starts fresh")
     a = ap.parse_args()
-    t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips)
+    t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips, up=a.up)
     t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every, decay=a.decay)

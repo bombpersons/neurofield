@@ -268,6 +268,51 @@ impl Walker {
         None
     }
 
+    /// A camera like this walker's, close in front of something at `at` on a wall facing `n`,
+    /// looking at it from up to about 50 degrees off square. None if there's nowhere to stand.
+    pub fn view_of_wall(&self, scene: &Scene, at: [f32; 3], n: [f32; 3], rng: &mut Rng) -> Option<Camera> {
+        for _ in 0..40 {
+            let dist = (0.7 + 2.6 * rng.f() * rng.f()) * TF;
+            let out = n[0].atan2(n[2]);
+            // Off a ceiling, the way out is any way at all.
+            let a = if n[1].abs() > 0.8 { rng.fr(0.0, std::f32::consts::TAU) } else { out + rng.fr(-0.9, 0.9) };
+            let (x, z) = (at[0] + a.sin() * dist, at[2] + a.cos() * dist);
+            let Some(fy) = scene.floor_y(x, at[1], z) else { continue };
+            if ![(0.0, 0.0), (RADIUS, 0.0), (-RADIUS, 0.0), (0.0, RADIUS), (0.0, -RADIUS)].iter().all(|&(ox, oz)| scene.walkable_y(x + ox, fy, z + oz).is_some()) {
+                continue;
+            }
+            let ceiling = scene.ceiling_y(x, fy, z).unwrap_or(fy - 2.0 * TF);
+            let lift = (EYE + rng.fr(-0.08, 0.08) * TF).min(fy - ceiling - 0.2 * TF);
+            if lift < 0.1 * TF {
+                continue;
+            }
+            let y = fy - lift;
+            let (dx, dy, dz) = (at[0] - x, at[1] - y, at[2] - z);
+            // The last stretch is the flesh standing out of the wall.
+            let n = (dist / 32.0).ceil() as i32;
+            let clear = (1..n).filter(|&i| i as f32 / n as f32 <= 1.0 - 0.3 * TF / dist).all(|i| {
+                let t = i as f32 / n as f32;
+                let (px, py, pz) = (x + dx * t, y + dy * t, z + dz * t);
+                scene.node_at(px, py, pz).is_some_and(|n| {
+                    let s = scene.span(n);
+                    s.floor(n.0, n.1, [px, pz]) > py && (s.sky || s.ceiling(n.0, n.1, [px, pz]) < py)
+                })
+            });
+            if !clear {
+                continue;
+            }
+            let pitch = dy.atan2(dist) / std::f32::consts::TAU * 4096.0;
+            return Some(Camera {
+                pos: [x as i32, y as i32, z as i32],
+                yaw: (yaw_towards(dx, dz) + rng.fr(-100.0, 100.0)).round() as i32,
+                pitch: (pitch + rng.fr(-60.0, 60.0)).clamp(-900.0, 900.0).round() as i32,
+                roll: 0,
+                ..self.camera()
+            });
+        }
+        None
+    }
+
     /// How far the walking bob moves the camera now (world units, down is positive).
     pub fn bob(&self) -> f32 {
         self.body.bob.sin() * BOB * self.body.bob_amount

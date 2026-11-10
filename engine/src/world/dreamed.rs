@@ -71,6 +71,13 @@ const EYE_VEINS: f32 = 0.75;
 const FREE_VEINS: usize = 20;
 /// How far from the viewer the veins and sphincters are drawn at all (tiles).
 const REACH: f32 = 8.0;
+/// Floats per level triangle that `turning_features` gives the net, and per organ in `organs`.
+pub const TURNING_FEATURES: usize = 15;
+pub const ORGAN_FEATURES: usize = 19;
+/// At most this many organs are told to the net for one view.
+pub const MAX_ORGANS: usize = 128;
+/// How many points of a vein one organ token covers: half a tile.
+const VEIN_TOKEN: usize = 4;
 
 fn smooth(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
@@ -331,6 +338,8 @@ pub struct Dreamed {
     /// Skins of a vein at rest and with a beat going through it.
     vein_skin: [u16; 2],
     footage: Option<Footage>,
+    /// Per level triangle, in `Scene::tris` order: see `turning_features`.
+    turning: Vec<[f32; TURNING_FEATURES]>,
     /// How many of the flesh pass's triangles don't move.
     pub fixed: usize,
     lid: u16,
@@ -796,7 +805,30 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
     let mut small = rough;
     scene.tris = keep;
     scene.tris.append(&mut small);
+    let mut turning = Vec::new();
     if painted.is_some() {
+        turning = vec![[0.0; TURNING_FEATURES]; scene.tris.len()];
+        turning.extend(turn.iter().map(|t| {
+            let mut row = [0.0; TURNING_FEATURES];
+            if slot_of(t).is_none() {
+                return row;
+            }
+            let [a, b, c] = t.v.map(|v| v.p);
+            let n = t.normal();
+            let laid = t.v.map(|v| laid_on(v.p.map(|x| x as f32), n));
+            let from = [0, 1].map(|k| laid.iter().map(|uv| uv[k]).fold(f32::MAX, f32::min).floor());
+            // The edges' middles are points of the cut surface too, as `cut` makes them.
+            let half = |x: [i32; 3], y: [i32; 3]| [0, 1, 2].map(|d| (x[d] * (N / 2) + y[d] * (N / 2)) / N);
+            for (i, k) in [a, b, c].into_iter().enumerate() {
+                row[i] = spread_of(scene.strangeness(k.map(|x| x as f32)));
+                row[3 + 2 * i] = laid[i][0] - from[0];
+                row[4 + 2 * i] = laid[i][1] - from[1];
+            }
+            for (i, k) in [a, b, c, half(a, b), half(a, c), half(b, c)].into_iter().enumerate() {
+                row[9 + i] = moved[&k].0;
+            }
+            row
+        }));
         scene.tris.extend(turn);
     }
 
@@ -970,7 +1002,120 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
         scene.flesh.tris.push(flesh::Tri { v: [v; 3], skin: [p.skins[0]; 2], light: [neutral; 2], corners: None, cap_axes: [[[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]; 2] });
     }
     let fixed = scene.flesh.tris.len();
-    Dreamed { eyes, mouths, points, walls: wall_tris, neutral, amount: 1.0, veins, vein_skin, footage, fixed, lid }
+    Dreamed { eyes, mouths, points, walls: wall_tris, neutral, amount: 1.0, veins, vein_skin, footage, turning, fixed, lid }
+}
+
+/// What the net is told about how each level triangle turns, as written to `turning.npy`,
+/// appended to `out` in `tri_features`' order (the doors and levers after the level never
+/// turn): how much of the dial reaches each corner (3); where the corners fall on the flesh
+/// textures, in repeats (6); and the height of the folds, in tiles, at the corners and the
+/// middles of edges ab, ac, bc (6). All zeros on what stays stone.
+pub fn turning_features(scene: &Scene, d: &Dreamed, out: &mut Vec<f32>) {
+    assert_eq!(d.turning.len(), scene.tris.len(), "the net can only be told about painted levels");
+    out.extend(d.turning.iter().flatten());
+    out.extend(std::iter::repeat_n(0.0, scene.part_tris().count() * TURNING_FEATURES));
+}
+
+/// Whether the flesh at dial `amount` has swollen up round a viewer at `cam`: a view from
+/// inside it shows nothing the net could learn.
+pub fn crowds(d: &Dreamed, cam: &Camera, amount: f32) -> bool {
+    const CLOSE: f32 = 0.35 * TF;
+    let eye = cam.pos.map(|c| c as f32);
+    d.points.iter().any(|q| {
+        let here = amount * q.spread;
+        if stage(here, CREEP) <= 0.0 {
+            return false;
+        }
+        let to = sub(add(q.base, scale(q.rise, stage(here, SAG))), eye);
+        dot(to, to) < CLOSE * CLOSE
+    })
+}
+
+/// Eyes and sphincters as (centre, facing), to stand in front of for training views.
+pub fn sights(d: &Dreamed) -> Vec<([f32; 3], [f32; 3])> {
+    d.eyes.iter().map(|e| (e.at, e.n)).chain(d.mouths.iter().map(|m| (m.at, m.n))).collect()
+}
+
+/// The features in `cam`'s view at `t` seconds, appended to `out` as `ORGAN_FEATURES` floats
+/// each, positions and sizes in tiles: kind, 0 eye, 1 sphincter, 2 length of vein (0); where
+/// it is now (1-3); what it faces (4-6); its across and up (7-9, 10-12; for an eye the image's
+/// right and up, for a vein along it and to the side); half its size along those (13-14;
+/// for a vein half its length and its radius now); and its state (15-18): an eye's showing,
+/// frame of the blink as a share (0 open) and gaze across and down, 0..1; a sphincter's
+/// showing and clench; a vein's beat. The same ones `pose` draws, on or near the screen of a
+/// frame `width` wide, eyes and sphincters first and then the nearest.
+pub fn organs(d: &Dreamed, cam: &Camera, width: u32, t: f32, out: &mut Vec<f32>) {
+    let eye = cam.pos.map(|c| c as f32);
+    let rows = crate::world::view::view_matrix(cam).m.map(|r| r.map(|e| e as f32 / 4096.0));
+    let reach = Sight { eye, ahead: rows[2] };
+    let (kx, ky) = (width as f32 / 2.0 / cam.h as f32 * 1.05, 120.0 / cam.h as f32 * 1.05);
+    let on_screen = |at: [f32; 3], size: f32| {
+        let to = sub(at, eye);
+        let [x, y, z] = rows.map(|r| dot(r, to));
+        let margin = 1.5 * size;
+        z > -margin && x.abs() - margin <= z.max(0.0) * kx && y.abs() - margin <= z.max(0.0) * ky
+    };
+    let tiles = |v: [f32; 3]| v.map(|c| c / TF);
+    let token = |kind: f32, at: [f32; 3], n: [f32; 3], x: [f32; 3], y: [f32; 3], size: [f32; 2], state: [f32; 4]| -> [f32; ORGAN_FEATURES] {
+        let mut row = [0.0; ORGAN_FEATURES];
+        row[0] = kind;
+        row[1..4].copy_from_slice(&tiles(at));
+        row[4..7].copy_from_slice(&n);
+        row[7..10].copy_from_slice(&x);
+        row[10..13].copy_from_slice(&y);
+        row[13] = size[0] / TF;
+        row[14] = size[1] / TF;
+        row[15..19].copy_from_slice(&state);
+        row
+    };
+    let mut found: Vec<(bool, f32, [f32; ORGAN_FEATURES])> = Vec::new();
+    let mut add_one = |at: [f32; 3], row: [f32; ORGAN_FEATURES]| {
+        let d = sub(at, eye);
+        found.push((row[0] == 2.0, dot(d, d), row));
+    };
+    if let Some(footage) = &d.footage {
+        for e in &d.eyes {
+            let (Some(patch), Some(want)) = (&e.patch, reach.of_eye(e)) else { continue };
+            let (showing, frame) = filmed_frame(e, footage.skins.len() - 1, t, d.amount);
+            if showing <= 0.0 || !on_screen(e.at, e.r) {
+                continue;
+            }
+            let (gx, gy) = gaze_of(e, patch, want);
+            let middle = patch.corners[(PATCH + 1) * PATCH / 2 + PATCH / 2];
+            let at = add(middle.flat, scale(e.n, middle.rise * stage(d.amount, SAG)));
+            let right = if patch.mirrored { scale(e.across, -1.0) } else { e.across };
+            let state = [showing, frame as f32 / (footage.skins.len() - 1) as f32, gx as f32 / (GAZES_X - 1) as f32, gy as f32 / (GAZES_Y - 1) as f32];
+            add_one(at, token(0.0, at, e.n, right, e.up, [e.r, e.r], state));
+        }
+    }
+    for m in &d.mouths {
+        let showing = stage(d.amount, (m.due - 0.1, m.due));
+        if showing <= 0.0 || !reach.near(m.at) || dot(sub(eye, m.at), m.n) <= 0.0 || !on_screen(m.at, m.size[0] * 2.0) {
+            continue;
+        }
+        add_one(m.at, token(1.0, m.at, m.n, m.across, m.up, m.size, [showing, clench_of(m, t), 0.0, 0.0]));
+    }
+    for v in &d.veins {
+        let Some(last) = vein_end(v, d.amount).filter(|_| reach.near(v.points[v.points.len() / 2].p)) else { continue };
+        let mut i = 0;
+        while i < last {
+            let j = (i + VEIN_TOKEN).min(last);
+            let k = (i + j) / 2;
+            let (a, b) = (vein_now(&v.points[i], t, d.amount).0, vein_now(&v.points[j], t, d.amount).0);
+            let (_, r, beat) = vein_now(&v.points[k], t, d.amount);
+            let at = scale(add(a, b), 0.5);
+            let (run, n) = (sub(b, a), v.points[k].n);
+            let half = dot(run, run).sqrt() / 2.0;
+            i = j;
+            if r > 0.0 && dot(sub(eye, at), n) > 0.0 && on_screen(at, half + r) {
+                let along = norm(run);
+                add_one(at, token(2.0, at, n, along, norm(cross(along, n)), [half, r], [beat, 0.0, 0.0, 0.0]));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    found.truncate(MAX_ORGANS);
+    out.extend(found.iter().flat_map(|f| f.2));
 }
 
 fn centre_of(t: &Tri) -> [f32; 3] {
@@ -1023,27 +1168,36 @@ fn beat(x: f32) -> f32 {
     (bump(0.1, 0.06) + 0.6 * bump(0.34, 0.07)).min(1.0)
 }
 
+/// How far along a vein the blood has pushed it: its last point, None while it's barely out.
+fn vein_end(v: &Vein, amount: f32) -> Option<usize> {
+    let front = stage(amount, VEINS_RUN) * VEIN_LENGTH;
+    match v.points.iter().position(|q| q.along > front + 0.4) {
+        Some(0) | Some(1) => None,
+        Some(i) => Some(i - 1),
+        None => Some(v.points.len() - 1),
+    }
+}
+
+/// A point of a vein at `t` seconds: where it lies on the wall, its radius, and the beat there.
+fn vein_now(q: &VeinPoint, t: f32, amount: f32) -> ([f32; 3], f32, f32) {
+    let b = beat(t / BEAT_EVERY - q.along / BEAT_WAVE);
+    let r = q.r * (1.0 + BEAT_SWELL * b) * smooth((stage(amount, VEINS_RUN) * VEIN_LENGTH - q.along) / 0.4);
+    (sub(q.p, scale(q.rise, 1.0 - stage(amount * q.spread, SAG))), r, b)
+}
+
 /// A vein as it stands at `t` seconds: half a tube lying on the wall, fattened where the
 /// beat has got to, and flushed red with it.
 fn mesh_vein(scene: &mut Scene, v: &Vein, skin: [u16; 2], t: f32, amount: f32) {
     const AROUND: usize = 4;
     const SPREAD: f32 = 1.9;
-    // As far as the blood has pushed it so far.
-    let front = stage(amount, VEINS_RUN) * VEIN_LENGTH;
-    let last = match v.points.iter().position(|q| q.along > front + 0.4) {
-        Some(0) | Some(1) => return,
-        Some(i) => i - 1,
-        None => v.points.len() - 1,
-    };
+    let Some(last) = vein_end(v, amount) else { return };
     let ring = |i: usize| -> [flesh::Vertex; AROUND + 1] {
         let q = v.points[i];
         let along = norm(sub(v.points[(i + 1).min(last)].p, v.points[i.saturating_sub(1)].p));
         let side = norm(cross(along, q.n));
         let out = cross(side, along);
-        let b = beat(t / BEAT_EVERY - q.along / BEAT_WAVE);
-        let r = q.r * (1.0 + BEAT_SWELL * b) * smooth((front - q.along) / 0.4);
-        let sag = stage(amount * q.spread, SAG);
-        let mid = add(sub(q.p, scale(q.rise, 1.0 - sag)), scale(out, 0.15 * r));
+        let (on_wall, r, b) = vein_now(&q, t, amount);
+        let mid = add(on_wall, scale(out, 0.15 * r));
         std::array::from_fn(|j| {
             let a = (j as f32 / AROUND as f32 * 2.0 - 1.0) * SPREAD;
             let n = add(scale(out, a.cos()), scale(side, a.sin()));
@@ -1066,6 +1220,12 @@ fn mesh_vein(scene: &mut Scene, v: &Vein, skin: [u16; 2], t: f32, amount: f32) {
     }
 }
 
+/// How clenched a sphincter is at `t` seconds: 0 relaxed, 1 shut, and a little past either.
+fn clench_of(m: &Mouth, t: f32) -> f32 {
+    let wave = 0.5 + 0.5 * (t * TAU / m.every + m.phase).sin();
+    smooth(wave) * 1.2 - 0.2 + 0.03 * smooth(wave) * (t * 19.0 + m.phase).sin()
+}
+
 /// A sphincter at `t` seconds: the opening drawn shut towards its middle and bulging, the
 /// outside of the rim staying where it is, and then let go.
 fn mesh_mouth(scene: &mut Scene, m: &Mouth, t: f32, amount: f32) {
@@ -1076,8 +1236,7 @@ fn mesh_mouth(scene: &mut Scene, m: &Mouth, t: f32, amount: f32) {
     if out_of_wall <= 0.0 {
         return;
     }
-    let wave = 0.5 + 0.5 * (t * TAU / m.every + m.phase).sin();
-    let clench = smooth(wave) * 1.2 - 0.2 + 0.03 * smooth(wave) * (t * 19.0 + m.phase).sin();
+    let clench = clench_of(m, t);
     let pull = 1.0 + clench * (RIM / (RIM - 1.0 + SHUT) - 1.0);
     for tri in &m.tris {
         let mut tri = *tri;
@@ -1101,14 +1260,10 @@ fn gaze_cell(sideways: f32, up: f32) -> (usize, usize) {
     (cell(sideways / GAZE_STEP[0], GAZES_X), cell(-up / GAZE_STEP[1], GAZES_Y))
 }
 
-/// A filmed eye at `t` seconds: the frame of the blink it has got to, turned to the viewer.
-fn mesh_filmed(scene: &mut Scene, e: &Eye, patch: &Patch, footage: &Footage, want: [f32; 3], t: f32, amount: f32) {
-    let frames = footage.skins.len() - 1;
+/// How far a filmed eye has come through the wall, and which of the `frames` of the blink it is on.
+fn filmed_frame(e: &Eye, frames: usize, t: f32, amount: f32) -> (f32, usize) {
     // The closed lid comes through the wall first, and then the eye opens as it does in the film.
     let (showing, open) = (stage(amount, (e.due - 0.12, e.due)), stage(amount, (e.due, e.due + 0.1)));
-    if showing <= 0.0 {
-        return;
-    }
     let beat = (t + e.phase).rem_euclid(BLINK_EVERY) * FOOTAGE_RATE;
     let frame = if open < 1.0 {
         FIRST_OPENING + ((frames - FIRST_OPENING + 1) as f32 * open) as usize
@@ -1117,11 +1272,24 @@ fn mesh_filmed(scene: &mut Scene, e: &Eye, patch: &Patch, footage: &Footage, wan
     } else {
         0
     };
-    let frame = if frame > frames { 0 } else { frame };
-    let sag = stage(amount, SAG);
+    (showing, if frame > frames { 0 } else { frame })
+}
+
+/// The filmed gaze of an eye looking along `want`.
+fn gaze_of(e: &Eye, patch: &Patch, want: [f32; 3]) -> (usize, usize) {
     // The image's right is along `across`, or against it where mirrored.
     let sideways = dot(want, e.across) * if patch.mirrored { -1.0 } else { 1.0 };
-    let (gx, gy) = gaze_cell(sideways, dot(want, e.up));
+    gaze_cell(sideways, dot(want, e.up))
+}
+
+/// A filmed eye at `t` seconds: the frame of the blink it has got to, turned to the viewer.
+fn mesh_filmed(scene: &mut Scene, e: &Eye, patch: &Patch, footage: &Footage, want: [f32; 3], t: f32, amount: f32) {
+    let (showing, frame) = filmed_frame(e, footage.skins.len() - 1, t, amount);
+    if showing <= 0.0 {
+        return;
+    }
+    let sag = stage(amount, SAG);
+    let (gx, gy) = gaze_of(e, patch, want);
     let skin = [footage.skins[frame][gx * GAZES_Y + gy], patch.wall.unwrap_or(footage.rim)];
     let (right, down) = (if patch.mirrored { scale(e.across, -1.0) } else { e.across }, scale(e.up, -1.0));
     let side = PATCH + 1;
@@ -1179,34 +1347,45 @@ pub fn walls(d: &Dreamed) -> Vec<flesh::Tri> {
     out
 }
 
+/// Which features a view has any business drawing.
+struct Sight {
+    eye: [f32; 3],
+    ahead: [f32; 3],
+}
+
+impl Sight {
+    /// Near enough to draw and not behind the viewer, allowing for the time before the next pose.
+    fn near(&self, at: [f32; 3]) -> bool {
+        let to = sub(at, self.eye);
+        let far = dot(to, to).sqrt();
+        far < 2.0 * TF || (far < REACH * TF && dot(to, self.ahead) > -0.2 * far)
+    }
+
+    /// The way from eye `e` to the viewer, if it's in range and facing them.
+    fn of_eye(&self, e: &Eye) -> Option<[f32; 3]> {
+        let to = sub(self.eye, e.at);
+        let far = dot(to, to).sqrt();
+        (far <= 9.0 * TF && dot(to, e.n) >= 0.0).then(|| scale(to, 1.0 / far))
+    }
+}
+
 /// Point the eyes in view at `cam`, blink them and beat the veins, at `t` seconds.
 pub fn pose(scene: &mut Scene, d: &Dreamed, cam: &Camera, t: f32) {
     scene.flesh.tris.truncate(d.fixed);
     let eye = cam.pos.map(|c| c as f32);
-    // Nothing behind the viewer, allowing for the time before the next pose.
-    let ahead = crate::world::view::view_matrix(cam).m[2].map(|e| e as f32 / 4096.0);
-    let shown = |at: [f32; 3]| {
-        let to = sub(at, eye);
-        let far = dot(to, to).sqrt();
-        far < 2.0 * TF || (far < REACH * TF && dot(to, ahead) > -0.2 * far)
-    };
+    let sight = Sight { eye, ahead: crate::world::view::view_matrix(cam).m[2].map(|e| e as f32 / 4096.0) };
     for m in &d.mouths {
-        if shown(m.at) && dot(sub(eye, m.at), m.n) > 0.0 {
+        if sight.near(m.at) && dot(sub(eye, m.at), m.n) > 0.0 {
             mesh_mouth(scene, m, t, d.amount);
         }
     }
     for v in &d.veins {
-        if shown(v.points[v.points.len() / 2].p) {
+        if sight.near(v.points[v.points.len() / 2].p) {
             mesh_vein(scene, v, d.vein_skin, t, d.amount);
         }
     }
     for e in &d.eyes {
-        let to = sub(eye, e.at);
-        let far = dot(to, to).sqrt();
-        if far > 9.0 * TF || dot(to, e.n) < 0.0 {
-            continue;
-        }
-        let want = scale(to, 1.0 / far);
+        let Some(want) = sight.of_eye(e) else { continue };
         if let (Some(patch), Some(footage)) = (&e.patch, &d.footage) {
             mesh_filmed(scene, e, patch, footage, want, t, d.amount);
             continue;

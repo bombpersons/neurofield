@@ -12,9 +12,14 @@ with a coverage bias of their own.
 Patch queries come from their positions alone, so the grid can be any width
 (any aspect ratio; 20 patches across is 4:3).
 
+Eyes, sphincters and lengths of vein come in the same way, one token each after the
+triangles (see data.organ_tokens), with a coverage bias of their own.
+
 The upsampling head lays the patch queries out as a grid and doubles it four
 times (3x3 convolution, then pixel shuffle), so neighbouring patches share
-detail across their edges. Each doubling can add per-pixel noise at a learned
+detail across their edges. With `up="resize"` each doubling is bilinear and then
+a convolution instead, which keeps pixel shuffle's 16-pixel mesh out of the frame.
+Each doubling can add per-pixel noise at a learned
 strength per channel (zero to begin with; `noise` gives the noise), for
 inventing detail rather than averaging it.
 """
@@ -25,7 +30,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from data import CAM_FEATURES, H, NUM_MOTIFS, NUM_SHAPES, NUM_TEX, PART_FEATURES, TRI_FEATURES, W
+from data import (
+    CAM_FEATURES, H, NUM_MOTIFS, NUM_ORGANS, NUM_SHAPES, NUM_TEX, ORGAN_FEATURES, PART_FEATURES, TRI_FEATURES,
+    TRI_FEATURES_PLAIN, W,
+)
 
 PATCH = 16
 DREAM_DIRS = 16
@@ -92,13 +100,15 @@ def centres(gw, device=None):
 class UpHead(nn.Module):
     """Patch queries [b, gh * gw, d] to an image [b, 3, 16 gh, 16 gw]: a 1x1 projection
     to the grid, four times (3x3 conv to 4c channels, pixel shuffle to c at twice the
-    size, plus noise scaled per channel, GELU), then a 3x3 conv to RGB."""
+    size, plus noise scaled per channel, GELU), then a 3x3 conv to RGB. With `up` "resize",
+    each doubling is bilinear and then a 3x3 conv to c channels."""
 
-    def __init__(self, d, first=128):
+    def __init__(self, d, first=128, up="shuffle"):
         super().__init__()
         self.proj = nn.Linear(d, first)
         chans = (first,) + UP
-        self.ups = nn.ModuleList([nn.Conv2d(a, 4 * b, 3, padding=1) for a, b in zip(chans, chans[1:])])
+        self.resize = up == "resize"
+        self.ups = nn.ModuleList([nn.Conv2d(a, b if self.resize else 4 * b, 3, padding=1) for a, b in zip(chans, chans[1:])])
         self.noise_scale = nn.ParameterList([nn.Parameter(torch.zeros(c)) for c in UP])
         self.rgb = nn.Conv2d(UP[-1], 3, 3, padding=1)
 
@@ -108,7 +118,7 @@ class UpHead(nn.Module):
         b, gh = q.shape[0], q.shape[1] // gw
         x = self.proj(q).transpose(1, 2).reshape(b, -1, gh, gw)
         for i, (up, scale) in enumerate(zip(self.ups, self.noise_scale)):
-            x = F.pixel_shuffle(up(x), 2)
+            x = up(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)) if self.resize else F.pixel_shuffle(up(x), 2)
             if noise is not None:
                 x = x + scale[:, None, None] * noise[:, i : i + 1, : x.shape[2], : x.shape[3]]
             x = F.gelu(x)
@@ -116,7 +126,7 @@ class UpHead(nn.Module):
 
 
 class Renderer(nn.Module):
-    def __init__(self, d=256, heads=8, enc_layers=4, dec_layers=6, bands=8, low=2):
+    def __init__(self, d=256, heads=8, enc_layers=4, dec_layers=6, bands=8, low=2, up="shuffle"):
         super().__init__()
         self.bands, self.low = bands, low
         tri_in = TRI_FEATURES + 6 * 2 * bands  # + Fourier of the 3 vertices' NDC
@@ -126,6 +136,9 @@ class Renderer(nn.Module):
         self.part_in = nn.Sequential(nn.Linear(part_in, d), nn.GELU(), nn.Linear(d, d))
         self.shape = nn.Embedding(NUM_SHAPES, d)
         self.motif = nn.Embedding(NUM_MOTIFS, d)
+        organ_in = ORGAN_FEATURES + 4 * 2 * bands  # + Fourier of the screen box's x0, y0, x1, y1
+        self.organ_in = nn.Sequential(nn.Linear(organ_in, d), nn.GELU(), nn.Linear(d, d))
+        self.organ_kind = nn.Embedding(NUM_ORGANS, d)
         self.cam_in = nn.Sequential(nn.Linear(CAM_FEATURES, d), nn.GELU(), nn.Linear(d, d))
         self.encoder = nn.ModuleList([Block(d, heads, False) for _ in range(enc_layers)])
         self.q_in = nn.Sequential(nn.Linear(2 * 2 * bands, d), nn.GELU(), nn.Linear(d, d))
@@ -134,16 +147,17 @@ class Renderer(nn.Module):
         self.cover = nn.Parameter(torch.zeros(dec_layers, heads))
         # The same for creature parts and their screen boxes.
         self.part_cover = nn.Parameter(torch.zeros(dec_layers, heads))
+        self.organ_cover = nn.Parameter(torch.zeros(dec_layers, heads))
         # Fixed directions for the dream effects (engine::neural::effects) to push patch queries along.
         noise_dirs = torch.randn(DREAM_DIRS, d, generator=torch.Generator().manual_seed(0)) / math.sqrt(DREAM_DIRS)
         self.register_buffer("noise_dirs", noise_dirs, persistent=False)
         self.out_norm = nn.LayerNorm(d)
-        self.head = UpHead(d)
+        self.head = UpHead(d, up=up)
 
-    def forward(self, feats, tex, pad, cams, width=W, parts=None, noise=None, tex_mix=None, temp=None, q_noise=None):
+    def forward(self, feats, tex, pad, cams, width=W, parts=None, noise=None, tex_mix=None, temp=None, q_noise=None, organs=None):
         """An image [b, 3, 240, width] (width a multiple of 16) of the triangle tokens seen
         with camera tokens `cams`. `parts` is (part feats, part ids, part pad) as `collate`
-        gives them, None for no creatures. `noise` is the head's (see UpHead). The other optional
+        gives them, None for no creatures; `organs` likewise (feats, kinds, pad). `noise` is the head's (see UpHead). The other optional
         inputs are for disturbing a trained model (the game's dream effects): `tex_mix`
         [NUM_TEX, NUM_TEX] mixes texture embeddings (identity: none), `temp` [1] is the
         cross-attention temperature (1: none), and `q_noise` [patches, DREAM_DIRS] pushes
@@ -164,6 +178,11 @@ class Renderer(nn.Module):
             # Creature parts follow the triangles.
             x = torch.cat([x, p + self.shape(pids[..., 0]) + self.motif(pids[..., 1])], 1)
             pad = torch.cat([pad, ppad], 1)
+        if organs is not None:
+            ofeats, okinds, opad = organs
+            o = self.organ_in(torch.cat([ofeats, fourier(ofeats[:, :, 12:16], self.bands, self.low)], -1))
+            x = torch.cat([x, o + self.organ_kind(okinds)], 1)
+            pad = torch.cat([pad, opad], 1)
         for blk in self.encoder:
             x = blk(x, pad=pad)
 
@@ -175,10 +194,13 @@ class Renderer(nn.Module):
         temp = 1.0 if temp is None else temp
         dist = cover_distance(ndc, c)
         pdist = None if parts is None else box_distance(parts[0][:, :, 18:20], parts[0][:, :, 20:22], c)
-        for blk, strength, pstrength in zip(self.decoder, self.cover, self.part_cover):
+        odist = None if organs is None else box_distance(organs[0][:, :, 12:14], organs[0][:, :, 14:16], c)
+        for blk, strength, pstrength, ostrength in zip(self.decoder, self.cover, self.part_cover, self.organ_cover):
             bias = -strength[None, :, None, None] * dist[:, None]  # [b, heads, patches, 1 + tris]
             if pdist is not None:
                 bias = torch.cat([bias, -pstrength[None, :, None, None] * pdist[:, None]], -1)
+            if odist is not None:
+                bias = torch.cat([bias, -ostrength[None, :, None, None] * odist[:, None]], -1)
             bias = bias.masked_fill(pad[:, None, None], float("-inf"))
             q = blk(q, mem=x, mem_bias=bias, temp=temp)
         return self.head(self.out_norm(q), gw, noise)
@@ -202,10 +224,49 @@ def box_distance(lo, hi, c):
 
 def migrate(weights, cfg):
     """Weights (and config) of an older model, brought up to date: see `migrate_widths`
-    and `migrate_parts`. Returns (weights, cfg, whether anything changed)."""
+    `migrate_parts`, `migrate_turning` and `migrate_organs`. Returns (weights, cfg, whether
+    anything changed)."""
     weights, cfg, widths = migrate_widths(weights, cfg)
     weights, parts = migrate_parts(weights, cfg)
-    return weights, cfg, widths or parts
+    weights, turning = migrate_turning(weights, cfg)
+    weights, organs = migrate_organs(weights, cfg)
+    return weights, cfg, widths or parts or turning or organs
+
+
+def migrate_turning(weights, cfg):
+    """From before triangles were told how they turn: those inputs get zero weights, so
+    the body computes what it did."""
+    w = weights["tri_in.0.weight"]
+    plain = TRI_FEATURES_PLAIN + 6 * 2 * cfg.get("bands", 8)
+    if w.shape[1] != plain:
+        return weights, False
+    zeros = torch.zeros(w.shape[0], TRI_FEATURES - TRI_FEATURES_PLAIN, dtype=w.dtype)
+    return {**weights, "tri_in.0.weight": torch.cat([w[:, :TRI_FEATURES_PLAIN], zeros, w[:, TRI_FEATURES_PLAIN:]], 1)}, True
+
+
+def migrate_organs(weights, cfg):
+    """From before organs: fresh organ tokens, with the triangles' coverage strengths to
+    start from (both measure distance to a screen box)."""
+    if "organ_in.0.weight" in weights:
+        return weights, False
+    new = Renderer(**cfg).state_dict()
+    out = dict(weights)
+    for k, v in new.items():
+        if k.startswith(("organ_in.", "organ_kind.")):
+            out[k] = v
+    out["organ_cover"] = weights.get("cover", new["cover"]).clone()
+    return out, True
+
+
+def migrate_head(weights, cfg, up):
+    """Swap the upsampling head for a fresh one of kind `up`, if it isn't that already.
+    Returns (weights, cfg, whether anything changed)."""
+    if cfg.get("up", "shuffle") == up:
+        return weights, cfg, False
+    cfg = {**cfg, "up": up}
+    out = {k: v for k, v in weights.items() if not k.startswith("head.")}
+    out.update({k: v for k, v in Renderer(**cfg).state_dict().items() if k.startswith("head.")})
+    return out, cfg, True
 
 
 def migrate_parts(weights, cfg):
@@ -247,7 +308,7 @@ def migrate_widths(weights, cfg):
                 cols[:, dst : dst + old] = w[:, src : src + old]
         return cols
 
-    out["tri_in.0.weight"] = widen(weights["tri_in.0.weight"], TRI_FEATURES - 1, TRI_FEATURES, 6)
+    out["tri_in.0.weight"] = widen(weights["tri_in.0.weight"], TRI_FEATURES_PLAIN - 1, TRI_FEATURES_PLAIN, 6)
     out["q_in.0.weight"] = widen(weights["q_in.0.weight"], 0, 0, 2)
     cam = torch.zeros(weights["cam_in.0.weight"].shape[0], CAM_FEATURES)
     cam[:, : weights["cam_in.0.weight"].shape[1]] = weights["cam_in.0.weight"]

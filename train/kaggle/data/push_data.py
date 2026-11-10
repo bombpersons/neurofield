@@ -1,11 +1,13 @@
 """Start a run's training data: PARTS Kaggle CPU kernels (bombpersons/neurofield-data-<i>),
 each drawing SCENES / PARTS scenes from its own seed, all at once.
 
-    .venv/bin/python train/kaggle/data/push_data.py [--parts 4] [--scenes 4000] [--seed S] [--only 2 3]
+    .venv/bin/python train/kaggle/data/push_data.py [--parts 4] [--scenes 4000] [--seed S] [--only 2 3] [--sculpt BRANCH]
     .venv/bin/kaggle kernels status bombpersons/neurofield-data-0
 
 They clone neurofield from GitHub, so push the code first. When they finish, push
-the training kernel (train/kaggle), which mounts their output.
+the training kernel (train/kaggle), which mounts their output. With --sculpt they are
+bombpersons/neurofield-sculpt-data-<i>, drawing the level net's sculpted targets from
+that branch, for train/kaggle_sculpt.
 """
 
 import argparse
@@ -26,6 +28,7 @@ def main():
     ap.add_argument("--scenes", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=int(time.time()))
     ap.add_argument("--only", type=int, nargs="*", help="push just these parts (e.g. to retry one)")
+    ap.add_argument("--sculpt", metavar="BRANCH", help="draw sculpted targets, from this branch")
     a = ap.parse_args()
     src = (HERE / "gen.py").read_text()
     for part in range(a.parts):
@@ -33,11 +36,14 @@ def main():
             continue
         consts = f"PART, SEED, SCENES, VIEWS, SHARD, LEVEL_SHARE = {part}, {a.seed + part}, {a.scenes // a.parts}, 8, 250, 0.3"
         code = re.sub(r"^PART, SEED, .*$", consts, src, count=1, flags=re.M)
-        slug = f"neurofield-data-{part}"
+        if a.sculpt:
+            code = re.sub(r"^SCULPT, BRANCH = .*$", f"SCULPT, BRANCH = True, {a.sculpt!r}", code, count=1, flags=re.M)
+        slug = f"neurofield-{'sculpt-' if a.sculpt else ''}data-{part}"
+        datasets = ["bombpersons/neurofield-textures"] + (["bombpersons/neurofield-sculpt"] if a.sculpt else [])
         meta = {
             "id": f"bombpersons/{slug}", "title": slug, "code_file": "gen.py", "language": "python",
             "kernel_type": "script", "is_private": "true", "enable_gpu": "false", "enable_tpu": "false",
-            "enable_internet": "true", "dataset_sources": ["bombpersons/neurofield-textures"], "competition_sources": [], "kernel_sources": [],
+            "enable_internet": "true", "dataset_sources": datasets, "competition_sources": [], "kernel_sources": [],
             "model_sources": [],
         }
         with tempfile.TemporaryDirectory() as d:

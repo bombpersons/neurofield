@@ -18,6 +18,12 @@ from before creatures had parts load with none.
 Newer shards keep the creatures apart: the frame is the level alone, and each
 view's creatures are an RGBA box of their own, whole (`creatures`). Their mask is
 where they cover at least half a pixel, as older shards' `masks.npy` was.
+
+Sculpted shards (`datagen gen --sculpt`) draw the level turning to flesh, and each
+view is somewhere along a dial. The triangles stay plain; `turning.npy` adds what
+the net can't guess per triangle (where the flesh reaches, how its textures lie,
+the broad folds) and `organs.npy` the eyes, sphincters and veins in each view, one
+token each (`organ_tokens`). Shards without them load with both at zero.
 """
 
 from pathlib import Path
@@ -30,13 +36,20 @@ W, H = 320, 240  # the 4:3 screen; views can be wider
 MAX_TRIS = 512
 NUM_TEX = 12
 # Per-triangle continuous features (see `tri_tokens`).
-TRI_FEATURES = 9 + 6 + 3 + 3 + 6 + 18 + 1
+TRI_FEATURES = 9 + 6 + 3 + 3 + 6 + 18 + 1 + 3 + 6 + 6
+# Of those, how many there were before triangles were told how they turn.
+TRI_FEATURES_PLAIN = 46
+TURNING_FEATURES = 15
 CAM_FEATURES = 1 + 2 + 3 + 1 + 3 + 1
 MAX_PARTS = 128
 NUM_SHAPES = 4
 NUM_MOTIFS = 11
 # Per-part continuous features (see `part_tokens`).
 PART_FEATURES = 3 + 3 + 9 + 3 + 4 + 2 + 4 + 2 + 3 + 12
+NUM_ORGANS = 3
+# Per-organ continuous features (see `organ_tokens`).
+ORGAN_FEATURES = 3 + 3 + 3 + 3 + 4 + 1 + 2 + 4
+RAW_ORGAN_FEATURES = 19
 
 
 class Shards(Dataset):
@@ -67,6 +80,11 @@ class Shards(Dataset):
                     s["masks"] = np.load(d / "masks.npy", mmap_mode="r")
             if (d / "image_offsets.npy").exists():  # frames of their own widths, one after another
                 s["image_offsets"] = np.load(d / "image_offsets.npy")
+            if (d / "turning.npy").exists():  # sculpted
+                s["turning"] = np.load(d / "turning.npy", mmap_mode="r")
+                s["amounts"] = np.load(d / "amounts.npy")
+                s["organs"] = np.load(d / "organs.npy")
+                s["organ_offsets"] = np.load(d / "organ_offsets.npy")
             self.index += [(len(self.shards), i) for i in range(len(s["views"]))]
             self.widths += [view_width(v) for v in s["views"]]
             self.shards.append(s)
@@ -80,7 +98,11 @@ class Shards(Dataset):
         v = s["views"][vi]
         scene = int(v[0])
         tris = np.asarray(s["tris"][s["offsets"][scene] : s["offsets"][scene + 1]])
-        feats, tex = tri_tokens(tris, v)
+        turning = np.asarray(s["turning"][s["offsets"][scene] : s["offsets"][scene + 1]]) if "turning" in s else None
+        amount = float(s["amounts"][vi]) if "amounts" in s else 0.0
+        feats, tex = tri_tokens(tris, v, turning, amount)
+        raw = s["organs"][s["organ_offsets"][vi] : s["organ_offsets"][vi + 1]] if "organs" in s else np.zeros((0, RAW_ORGAN_FEATURES), np.float32)
+        ofeats, okinds = organ_tokens(raw, v)
         w = view_width(v)
         if "image_offsets" in s:
             a, b = s["image_offsets"][vi : vi + 2]
@@ -107,6 +129,8 @@ class Shards(Dataset):
             torch.from_numpy(pfeats),
             torch.from_numpy(pids),
             torch.from_numpy(mask).float(),
+            torch.from_numpy(ofeats),
+            torch.from_numpy(okinds),
         )
 
 
@@ -137,8 +161,12 @@ def cam_token(v):
     return np.concatenate([[h / 160.0], v[14:16] / 8.0, v[19:22], [v[22] / 4.0], fog, [view_width(v) / W]]).astype(np.float32)
 
 
-def tri_tokens(tris, v):
-    """Camera-space triangle features, nearest first, at most MAX_TRIS."""
+def tri_tokens(tris, v, turning=None, amount=0.0):
+    """Camera-space triangle features, nearest first, at most MAX_TRIS. With `turning`
+    (`turning.npy`'s rows for these triangles), the level has turned `amount` of the way:
+    strangeness and the corners' become how far along each is, 0 stone to 1 flesh."""
+    if turning is None:
+        turning = np.zeros((len(tris), TURNING_FEATURES), np.float32)
     pos, R, h = v[1:4], v[4:13].reshape(3, 3), v[13]
     p = (tris[:, :9].reshape(-1, 3, 3) - pos) @ R.T  # [T, 3 verts, xyz], tiles
     z = p[:, :, 2]
@@ -158,9 +186,9 @@ def tri_tokens(tris, v):
     n = np.cross(e1, e2)
     front = (n * -p[:, 0]).sum(1) > 0  # camera is at the origin
     keep = (z > near).any(1) & (z.min(1) < v[15]) & ~outside & front
-    p, z, n, tris = p[keep], z[keep], n[keep], tris[keep]
+    p, z, n, tris, turning = p[keep], z[keep], n[keep], tris[keep], turning[keep]
     order = np.argsort(z.min(1))[:MAX_TRIS]
-    p, z, n, tris = p[order], z[order], n[order], tris[order]
+    p, z, n, tris, turning = p[order], z[order], n[order], tris[order], turning[order]
 
     # Screen position in NDC (x in -1..1 across a 4:3 width, further on wider screens; y in
     # -0.75..0.75), clamped for vertices near or behind the eye.
@@ -168,6 +196,9 @@ def tri_tokens(tris, v):
     ndc = np.stack([p[:, :, 0] / zc * h / 160.0, p[:, :, 1] / zc * h / 160.0], -1).clip(-4, 4)
     inv_z = (near / zc).clip(0, 2)
     n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-6)
+    strangeness = tris[:, 34:35] if tris.shape[1] > 34 else np.zeros((len(tris), 1), np.float32)
+    if amount or turning.any():
+        strangeness = amount * turning[:, :3].mean(1, keepdims=True)
     feats = np.concatenate(
         [
             p.reshape(-1, 9) / 8.0,
@@ -176,7 +207,10 @@ def tri_tokens(tris, v):
             n,
             tris[:, 9:15],
             tris[:, 16:34] * 2.0,  # baked colour and tint, 1.0 = neutral
-            tris[:, 34:35] if tris.shape[1] > 34 else np.zeros((len(tris), 1), np.float32),  # strangeness
+            strangeness,
+            amount * turning[:, :3],
+            turning[:, 3:9],  # the corners on the flesh textures
+            turning[:, 9:15] * 2.0,  # heights of the folds
         ],
         1,
     ).astype(np.float32)
@@ -232,6 +266,37 @@ def part_tokens(parts, v):
     return feats, ids
 
 
+def organ_tokens(organs, v):
+    """Camera-space features of a view's eyes, sphincters and lengths of vein (`organs.npy`
+    rows; `dreamed::organs` chose them, so nothing is dropped here): (float features
+    [O, ORGAN_FEATURES], int kinds [O])."""
+    pos, R, h = v[1:4], v[4:13].reshape(3, 3), v[13]
+    near = h / 2 / 256
+    at, n, x, y = organs[:, 1:4], organs[:, 4:7], organs[:, 7:10], organs[:, 10:13]
+    size = organs[:, 13:15]
+    pick = np.array([[-1, -1], [1, -1], [-1, 1], [1, 1]], np.float32)  # [4, 2]
+    offset = pick[None, :, 0, None] * (size[:, 0, None, None] * x[:, None]) + pick[None, :, 1, None] * (size[:, 1, None, None] * y[:, None])
+    corners = (at[:, None] + offset - pos) @ R.T  # [O, 4, xyz]
+    z = corners[..., 2]
+    zc = np.maximum(z, near * 0.5)
+    ndc = (corners[..., :2] / zc[..., None] * h / 160.0).clip(-4, 4)
+    inv_z = (near / np.maximum(((at - pos) @ R.T)[:, 2:3], near * 0.5)).clip(0, 2)
+    feats = np.concatenate(
+        [
+            (at - pos) @ R.T / 8.0,
+            n @ R.T,
+            x @ R.T,
+            y @ R.T,
+            np.concatenate([ndc.min(1), ndc.max(1)], 1),  # screen box: x0, y0, x1, y1
+            inv_z,
+            size * 4.0,
+            organs[:, 15:19],
+        ],
+        1,
+    ).astype(np.float32)
+    return feats, organs[:, 0].astype(np.int64)
+
+
 class WidthBatches(torch.utils.data.Sampler):
     """Batches of `batch` indices into `widths` that share a width, in random order
     (each epoch reshuffled); a width's leftover views wait for the next epoch, or
@@ -262,23 +327,31 @@ class WidthBatches(torch.utils.data.Sampler):
 def collate(batch):
     """Pad triangle and part tokens to the longest in the batch; the pads mark padding.
     The views must share a width.
-    Returns (feats, tex, pad, cams, images, (part feats, part ids, part pad, creature masks))."""
+    Returns (feats, tex, pad, cams, images, (part feats, part ids, part pad, creature masks),
+    (organ feats, organ kinds, organ pad))."""
     n = max(1, max(item[0].shape[0] for item in batch))
     m = max(1, max(item[4].shape[0] for item in batch))
+    o = max(1, max(item[7].shape[0] for item in batch))
     feats = torch.zeros(len(batch), n, TRI_FEATURES)
     tex = torch.zeros(len(batch), n, dtype=torch.long)
     pad = torch.ones(len(batch), n, dtype=torch.bool)
     pfeats = torch.zeros(len(batch), m, PART_FEATURES)
     pids = torch.zeros(len(batch), m, 2, dtype=torch.long)
     ppad = torch.ones(len(batch), m, dtype=torch.bool)
-    for i, (f, t, _, _, pf, pi, _) in enumerate(batch):
+    ofeats = torch.zeros(len(batch), o, ORGAN_FEATURES)
+    okinds = torch.zeros(len(batch), o, dtype=torch.long)
+    opad = torch.ones(len(batch), o, dtype=torch.bool)
+    for i, (f, t, _, _, pf, pi, _, of, ok) in enumerate(batch):
         feats[i, : len(f)] = f
         tex[i, : len(t)] = t
         pad[i, : len(f)] = False
         pfeats[i, : len(pf)] = pf
         pids[i, : len(pi)] = pi
         ppad[i, : len(pf)] = False
+        ofeats[i, : len(of)] = of
+        okinds[i, : len(ok)] = ok
+        opad[i, : len(of)] = False
     cams = torch.stack([item[2] for item in batch])
     images = torch.stack([item[3] for item in batch])
     masks = torch.stack([item[6] for item in batch])
-    return feats, tex, pad, cams, images, (pfeats, pids, ppad, masks)
+    return feats, tex, pad, cams, images, (pfeats, pids, ppad, masks), (ofeats, okinds, opad)
