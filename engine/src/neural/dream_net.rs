@@ -2,8 +2,9 @@
 //! fields, the U-Net, and its layer laid over the level network's frame where the parts
 //! are nearer than the level. Weights and phrase tables come from train/export_dream.py.
 
-use super::features::{part_features, PART_FEATURES};
+use super::features::{part_features, PART_FEATURES, TRI_FEATURES as RAW};
 use super::gpu_net::{read_safetensors, Params, MAX_W};
+use crate::world::creature::Creature;
 use crate::world::rng::Rng;
 use crate::world::scene::{Camera, Scene, T};
 use crate::world::view::{view_matrix, H};
@@ -350,7 +351,7 @@ impl DreamNet {
             let reach = row[15].abs().max(row[16].abs()).max(row[17].abs());
             let z = c[2].max(0.05);
             let (px, py, rp) = (c[0] / z * vh + width as f32 / 2.0, c[1] / z * vh + H as f32 / 2.0, 3.0 * reach / z * vh);
-            if c[2] + reach > 0.05 && px + rp > 0.0 && px - rp < width as f32 && py + rp > 0.0 && py - rp < H as f32 {
+            if reach > 0.0 && c[2] + reach > 0.05 && px + rp > 0.0 && px - rp < width as f32 && py + rp > 0.0 && py - rp < H as f32 {
                 near.push((-reach / z, i, c));
             }
         }
@@ -782,20 +783,21 @@ fn tile_lists(drawn: &[bool], full: (usize, usize)) -> [(Vec<(usize, usize)>, Ve
     })
 }
 
-/// Each pixel's camera-space depth (in tiles) of the nearest level triangle, [H][width].
-pub fn level_depth(scene: &Scene, cam: &Camera, width: u32) -> Vec<f32> {
+/// Each pixel's camera-space depth (in tiles) of the nearest of the level triangles `tris`
+/// (`features::tri_features`), [H][width].
+pub fn level_depth(tris: &[f32], cam: &Camera, width: u32) -> Vec<f32> {
     const NEAR: f32 = 0.05;
     let (wi, hi) = (width as usize, H as usize);
     let mut depth = vec![f32::MAX; wi * hi];
     let m = view_matrix(cam);
     let r = |i: usize, j: usize| m.m[i][j] as f32 / 4096.0;
     let vh = cam.h as f32;
-    let to_cam = |p: [i32; 3]| {
-        let d = [0, 1, 2].map(|c| (p[c] - cam.pos[c]) as f32 / T as f32);
+    let to_cam = |p: &[f32]| {
+        let d = [0, 1, 2].map(|c| p[c] - cam.pos[c] as f32 / T as f32);
         [0, 1, 2].map(|k| r(k, 0) * d[0] + r(k, 1) * d[1] + r(k, 2) * d[2])
     };
-    for t in scene.tris.iter().chain(scene.part_tris()) {
-        let tri = [to_cam(t.v[0].p), to_cam(t.v[1].p), to_cam(t.v[2].p)];
+    for t in tris.chunks_exact(RAW) {
+        let tri = [to_cam(&t[0..3]), to_cam(&t[3..6]), to_cam(&t[6..9])];
         // Clipped against the near plane: at most a quad.
         let mut poly: Vec<[f32; 3]> = Vec::with_capacity(4);
         for i in 0..3 {
@@ -907,8 +909,12 @@ impl DreamLayer {
         &self.net.adapter
     }
 
-    /// Lay the creatures of `scene` (`version` says when its parts must be read again) over `rgb`.
-    pub fn draw(&mut self, scene: &Scene, version: u64, cam: &Camera, rgb: &mut [f32], width: u32) -> Result<()> {
+    /// Lay the creatures of `scene`, with `extra` among them (it must always have the same parts;
+    /// `version` says when the parts must be read again), over `rgb`, hidden by the level
+    /// triangles `tris`. `warp` (in tiles) has already bent `tris`, and bends the creatures too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, scene: &mut Scene, version: u64, tris: &[f32], extra: Creature, warp: impl Fn([f32; 3]) -> [f32; 3], cam: &Camera, rgb: &mut [f32], width: u32) -> Result<()> {
+        scene.creatures.push(extra);
         if self.parts.as_ref().is_none_or(|(v, _)| *v != version) {
             self.parts = Some((version, self.net.parts(scene, self.seed.wrapping_add(version))));
         }
@@ -916,18 +922,71 @@ impl DreamLayer {
         // They may have moved (`world::animate`).
         parts.rows.clear();
         part_features(scene, &mut parts.rows);
+        scene.creatures.pop();
+        warp_parts(&mut parts.rows, &warp);
         let layers = self.net.render(parts, cam, width)?;
         if !layers.is_empty() {
-            let depth = level_depth(scene, cam, width);
+            let depth = level_depth(tris, cam, width);
             composite(rgb, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
         }
         Ok(())
     }
 }
 
+/// The posed parts `rows` carried along by `warp` (tiles): each moves with the space it is in
+/// and turns as that space does, keeping its size.
+fn warp_parts(rows: &mut [f32], warp: &impl Fn([f32; 3]) -> [f32; 3]) {
+    const STEP: f32 = 0.1;
+    let unit = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        v.map(|c| c / l)
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    for row in rows.chunks_exact_mut(PART_FEATURES) {
+        let joint = warp([row[0], row[1], row[2]]);
+        let centre = [row[3], row[4], row[5]];
+        let moved = warp(centre);
+        // The axes are the columns of rows 6..15.
+        let axis = |row: &[f32], col: usize| {
+            let a = [row[6 + col], row[9 + col], row[12 + col]];
+            let end = warp([0, 1, 2].map(|c| centre[c] + a[c] * STEP));
+            [0, 1, 2].map(|c| end[c] - moved[c])
+        };
+        // The length (y) leads, and the others are squared up to it.
+        let y = unit(axis(row, 1));
+        let x = axis(row, 0);
+        let along = dot(x, y);
+        let x = unit([0, 1, 2].map(|c| x[c] - y[c] * along));
+        let z = crate::world::creature::cross(x, y);
+        row[0..3].copy_from_slice(&joint);
+        row[3..6].copy_from_slice(&moved);
+        for (col, a) in [x, y, z].iter().enumerate() {
+            for k in 0..3 {
+                row[6 + 3 * k + col] = a[k];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_warped_part_moves_and_stays_square() {
+        let mut row = vec![0.0; PART_FEATURES];
+        row[3..6].copy_from_slice(&[1.0, 2.0, 3.0]);
+        row[6..15].copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        warp_parts(&mut row, &|p| [p[0] + 0.3 * p[1], p[1] + 1.0, p[2]]);
+        assert!((row[3] - 1.6).abs() < 1e-4 && (row[4] - 3.0).abs() < 1e-4);
+        let col = |c: usize| [row[6 + c], row[9 + c], row[12 + c]];
+        // The shear leans the length over, and the others stay at right angles to it.
+        assert!(col(1)[0] > 0.2);
+        for (a, b) in [(0, 1), (1, 2), (0, 2)] {
+            let d: f32 = (0..3).map(|k| col(a)[k] * col(b)[k]).sum();
+            assert!(d.abs() < 1e-4, "{a} {b}: {d}");
+        }
+    }
 
     #[test]
     fn a_drawn_tile_has_its_parents_drawn_and_what_they_read_cleared() {

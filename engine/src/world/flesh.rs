@@ -14,7 +14,7 @@ use crate::world::skin::{self, Motif};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Skin size in texels (photo skins; drawn skins stay at 64).
-const SKIN: usize = 128;
+pub const SKIN: usize = 128;
 /// How far the skin's fine detail tilts its normals.
 const BUMP: f32 = 8.0;
 
@@ -61,13 +61,18 @@ pub struct Vertex {
     /// how much of the wrapped coordinates to use rather than those (see `wrap_weight`).
     pub cap: [[f32; 2]; 2],
     pub wrap: [f32; 2],
+    /// How far this surface has grown in, 0..1: below 1 it has a ragged edge, drawn per pixel.
+    pub grow: f32,
 }
 
+#[derive(Clone, Copy)]
 pub struct Tri {
     pub v: [Vertex; 3],
     pub skin: [u16; 2],
     /// Indices into `Flesh::lights`: the light of each skin's part.
     pub light: [u16; 2],
+    /// Light baked for each corner, in place of `light`: walls are too big for one.
+    pub corners: Option<[[[f32; 3]; 4]; 3]>,
     /// Per skin: the world directions of increasing cap u and v (the part's local x and z).
     pub cap_axes: [[[f32; 3]; 2]; 2],
 }
@@ -89,6 +94,8 @@ pub struct Flesh {
     pub lights: Vec<[[f32; 3]; 4]>,
     /// Where each of `lights` was taken (the part's centre), to bake it again.
     pub light_at: Vec<[f32; 3]>,
+    /// How far from slick toward dry skin the whole scene is drawn, 0..1.
+    pub matte: f32,
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -113,6 +120,11 @@ impl Skin {
                 (crate::world::tex::SIZE, t.idx.iter().map(|&i| t.pal[i as usize].map(|c| c as f32)).collect())
             }
         };
+        Skin::from_rgb(size, rgb, tint)
+    }
+
+    /// A skin from an image `size` square, RGB 0..255.
+    pub fn from_rgb(size: usize, rgb: Vec<[f32; 3]>, tint: [f32; 3]) -> Skin {
         let at = |x: isize, y: isize| (y.rem_euclid(size as isize) as usize) * size + x.rem_euclid(size as isize) as usize;
         // Fine detail: brightness less a blurred copy of itself, so the photo's own
         // shading does not turn into slopes.

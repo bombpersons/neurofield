@@ -6,7 +6,8 @@
 pub enum Item {
     HealingPotion,
     ManaPotion,
-    ClarityPotion,
+    ClearSeeingPotion,
+    CalmingPotion,
 }
 
 impl Item {
@@ -14,7 +15,8 @@ impl Item {
         match self {
             Item::HealingPotion => "healing potion",
             Item::ManaPotion => "mana potion",
-            Item::ClarityPotion => "clarity potion",
+            Item::ClearSeeingPotion => "clear seeing potion",
+            Item::CalmingPotion => "calming potion",
         }
     }
 }
@@ -24,9 +26,9 @@ const HEAL: i32 = 15;
 const RESTORE: i32 = 6;
 /// How fast affliction rises by itself, per second: from nothing to all in ten minutes.
 const AFFLICTION_RISE: f32 = 1.0 / 600.0;
-/// How long a clarity potion shows the dungeon as it is, in seconds, and what it lifts.
-pub const CLARITY_SECS: f32 = 20.0;
-const CLARITY_EASE: f32 = 0.25;
+/// How long a clear seeing potion lasts, in seconds: the plain picture shows for about ten
+/// of them, the rest being the fades.
+pub const CLARITY_SECS: f32 = 12.0;
 
 pub struct Player {
     pub hp: i32,
@@ -47,7 +49,8 @@ impl Player {
         let mut p = Player { hp: 40, max_hp: 40, mp: 12, max_mp: 12, affliction: 0.0, clarity: 0.0, items: Vec::new(), hotbar: [None; SLOTS] };
         p.add(Item::HealingPotion, 3);
         p.add(Item::ManaPotion, 2);
-        p.add(Item::ClarityPotion, 2);
+        p.add(Item::ClearSeeingPotion, 2);
+        p.add(Item::CalmingPotion, 1);
         p
     }
 
@@ -91,13 +94,10 @@ impl Player {
         self.affliction = (self.affliction + n).clamp(0.0, 1.0);
     }
 
-    /// `dt` seconds pass: clarity runs out, and while it lasts affliction doesn't rise.
+    /// `dt` seconds pass: clarity runs out and affliction creeps up.
     pub fn update(&mut self, dt: f32) {
-        if self.clarity > 0.0 {
-            self.clarity = (self.clarity - dt).max(0.0);
-        } else {
-            self.afflict(AFFLICTION_RISE * dt);
-        }
+        self.clarity = (self.clarity - dt).max(0.0);
+        self.afflict(AFFLICTION_RISE * dt);
     }
 
     /// Use the item on hotbar slot `slot`; says what happened, `None` for an empty slot.
@@ -121,12 +121,17 @@ impl Player {
                 self.remove_one(item);
                 "you drink the mana potion".into()
             }
-            Item::ClarityPotion if self.clarity > 0.0 => "you already see clearly".into(),
-            Item::ClarityPotion => {
+            Item::ClearSeeingPotion if self.clarity > 0.0 => "you already see clearly".into(),
+            Item::ClearSeeingPotion => {
                 self.clarity = CLARITY_SECS;
-                self.afflict(-CLARITY_EASE);
                 self.remove_one(item);
                 "the dream lifts".into()
+            }
+            Item::CalmingPotion if self.affliction <= 0.0 => "nothing troubles you".into(),
+            Item::CalmingPotion => {
+                self.affliction = 0.0;
+                self.remove_one(item);
+                "your head clears".into()
             }
         }
     }
@@ -139,7 +144,7 @@ mod tests {
     #[test]
     fn starts_with_potions_on_the_hotbar() {
         let p = Player::new();
-        assert_eq!(p.hotbar, [Some(Item::HealingPotion), Some(Item::ManaPotion), Some(Item::ClarityPotion), None]);
+        assert_eq!(p.hotbar, [Some(Item::HealingPotion), Some(Item::ManaPotion), Some(Item::ClearSeeingPotion), Some(Item::CalmingPotion)]);
         assert_eq!(p.count(Item::HealingPotion), 3);
     }
 
@@ -193,20 +198,16 @@ mod tests {
     }
 
     #[test]
-    fn clarity_lifts_affliction_holds_it_and_runs_out() {
+    fn clear_seeing_runs_out_and_leaves_affliction_alone() {
         let mut p = Player::new();
         p.afflict(0.5);
         assert_eq!(p.use_slot(2).as_deref(), Some("the dream lifts"));
         assert_eq!(p.clarity, CLARITY_SECS);
-        assert_eq!(p.count(Item::ClarityPotion), 1);
-        assert!((p.affliction - 0.25).abs() < 1e-5);
-        p.update(CLARITY_SECS - 1.0);
-        assert!((p.affliction - 0.25).abs() < 1e-5);
-        assert_eq!(p.clarity, 1.0);
-        p.update(1.0);
+        assert_eq!(p.count(Item::ClearSeeingPotion), 1);
+        assert_eq!(p.affliction, 0.5);
+        p.update(CLARITY_SECS);
         assert_eq!(p.clarity, 0.0);
-        p.update(6.0);
-        assert!(p.affliction > 0.25);
+        assert!(p.affliction > 0.5);
     }
 
     #[test]
@@ -214,14 +215,18 @@ mod tests {
         let mut p = Player::new();
         p.use_slot(2);
         assert_eq!(p.use_slot(2).as_deref(), Some("you already see clearly"));
-        assert_eq!(p.count(Item::ClarityPotion), 1);
+        assert_eq!(p.count(Item::ClearSeeingPotion), 1);
     }
 
     #[test]
-    fn affliction_never_goes_below_nothing() {
+    fn a_calming_potion_clears_affliction_and_is_kept_if_there_is_none() {
         let mut p = Player::new();
-        p.use_slot(2);
+        assert_eq!(p.use_slot(3).as_deref(), Some("nothing troubles you"));
+        assert_eq!(p.count(Item::CalmingPotion), 1);
+        p.afflict(0.7);
+        assert_eq!(p.use_slot(3).as_deref(), Some("your head clears"));
         assert_eq!(p.affliction, 0.0);
+        assert_eq!(p.count(Item::CalmingPotion), 0);
     }
 
     #[test]

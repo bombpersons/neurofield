@@ -823,7 +823,7 @@ impl Scene {
 
     /// The creature's meshes: through the PS1 pipeline, or for the full-colour pass
     /// as one sculpted surface (see `sculpt`) plus whatever parts are too thin for it.
-    fn mesh_creature(&mut self, c: &Creature) {
+    pub(crate) fn mesh_creature(&mut self, c: &Creature) {
         let placed = c.pose();
         if !crate::world::flesh::enabled() {
             for (p, at) in c.parts.iter().zip(&placed) {
@@ -862,7 +862,7 @@ impl Scene {
     /// A dense latitude-longitude mesh of one part, smooth-shaded, its skin
     /// repeated a whole number of times around and along: for the PS1 pass, or with
     /// `full` (a full-colour skin and light index) for the full-colour one.
-    fn mesh_part(&mut self, p: &Part, at: &Placed, skin: &Skin, tex: u8, full: Option<(u16, u16)>) {
+    pub(crate) fn mesh_part(&mut self, p: &Part, at: &Placed, skin: &Skin, tex: u8, full: Option<(u16, u16)>) {
         let circ = PI * (p.half[0] + p.half[2]) * (1.0 + p.bulge) * p.taper.max(1.0);
         let len = 2.0 * p.half[1] * (1.0 + 0.5 * p.bend.abs());
         let reps = |l: f32| (l / skin.scale).round().clamp(1.0, 8.0) as usize;
@@ -946,11 +946,12 @@ impl Scene {
                             b: [tan[i].1; 2],
                             cap: [cap; 2],
                             wrap: [wrap; 2],
+                            grow: 1.0,
                         }
                     };
                     let q = [fv(k, j), fv(k, j + 1), fv(k + 1, j), fv(k + 1, j + 1)];
                     for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
-                        self.flesh.tris.push(crate::world::flesh::Tri { v: [q[a], q[b], q[c]], skin: [skin_id; 2], light: [light; 2], cap_axes: [cap_axes; 2] });
+                        self.flesh.tris.push(crate::world::flesh::Tri { v: [q[a], q[b], q[c]], skin: [skin_id; 2], light: [light; 2], corners: None, cap_axes: [cap_axes; 2] });
                     }
                 }
             }

@@ -38,6 +38,8 @@ struct Vertex {
     @location(11) sh0: vec4<f32>,
     @location(12) sh1: vec4<f32>,
     @location(13) sh2: vec4<f32>,
+    // How far the surface has grown in; below 1 it has a ragged edge.
+    @location(14) grow: f32,
 };
 
 struct Varying {
@@ -57,6 +59,7 @@ struct Varying {
     @location(11) sh0: vec4<f32>,
     @location(12) sh1: vec4<f32>,
     @location(13) sh2: vec4<f32>,
+    @location(14) grow: f32,
 };
 
 @vertex
@@ -80,6 +83,7 @@ fn vertex(v: Vertex) -> Varying {
     out.sh0 = v.sh0;
     out.sh1 = v.sh1;
     out.sh2 = v.sh2;
+    out.grow = v.grow;
     return out;
 }
 
@@ -107,6 +111,29 @@ fn project(n0: vec3<f32>, uv: vec2<f32>, tt: vec3<f32>, bb: vec3<f32>, layer: i3
     s.wet = c.a;
     s.n = normalize(t * tn.x + b * tn.y + n0 * tn.z);
     return s;
+}
+
+fn hash(p: vec3<f32>) -> f32 {
+    let q = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3)) * 17.0;
+    return fract(q.x * q.y * q.z * (q.x + q.y + q.z));
+}
+
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let s = f * f * (3.0 - 2.0 * f);
+    let edge = array<f32, 4>(
+        mix(hash(i), hash(i + vec3(1.0, 0.0, 0.0)), s.x),
+        mix(hash(i + vec3(0.0, 1.0, 0.0)), hash(i + vec3(1.0, 1.0, 0.0)), s.x),
+        mix(hash(i + vec3(0.0, 0.0, 1.0)), hash(i + vec3(1.0, 0.0, 1.0)), s.x),
+        mix(hash(i + vec3(0.0, 1.0, 1.0)), hash(i + vec3(1.0, 1.0, 1.0)), s.x),
+    );
+    return mix(mix(edge[0], edge[1], s.y), mix(edge[2], edge[3], s.y), s.z);
+}
+
+// The pattern that a growing edge follows, about 0..1: a fixed thing at each place.
+fn ragged(p: vec3<f32>) -> f32 {
+    return 0.55 * value_noise(p) + 0.3 * value_noise(p * 2.1 + 7.0) + 0.15 * value_noise(p * 4.3 + 13.0);
 }
 
 fn luma(c: vec3<f32>) -> f32 {
@@ -149,6 +176,16 @@ fn fragment(in: Varying) -> @location(0) vec4<f32> {
         alb += ka * a.colour + kc * c.colour;
         nsum += ka * a.n + kc * c.n;
         wet += ka * a.wet + kc * c.wet;
+    }
+    // Where the surface is still growing in, it stops along a ragged line with a dark wet rim.
+    if in.grow < 1.0 {
+        let cover = in.grow * 2.2 - 0.9 + (ragged(p / u.eye.w * 1.6) - 0.5) * 2.0;
+        if cover <= 0.0 {
+            discard;
+        }
+        let rim = 1.0 - smoothstep(0.0, 0.22, cover);
+        alb = mix(alb, vec3(0.1, 0.015, 0.02), rim * 0.92);
+        wet += rim * 0.7;
     }
     let n = normalize(nsum);
     let sh_mean = in.sh0.xyz;

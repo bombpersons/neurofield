@@ -6,8 +6,13 @@
 //!     `--strange DIR`, `--level DIR` (level textures alone).
 //!     `--dream x.safetensors` draws the creatures with the dream net (train/export_dream.py).
 //!     `--window 1280x720` sets the window's starting size; the frame follows its shape.
+//!     `--sculpt data/eye` turns the level to folded flesh with filmed eyes, veins and mouths and
+//!     draws it with the rasteriser, as the level net might one day (`engine::world::dreamed`);
+//!     its textures default to data/painted. [ and ] turn it from plain stone to fully flesh
+//!     and back (select + L1 / R1 on the pad).
 //!     `--view raster` (or `both`) starts on the rasteriser instead of the network.
 //!     `--strangeness 0.7` sets how strange each level is (otherwise random).
+//!     `--affliction 0.7` starts the player that afflicted, to try how it looks.
 //!     `--level-file levels/x.ron` plays a hand-built level (see `engine::world::level`) from its
 //!     player start, or from `--start x,y,z,yaw` (world units, yaw in radians); N reloads it.
 //!     E (or circle) opens and closes the door in front, or pulls the lever; walking over a
@@ -51,6 +56,7 @@ use bevy_egui::input::EguiWantsInput;
 use bevy_egui::{egui, EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, PrimaryEguiContext};
 use engine::world::view::{H, W};
 use engine::world::rng::Rng;
+use engine::world::growths::Growths;
 use engine::world::walker::{self, MAX_PITCH};
 use psx_bevy::controller::{BindingDevice, Button, ControllerBindings, ControllerState};
 use psx_bevy::psx::{fit_scale, PsxPlugin, PsxScreen, DISPLAY_LAYER};
@@ -72,12 +78,15 @@ const LOOK: f32 = 1.2;
 /// Right stick look speed at full tilt: yaw and pitch units per second.
 const PAD_YAW: f32 = 2600.0;
 const PAD_PITCH: f32 = 1400.0;
-/// Affliction reaches the level in this many steps: each bakes the level's lights again.
-const AFFLICTION_STEPS: f32 = 50.0;
+/// Seconds for what the player feels to catch up with a whole bar of change in affliction.
+const FEEL_SECS: f32 = 2.0;
 /// Seconds the strangeness takes to drain away, or come back, under the network.
 const CALM_SECS: f32 = 1.5;
 /// Seconds the network's calm picture takes to fade to the plain one, and back.
 const FADE_SECS: f32 = 0.8;
+/// What a tentacle's lash does: health lost and affliction added.
+const LASH_HP: i32 = 4;
+const LASH_AFFLICTION: f32 = 0.01;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -113,8 +122,19 @@ struct Sim {
     width: u32,
     /// How strange the level is at its base, before affliction (the egui slider sets it).
     strangeness: f32,
-    /// The step of affliction the level was last lit for (`apply_affliction`).
-    applied: Option<i32>,
+    /// Affliction as the player feels it, easing after the real value so nothing jumps.
+    felt: f32,
+    /// The tentacles of near-full affliction; only the dream net can draw them.
+    growths: Option<Growths>,
+    /// With `--sculpt`: where the filmed eyes are, and what the level's been turned into.
+    eyes: Option<PathBuf>,
+    sculpted: Option<engine::world::dreamed::Dreamed>,
+    /// How far the sculpted level has turned, 0..1; [ and ] move it.
+    dial: f32,
+    /// The level's triangles as affliction has swollen them, for this frame.
+    swollen: Vec<f32>,
+    /// Seconds of unpaused time, for the affliction's effects.
+    dream_time: f32,
     /// How much of the strangeness has drained away, 0..1, and after that how far the
     /// network has faded to the plain picture, 0..1.
     calm: f32,
@@ -140,24 +160,12 @@ impl Sim {
     fn set_strangeness(&mut self, s: f32) {
         self.strangeness = s.clamp(0.0, 1.0);
         engine::world::scene::force_strangeness(Some(self.strangeness));
-        self.applied = None;
-        self.apply_affliction();
+        self.relight();
     }
 
-    /// Light the level for its base strangeness and the player's affliction, which takes
-    /// it from there towards fully strange. Only a new step of affliction does anything.
-    fn apply_affliction(&mut self) {
-        // A jump in the strangeness would show as it drains: it can wait until that's done.
-        if self.player.clarity > 0.0 && self.calm < 1.0 {
-            return;
-        }
-        let step = (self.player.affliction * AFFLICTION_STEPS).round() as i32;
-        if self.applied == Some(step) {
-            return;
-        }
-        self.applied = Some(step);
-        let base = self.strangeness;
-        self.level.set_strangeness(base + (1.0 - base) * step as f32 / AFFLICTION_STEPS);
+    /// Light the level for its strangeness.
+    fn relight(&mut self) {
+        self.level.set_strangeness(self.strangeness);
         self.look += 1;
     }
 
@@ -205,7 +213,7 @@ impl Sim {
     }
 
     /// A new level, or the file again (it may have been edited), its own strangeness
-    /// (a file keeps the slider's) with the player's affliction on top.
+    /// (a file keeps the slider's).
     fn reload(&mut self) {
         self.version += 1;
         self.held.clear();
@@ -219,9 +227,20 @@ impl Sim {
                 self.strangeness = self.level.scene.strange.base;
             }
         }
+        if let Some(dir) = &self.eyes {
+            self.sculpted = Some(engine::world::dreamed::sculpt(&mut self.level.scene, self.rng.next() as u64, Some(dir)));
+            self.strangeness = self.level.scene.strange.base;
+        }
+        self.relight();
         self.level.set_strange_amount(1.0 - self.calm);
-        self.applied = None;
-        self.apply_affliction();
+        if self.growths.is_some() {
+            self.growths = Some(Growths::new(&self.level.scene));
+        }
+    }
+
+    /// Affliction as it shows: drained away while the player sees clearly.
+    fn showing(&self) -> f32 {
+        self.felt * (1.0 - self.calm)
     }
 
     fn say(&mut self, what: String) {
@@ -241,7 +260,6 @@ impl Sim {
     fn use_slot(&mut self, slot: usize) {
         if let Some(what) = self.player.use_slot(slot) {
             self.say(what);
-            self.apply_affliction();
         }
     }
 
@@ -319,6 +337,7 @@ struct Report {
     /// The walking bob's offset of the camera, in world units.
     bob: f32,
     affliction: f32,
+    felt: f32,
     clarity: f32,
     /// The level's strangeness at its base, affliction included, and the picture on show.
     strangeness: f32,
@@ -326,6 +345,8 @@ struct Report {
     /// How much of the strangeness has drained, and how far the plain picture has faded in.
     calm: f32,
     veil: f32,
+    /// How many tentacles are out.
+    growths: usize,
 }
 
 fn main() {
@@ -353,6 +374,9 @@ fn main() {
     let config = engine::world::config::Config::load();
     let model = engine::neural::model_path(&opts, &config);
     let seed: u64 = opts.get("seed").map_or(7, |s| s.parse().expect("--seed is a number"));
+    if opts.contains_key("sculpt") && !opts.contains_key("strange") {
+        opts.insert("strange".to_string(), "data/painted".to_string());
+    }
     config.load_textures(&opts);
     if let Some(s) = opts.get("strangeness") {
         engine::world::scene::force_strangeness(Some(s.parse().expect("--strangeness 0..1")));
@@ -375,7 +399,16 @@ fn main() {
         Some(f) => load_level(f, start, &mut rng).unwrap_or_else(|e| panic!("{e}")),
         None => Level::new(&mut rng),
     };
+    let eyes = opts.get("sculpt").map(PathBuf::from);
+    let mut level = level;
+    let sculpted = eyes.as_deref().map(|dir| engine::world::dreamed::sculpt(&mut level.scene, seed, Some(dir)));
     let strangeness = level.scene.strange.base;
+    let growths = dream.is_some().then(|| Growths::new(&level.scene));
+
+    let mut player = Player::new();
+    if let Some(a) = opts.get("affliction") {
+        player.afflict(a.parse().expect("--affliction 0..1"));
+    }
 
     let window_size = opts.get("window").map_or((960, 720), |w| {
         let (x, y) = w.split_once('x').expect("--window WIDTHxHEIGHT");
@@ -426,6 +459,7 @@ fn main() {
             auto_walk: false,
             paused: false,
             mode: match opts.get("view").map(String::as_str) {
+                None if eyes.is_some() => Mode::Raster,
                 None | Some("network") => Mode::Network,
                 Some("raster") => Mode::Raster,
                 Some("both") => Mode::Both,
@@ -438,7 +472,13 @@ fn main() {
             tris: 0,
             width: W,
             strangeness,
-            applied: Some(0),
+            felt: player.affliction,
+            growths,
+            eyes,
+            sculpted,
+            dial: 1.0,
+            swollen: Vec::new(),
+            dream_time: 0.0,
             calm: 0.0,
             veil: 0.0,
             file,
@@ -447,14 +487,14 @@ fn main() {
             look: 0,
             held: Vec::new(),
             said: None,
-            player: Player::new(),
+            player,
             sword: Sword::default(),
             on_pad: false,
         })
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
-        .add_systems(Update, (keys, mouse, draw, build_scene, move_things, raster_camera, status, update_hud, auto_screenshot).chain())
+        .add_systems(Update, (keys, mouse, draw, build_scene, move_things, pose_sculpted, raster_camera, status, update_hud, auto_screenshot).chain())
         .add_systems(Update, egui_on_display)
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
@@ -660,7 +700,9 @@ fn debug_chords(pad: &ControllerState, sim: &mut Sim) {
         sim.toggle_renderer();
     }
     for (b, d) in [(Button::L1, -0.1), (Button::R1, 0.1)] {
-        if pad.pressed(b) {
+        if pad.pressed(b) && sim.sculpted.is_some() {
+            sim.dial = (sim.dial + d).clamp(0.0, 1.0);
+        } else if pad.pressed(b) {
             let s = sim.strangeness + d;
             sim.set_strangeness(s);
         }
@@ -759,11 +801,13 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         attacking: sim.sword.swinging(),
         bob: sim.level.walker.bob(),
         affliction: sim.player.affliction,
+        felt: sim.felt,
         clarity: sim.player.clarity,
-        strangeness: sim.level.scene.strange.base,
+        strangeness: if sim.sculpted.is_some() { sim.dial } else { sim.level.scene.strange.base },
         shown: sim.shown().name().to_string(),
         calm: sim.calm,
         veil: sim.veil,
+        growths: sim.growths.as_ref().map_or(0, Growths::count),
     };
     if sim.paused {
         return;
@@ -774,7 +818,17 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         sim.say("the dream returns".to_string());
     }
     sim.fade(1.0 / TICK as f32);
-    sim.apply_affliction();
+    let most = 1.0 / TICK as f32 / FEEL_SECS;
+    sim.felt += (sim.player.affliction - sim.felt).clamp(-most, most);
+    let wanted = effects::growth(sim.showing());
+    if let Some(growths) = &mut sim.growths {
+        let cam = sim.level.walker.camera();
+        if growths.update(&sim.level.scene, &cam, wanted, 1.0 / TICK as f32, &mut sim.rng) && !sim.auto_walk {
+            sim.player.hurt(LASH_HP);
+            sim.player.afflict(LASH_AFFLICTION);
+            sim.said = Some(("something lashes you".to_string(), 3.0));
+        }
+    }
     if sim.level.scene.tick_things(1.0 / TICK as f32) {
         sim.level.things_moved();
     }
@@ -842,6 +896,7 @@ fn draw(
     if !sim.paused {
         let dt = time.delta_secs();
         sim.effects.iter_mut().flatten().for_each(|t| *t += dt);
+        sim.dream_time += dt;
         if dream.is_some() {
             let sim = &mut *sim;
             sim.herd.update(&mut sim.level.scene, sim.version, dt);
@@ -850,12 +905,16 @@ fn draw(
     if sim.shown() != Mode::Raster {
         let t0 = std::time::Instant::now();
         let width = sim.width;
-        let mut tokens = sim.level.tokens_at(width);
-        let calm = effects::apply_set(&sim.effects, &mut tokens, &sim.level.tris);
-        let mut rgb = net.render(&tokens, &calm);
-        if let Some(layer) = dream.as_mut() {
-            let cam = sim.level.walker.camera();
-            if let Err(e) = layer.draw(&sim.level.scene, sim.version, &cam, &mut rgb, width) {
+        let sim = &mut *sim;
+        let cam = sim.level.walker.camera();
+        // All this drains away with the strangeness when the player sees clearly.
+        let swelling = effects::Swelling::of(sim.showing(), sim.dream_time, &cam);
+        swelling.tris(&sim.level.tris, &mut sim.swollen);
+        let mut tokens = sim.level.tokens_of(&sim.swollen, width);
+        let disturbed = effects::apply_set(&sim.effects, &mut tokens, &sim.swollen);
+        let mut rgb = net.render(&tokens, &disturbed);
+        if let (Some(layer), Some(growths)) = (dream.as_mut(), &sim.growths) {
+            if let Err(e) = layer.draw(&mut sim.level.scene, sim.version, &sim.swollen, growths.creature(), |p| swelling.tiles(p), &cam, &mut rgb, width) {
                 eprintln!("dream layer: {e}");
             }
         }
@@ -910,6 +969,67 @@ fn move_things(
         if let Some(v) = parts.things.get_mut(i) {
             *v = p.version;
         }
+    }
+}
+
+/// How many times a second the sculpted level's moving parts are remade.
+const POSE_RATE: f32 = 20.0;
+/// How much of the sculpted level's dial [ and ] move a second.
+const DIAL_SPEED: f32 = 0.25;
+
+/// The filmed eyes and the veins as they stand this frame (with `--sculpt`), a mesh of their own
+/// made afresh so that the rest of the level's flesh stays put.
+fn pose_sculpted(
+    mut commands: Commands,
+    mut sim: ResMut<Sim>,
+    time: Res<Time>,
+    key: Res<ButtonInput<KeyCode>>,
+    mut moving: Local<Option<Entity>>,
+    mut walls: Local<Option<Entity>>,
+    mut walls_of: Local<Option<(AssetId<engine::render::flesh::FleshMaterial>, f32)>>,
+    mut since: Local<f32>,
+    // The scene's own only: what's remade may still have the last level's skins.
+    flesh: Query<&MeshMaterial3d<engine::render::flesh::FleshMaterial>, Without<engine::render::flesh::MovingFlesh>>,
+    mut gfx: engine::render::Gfx,
+) {
+    let sim = &mut *sim;
+    if sim.sculpted.is_none() {
+        return;
+    }
+    let dt = time.delta_secs();
+    let held = key.pressed(KeyCode::BracketRight) as i32 as f32 - key.pressed(KeyCode::BracketLeft) as i32 as f32;
+    sim.dial = (sim.dial + held * DIAL_SPEED * dt).clamp(0.0, 1.0);
+    // The mesh is in the world, so turning the camera doesn't need a new one, and what moves
+    // in it is slow: remaking it every frame was the slowest part of the frame.
+    *since += dt;
+    if *since < 1.0 / POSE_RATE {
+        return;
+    }
+    *since = 0.0;
+    let Some(sculpted) = &mut sim.sculpted else { return };
+    // Clear seeing takes the flesh back into the stone as well.
+    sculpted.amount = sim.dial * (1.0 - sim.calm);
+    let Some(material) = flesh.iter().next() else { return };
+    let scene = &mut sim.level.scene;
+    let now = (material.id(), sculpted.amount);
+    if *walls_of != Some(now) {
+        if let Some(e) = walls.take() {
+            commands.entity(e).despawn();
+        }
+        let tris = engine::world::dreamed::walls(sculpted);
+        if !tris.is_empty() {
+            *walls = Some(gfx.spawn_moving_flesh(&mut commands, material, &scene.flesh, &tris));
+        }
+        *walls_of = Some(now);
+    }
+    if let Some(e) = moving.take() {
+        commands.entity(e).despawn();
+    }
+    let cam = sim.level.walker.camera();
+    engine::world::dreamed::pose(scene, sculpted, &cam, sim.dream_time);
+    let tris = scene.flesh.tris.split_off(sculpted.fixed);
+    if !tris.is_empty() {
+        *moving = Some(gfx.spawn_moving_flesh(&mut commands, material, &scene.flesh, &tris));
     }
 }
 
@@ -1042,8 +1162,9 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
         _ => format!(" | keys: {}", sim.held.iter().map(|k| k.1.as_str()).collect::<Vec<_>>().join(", ")),
     };
     let said = sim.said.as_ref().map_or(String::new(), |s| format!("\n{}", s.0));
+    let dial = if sim.sculpted.is_some() { format!("flesh {:.0}% | ", sim.dial * 100.0) } else { String::new() };
     text.0 = format!(
-        "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | affliction {:.0}% | {walk}{pause}{keys}\n\
+        "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | affliction {:.0}% | {dial}{walk}{pause}{keys}\n\
          mouse: look  rmb: attack  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  f1: switch  f2: both  f3: hurt  h: panel  esc: free mouse{said}",
         sim.net_ms, sim.tris, sim.player.affliction * 100.0
     );

@@ -129,8 +129,13 @@ impl Level {
     /// The network's inputs for the walker's current view on a screen `width` pixels
     /// wide (a multiple of 16, up to `gpu_net::MAX_W`).
     pub fn tokens_at(&self, width: u32) -> tokens::Tokens {
+        self.tokens_of(&self.tris, width)
+    }
+
+    /// The same with `tris` in place of the level's triangle features.
+    pub fn tokens_of(&self, tris: &[f32], width: u32) -> tokens::Tokens {
         let mut v = Vec::new();
         view_features(&self.scene, 0, &self.walker.camera(), width, &mut v);
-        tokens::tokens(&self.tris, &v)
+        tokens::tokens(tris, &v)
     }
 }

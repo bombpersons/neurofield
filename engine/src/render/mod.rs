@@ -250,6 +250,17 @@ impl Gfx<'_> {
     pub fn spawn_flesh(&mut self, commands: &mut Commands, flesh: &crate::world::flesh::Flesh) -> Option<Entity> {
         flesh::spawn_flesh(commands, &mut self.meshes, &mut self.images, &mut self.flesh, flesh, &self.view)
     }
+
+    /// Triangles of `fl`'s that change every frame, drawn with the skins of `material`.
+    pub fn spawn_moving_flesh(
+        &mut self,
+        commands: &mut Commands,
+        material: &MeshMaterial3d<flesh::FleshMaterial>,
+        fl: &crate::world::flesh::Flesh,
+        tris: &[crate::world::flesh::Tri],
+    ) -> Entity {
+        flesh::spawn_moving(commands, &mut self.meshes, material, fl, tris)
+    }
 }
 
 /// Spawn `scene` as meshes: the level and any PS1-pipeline creatures one mesh

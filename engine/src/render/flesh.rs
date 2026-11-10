@@ -71,6 +71,8 @@ const ATTR_SH: [MeshVertexAttribute; 3] = [
     MeshVertexAttribute::new("Flesh_Sh2", 0x6e66_000d, VertexFormat::Float32x4),
 ];
 
+const ATTR_GROW: MeshVertexAttribute = MeshVertexAttribute::new("Flesh_Grow", 0x6e66_000e, VertexFormat::Float32);
+
 #[derive(Clone, Copy, Default, ShaderType, Debug)]
 struct FleshUniform {
     /// The eye in world units, and one tile in them.
@@ -125,6 +127,7 @@ impl Material for FleshMaterial {
             .chain(ATTR_AXES)
             .chain(ATTR_SH);
         attrs.extend(rest.enumerate().map(|(i, a)| a.at_shader_location(2 + i as u32)));
+        attrs.push(ATTR_GROW.at_shader_location(14));
         descriptor.vertex.buffers = vec![layout.0.get_layout(&attrs)?];
         // Triangles face out of the creature (see `mesh`); the rest are culled.
         descriptor.primitive.cull_mode = Some(Face::Back);
@@ -475,14 +478,29 @@ pub(crate) fn spawn_flesh(
     if fl.tris.is_empty() || fl.skins.is_empty() {
         return None;
     }
-    let (colour, normal) = skin_arrays(&fl.skins);
+    let (colour, normal) = skin_arrays(&fl.skins, fl.matte);
     let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal) };
-    let mesh = meshes.add(mesh(fl));
+    let mesh = meshes.add(mesh(fl, &fl.tris));
     Some(commands.spawn((Mesh3d(mesh), MeshMaterial3d(materials.add(material)), RenderLayers::layer(FLESH_LAYER))).id())
 }
 
-fn mesh(fl: &Flesh) -> Mesh {
-    let n = fl.tris.len() * 3;
+/// Flesh remade as it changes, which borrows its skins from the scene's own (`spawn_flesh`).
+#[derive(Component)]
+pub struct MovingFlesh;
+
+/// Triangles that change every frame, with `fl`'s lights and the skins of `material`.
+pub(crate) fn spawn_moving(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    material: &MeshMaterial3d<FleshMaterial>,
+    fl: &Flesh,
+    tris: &[crate::world::flesh::Tri],
+) -> Entity {
+    commands.spawn((Mesh3d(meshes.add(mesh(fl, tris))), material.clone(), RenderLayers::layer(FLESH_LAYER), MovingFlesh)).id()
+}
+
+fn mesh(fl: &Flesh, tris: &[crate::world::flesh::Tri]) -> Mesh {
+    let n = tris.len() * 3;
     let mut pos = Vec::with_capacity(n);
     let mut nw = Vec::with_capacity(n);
     let mut uvcap = [Vec::with_capacity(n), Vec::with_capacity(n)];
@@ -490,8 +508,9 @@ fn mesh(fl: &Flesh) -> Mesh {
     let mut bs = [Vec::with_capacity(n), Vec::with_capacity(n)];
     let mut axes = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
     let mut sh = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
+    let mut grow = Vec::with_capacity(n);
     let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-    for t in &fl.tris {
+    for t in tris {
         // Wound to face out of the creature, by its vertex normals.
         let p = t.v.map(|v| v.p);
         let (e1, e2) = (sub(p[1], p[0]), sub(p[2], p[0]));
@@ -505,6 +524,7 @@ fn mesh(fl: &Flesh) -> Mesh {
             let v = &t.v[k];
             pos.push(to_view(v.p).to_array());
             nw.push([v.n[0], v.n[1], v.n[2], v.w]);
+            grow.push(v.grow);
             for s in 0..2 {
                 uvcap[s].push([v.uv[s][0], v.uv[s][1], v.cap[s][0], v.cap[s][1]]);
                 tw[s].push([v.t[s][0], v.t[s][1], v.t[s][2], v.wrap[s]]);
@@ -514,8 +534,15 @@ fn mesh(fl: &Flesh) -> Mesh {
                 list.push([a[i * 4], a[i * 4 + 1], a[i * 4 + 2], a[i * 4 + 3]]);
             }
             let w = v.w.clamp(0.0, 1.0);
-            let blended: Vec<f32> =
-                (0..4).flat_map(|r| (0..3).map(move |c| (r, c))).map(|(r, c)| w * lights[0][r][c] + (1.0 - w) * lights[1][r][c]).collect();
+            let mut blended = [0.0f32; 12];
+            for r in 0..4 {
+                for c in 0..3 {
+                    blended[r * 3 + c] = match &t.corners {
+                        Some(light) => light[k][r][c],
+                        None => w * lights[0][r][c] + (1.0 - w) * lights[1][r][c],
+                    };
+                }
+            }
             for (i, list) in sh.iter_mut().enumerate() {
                 list.push([blended[i * 4], blended[i * 4 + 1], blended[i * 4 + 2], blended[i * 4 + 3]]);
             }
@@ -524,6 +551,7 @@ fn mesh(fl: &Flesh) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
     mesh.insert_attribute(ATTR_NW, nw);
+    mesh.insert_attribute(ATTR_GROW, grow);
     for s in 0..2 {
         mesh.insert_attribute(ATTR_UVCAP[s], std::mem::take(&mut uvcap[s]));
         mesh.insert_attribute(ATTR_TW[s], std::mem::take(&mut tw[s]));
@@ -538,8 +566,9 @@ fn mesh(fl: &Flesh) -> Mesh {
 
 /// The skins as two texture arrays with their mip chains: albedo (tinted) with
 /// gloss in alpha, and normals. Smaller skins are scaled up to the largest by
-/// their own bilinear sampling, below which their mips carry on.
-fn skin_arrays(skins: &[crate::world::flesh::Skin]) -> (Image, Image) {
+/// their own bilinear sampling, below which their mips carry on. `matte` takes
+/// away the gloss and most of the fine relief that catches it.
+fn skin_arrays(skins: &[crate::world::flesh::Skin], matte: f32) -> (Image, Image) {
     let size = skins.iter().map(|s| s.mips()[0].0).max().unwrap_or(1);
     let levels = size.trailing_zeros() + 1;
     let (mut colour, mut normal) = (Vec::new(), Vec::new());
@@ -554,10 +583,12 @@ fn skin_arrays(skins: &[crate::world::flesh::Skin]) -> (Image, Image) {
                     .collect(),
             };
             for t in texels {
-                for c in [t.c[0] * tint[0], t.c[1] * tint[1], t.c[2] * tint[2], t.wet] {
+                for c in [t.c[0] * tint[0], t.c[1] * tint[1], t.c[2] * tint[2], t.wet * (1.0 - matte)] {
                     colour.extend_from_slice(&half::f16::from_f32(c).to_le_bytes());
                 }
-                normal.extend(t.n.map(|c| ((c * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8));
+                let flat = 1.0 - 0.7 * matte;
+                let n = Vec3::new(t.n[0] * flat, t.n[1] * flat, t.n[2]).normalize();
+                normal.extend(n.to_array().map(|c| ((c * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8));
                 normal.push(255);
             }
         }

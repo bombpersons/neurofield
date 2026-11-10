@@ -140,7 +140,7 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 }
 
 /// Gradient noise in about -1..1.
-fn noise(p: [f32; 3], seed: u64) -> f32 {
+pub(crate) fn noise(p: [f32; 3], seed: u64) -> f32 {
     let i = p.map(|c| c.floor());
     let f = [0, 1, 2].map(|k| p[k] - i[k]);
     let fade = f.map(|t| t * t * t * (t * (t * 6.0 - 15.0) + 10.0));
@@ -517,9 +517,10 @@ fn triangle(
             b: [frames[0][k].2, frames[1][k].2],
             cap: [frames[0][k].3, frames[1][k].3],
             wrap: [frames[0][k].4, frames[1][k].4],
+            grow: 1.0,
         }
     });
     let idx = [pieces[0].index, pieces[1].index];
     let cap_axes = pieces.map(|pc| [0, 2].map(|c| [pc.at.axes[0][c], pc.at.axes[1][c], pc.at.axes[2][c]]));
-    Some(Tri { v, skin: idx.map(|i| skins[i]), light: idx.map(|i| lights[i]), cap_axes })
+    Some(Tri { v, skin: idx.map(|i| skins[i]), light: idx.map(|i| lights[i]), corners: None, cap_axes })
 }

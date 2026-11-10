@@ -91,8 +91,11 @@ pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
     let radius = (dx * dx + dz * dz).sqrt();
     let angle = dz.atan2(dx);
     let (mut net_ms, mut dream_ms) = (Vec::new(), Vec::new());
+    let affliction: f32 = opts.get("affliction").map_or(0.0, |a| a.parse().expect("--affliction is 0..1"));
     let animate = opts.contains_key("animate");
     let mut herd = engine::world::animate::Herd::default();
+    let mut growths = engine::world::growths::Growths::new(&level.scene);
+    let (mut swollen, mut lashes, mut most) = (Vec::new(), 0, 0);
     for f in 0..frames {
         if animate {
             herd.update(&mut level.scene, 0, 1.0 / 30.0);
@@ -107,16 +110,22 @@ pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
         let cam = Camera { pos: [x as i32, start.pos[1], z as i32], yaw, roll: 0, ..start };
         let mut v = Vec::new();
         view_features(&level.scene, 0, &cam, W, &mut v);
-        let t = tokens::tokens(&level.tris, &v);
+        let time = f as f32 / 30.0;
+        let swelling = effects::Swelling::of(affliction, time, &cam);
+        swelling.tris(&level.tris, &mut swollen);
+        let t = tokens::tokens(&swollen, &v);
+        lashes += growths.update(&level.scene, &cam, effects::growth(affliction), 1.0 / 30.0, &mut rng) as u32;
+        most = most.max(growths.count());
         let t0 = Instant::now();
         let mut rgb = net.render(&t, &Dream::calm(W));
         net_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         let t0 = Instant::now();
-        layer.draw(&level.scene, 0, &cam, &mut rgb, W).expect("dream layer");
+        layer.draw(&mut level.scene, 0, &swollen, growths.creature(), |p| swelling.tiles(p), &cam, &mut rgb, W).expect("dream layer");
         dream_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         let bytes: Vec<u8> = rgb.iter().map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8).collect();
         crate::write_png(&out.join(format!("frame_{f:05}.png")), W, H, &bytes);
     }
+    println!("tentacles: at most {most} out, {lashes} lashes landed");
     for (name, v) in [("level net", &mut net_ms), ("dream layer", &mut dream_ms)] {
         v.sort_by(f64::total_cmp);
         println!("{name}: median {:.1} ms, slowest {:.1} ms", v[v.len() / 2], v[v.len() - 1]);

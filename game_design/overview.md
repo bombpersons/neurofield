@@ -53,33 +53,36 @@ The opening area is a castle with an outdoor market and houses around it.
 ## Affliction and strangeness
 
 The player has an **affliction** value (the name may change) that changes how
-strange the dungeon is around them. The neural renderer already has a
-strangeness control (the `strangeness` slider in `game/`), and affliction is
-what drives it during play.
+the dungeon behaves around them. A level's strangeness is its own and affliction
+doesn't touch it: the colourful, psychedelic look is a separate thing.
 
 - Affliction goes from none to full. It creeps up by itself while the player is
   in the dungeon, taking about ten minutes from nothing to full.
-- It takes the level from its own strangeness towards fully strange.
-- Being hit raises it. Potions, items and other things raise or lower it too.
-- When strangeness gets very high, special enemies spawn from time to time and
-  attack the player.
-- The renderer's dream effects show what is happening to the player:
-  - **Smeared attention** (`engine/src/neural/effects.rs`) is a status effect, possibly
-    blindness or confusion.
-  - **Vertex waves** (the vertex wobble) might be a status effect of its own,
-    or it might just get stronger as affliction rises. Not decided yet.
+- Being attacked and other things in play raise it faster.
+- **Getting rid of it.** Returning to the town, by a shortcut or by backtracking,
+  resets it to nothing. So does a calming potion.
+- As it grows, the world begins to move and then to reach for the player. None
+  of this disturbs the neural renderer itself, so the picture stays sharp.
+- **The swell** moves the level's walls, floors and ceilings in long, slow
+  waves, and bends the creatures with them. It grows as affliction rises.
+- **Tentacles.** From 85% affliction, tentacles grow out of the walls and
+  ceilings the player is looking at, up to eight at full affliction. One within
+  reach turns on the player for 0.7 seconds and then lunges at where they
+  were, so the player can step away. A hit costs 4 HP and adds a little
+  affliction. They wither when the player leaves them behind, when affliction
+  falls, or when a clear seeing potion takes hold.
 
 ### Seeing clearly
 
 Some items let the player see the dungeon as it really is, drawn with the
 plain PSX renderer instead of the neural one.
 
-- **Clarity potion** (name WIP). For 20 seconds the player sees the dungeon as
-  it is. The strangeness drains away while the neural renderer is still drawing,
-  then the picture fades to the plain PSX renderer. When it runs out, the same
-  happens backwards. A pale bar under the MP bar shows the time left.
-  It lowers affliction by a quarter of the full amount, and affliction doesn't
-  rise while it lasts. It can be used from the inventory or the hotbar.
+- **Clear seeing potion** (name WIP). The player sees the dungeon as it is for
+  about ten seconds. The strangeness and the swell drain away while the
+  neural renderer is still drawing, then the picture fades to the plain PSX
+  renderer. When it runs out, the same happens backwards. A pale bar under the
+  MP bar shows the time left. It doesn't change affliction. It can be used from
+  the inventory or the hotbar.
 - **Monocle.** A lens the player moves around the screen. Only the part of the
   screen inside the lens is drawn with the PSX renderer.
   - **Using it.** Hotbar only: it can't be used from the inventory screen. Put
@@ -249,8 +252,6 @@ options:
 
 - A final name for "affliction".
 - The keyboard key for casting the selected spell.
-- Whether vertex wobble is its own status effect or just grows with affliction.
-- Whether smeared attention means blindness, confusion, or something else.
 - The keyboard key for quick-change. How does keyboard and mouse pick from the
   list (mouse wheel? number keys?)
 - Does "cast now" from the pause menu cast the spell the moment the menu

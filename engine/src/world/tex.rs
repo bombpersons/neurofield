@@ -226,6 +226,14 @@ fn texel(t: usize, x: usize, y: usize) -> f32 {
 
 /// Level textures from images, by slot (see `load_level`).
 static LEVEL: std::sync::OnceLock<Vec<Option<Texture>>> = std::sync::OnceLock::new();
+/// Where `load_strange` read them from.
+static STRANGE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The fully strange textures' folder, once `load_strange` has run.
+pub fn fully_strange_dir() -> Option<std::path::PathBuf> {
+    Some(STRANGE_DIR.get()?.join((STRANGE_STEPS - 1).to_string()))
+}
+
 /// Baked strange steps 1.. of the level textures: [step - 1][slot] (see `load_strange`).
 static STRANGE: std::sync::OnceLock<Vec<Vec<Texture>>> = std::sync::OnceLock::new();
 
@@ -260,6 +268,7 @@ pub fn load_level(dir: &std::path::Path) {
 /// Take the level textures at every strangeness step from DIR/<step>/<slot>.png
 /// (see `photo/bake_strange.py`): step 0 is the level itself, as `load_level`.
 pub fn load_strange(dir: &std::path::Path) {
+    STRANGE_DIR.set(dir.to_path_buf()).ok();
     load_level(&dir.join("0"));
     let steps: Vec<Vec<Texture>> = (1..STRANGE_STEPS)
         .map(|k| {

@@ -382,6 +382,42 @@ fn walk(out: &Path, frames: usize, seed: u64) {
     std::fs::write(out.join("format.json"), FORMAT).unwrap();
 }
 
+/// A first-person walk through a level as the level net could be taught to dream it
+/// (`world::dreamed`), as `out/frame_NNNNN.png`.
+fn sculpt_walk(out: &Path, frames: usize, seed: u64, eyes: Option<&Path>, stop_at: Option<usize>, sweep: bool) {
+    let mut rng = Rng::new(seed);
+    let (mut scene, mut walker) = walkable_scene(&mut rng, 30);
+    let t0 = std::time::Instant::now();
+    let mut dreamed = engine::world::dreamed::sculpt(&mut scene, seed, eyes);
+    eprintln!("sculpted to {} triangles in {:.1} s", scene.tris.len(), t0.elapsed().as_secs_f64());
+    let mut renderer = Renderer::new();
+    std::fs::create_dir_all(out).unwrap();
+    let t0 = std::time::Instant::now();
+    for f in 0..frames {
+        // With a stopping frame, nothing before it is drawn and the camera rests from there.
+        if stop_at.is_some_and(|s| f < s) {
+            walker.step(&scene, &mut rng);
+            continue;
+        }
+        let cam = walker.camera();
+        // A sweep goes from plain stone to fully turned and back while the frames last.
+        if sweep {
+            let start = stop_at.unwrap_or(0);
+            let k = (f - start) as f32 / (frames - start).max(1) as f32;
+            dreamed.amount = 1.0 - (2.0 * k - 1.0).abs();
+        }
+        engine::world::dreamed::pose(&mut scene, &dreamed, &cam, f as f32 / 30.0);
+        scene.flesh.tris.extend(engine::world::dreamed::walls(&dreamed));
+        renderer.set_scene(&scene);
+        let frame = renderer.render(&scene, &cam);
+        write_png(&out.join(format!("frame_{f:05}.png")), W, H, &frame.rgb);
+        if stop_at.is_none() {
+            walker.step(&scene, &mut rng);
+        }
+    }
+    eprintln!("{:.0} ms a frame", t0.elapsed().as_secs_f64() * 1000.0 / frames.max(1) as f64);
+}
+
 /// 16 close views of creatures from random scenes, each with its mask tinted red
 /// beside it, 8 rows of two pairs.
 fn creatures(out: &Path, seed: u64, zoom: f32) {
@@ -457,6 +493,11 @@ fn main() {
         engine::world::config::Config::load().load_textures(&opts);
         let frames = opts.get("frames").expect("--frames N is required").parse().expect("--frames is a count");
         check::run(&opts, frames, &out);
+        return;
+    }
+    if cmd == "sculpt-walk" {
+        engine::world::config::Config::load().load_textures(&opts);
+        sculpt_walk(&out, num("frames", 360) as usize, opts.get("seed").map_or(1, |s| s.parse().expect("--seed is a number")), opts.get("eye").map(Path::new), opts.get("stop-at").map(|s| s.parse().expect("--stop-at is a frame")), opts.contains_key("sweep"));
         return;
     }
     if cmd == "dream-check" {

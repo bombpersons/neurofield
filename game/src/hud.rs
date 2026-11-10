@@ -23,6 +23,7 @@ const DIM: Rgba = [205, 190, 150, 90];
 const HP: Rgba = [205, 35, 30, 255];
 const MP: Rgba = [50, 85, 225, 255];
 const CLARITY: Rgba = [205, 235, 230, 255];
+const CALMING: Rgba = [165, 115, 225, 255];
 const WHITE: Rgba = [240, 235, 220, 255];
 
 /// All that the HUD shows; it is redrawn when this changes.
@@ -164,7 +165,8 @@ impl Canvas<'_> {
         match item {
             Item::HealingPotion => self.flask(x, y, HP),
             Item::ManaPotion => self.flask(x, y, MP),
-            Item::ClarityPotion => self.flask(x, y, CLARITY),
+            Item::ClearSeeingPotion => self.flask(x, y, CLARITY),
+            Item::CalmingPotion => self.flask(x, y, CALMING),
         }
     }
 
