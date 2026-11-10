@@ -362,9 +362,10 @@ fn scene_and_views(i: usize, seed: u64, views: usize, src: &Sources) -> (Scene, 
 /// Scenes are built on every core, a batch at a time in order, while this
 /// thread draws the last batch's views on the GPU; shards are written behind.
 fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, src: Sources) {
-    let batch_len = rayon::current_num_threads() * 2;
     let sculpted = src.sculpt.is_some();
-    let (send, recv) = std::sync::mpsc::sync_channel::<Vec<(usize, Scene, Option<Dreamed>, Vec<Shot>)>>(1);
+    // A sculpted scene carries its skins and its cut-up walls: keep fewer waiting.
+    let batch_len = rayon::current_num_threads() * if sculpted { 1 } else { 2 };
+    let (send, recv) = std::sync::mpsc::sync_channel::<Vec<(usize, Scene, Option<Dreamed>, Vec<Shot>)>>(if sculpted { 0 } else { 1 });
     let builder = std::thread::spawn(move || {
         for start in (0..scenes).step_by(batch_len) {
             let built = (start..(start + batch_len).min(scenes))
@@ -400,11 +401,15 @@ fn gen(out: &Path, scenes: usize, views: usize, shard_scenes: usize, seed: u64, 
             let si = batch.add_scene(&scene);
             if let Some(mut d) = dreamed {
                 dreamed::turning_features(&scene, &d, &mut batch.turning);
+                // The skins go up once; each view only swaps what moves.
+                scene.flesh.tris.truncate(d.fixed);
+                renderer.set_scene(&scene);
                 for s in &shots {
                     d.amount = s.amount;
                     dreamed::pose(&mut scene, &d, &s.cam, s.time);
-                    scene.flesh.tris.extend(dreamed::walls(&d));
-                    renderer.set_scene(&scene);
+                    let mut moving = scene.flesh.tris.split_off(d.fixed);
+                    moving.extend(dreamed::walls_seen(&d, &s.cam));
+                    renderer.set_moving(&scene, &moving);
                     let mut frame = renderer.render(&scene, &s.cam).crop(s.width);
                     // All of it is the target: there is no layer to keep apart.
                     frame.creatures.fill(0);

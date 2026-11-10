@@ -1323,6 +1323,25 @@ fn mesh_filmed(scene: &mut Scene, e: &Eye, patch: &Patch, footage: &Footage, wan
 /// The flesh walls as far as `d.amount` has grown them, for the smooth pass: they need
 /// remaking only when that changes.
 pub fn walls(d: &Dreamed) -> Vec<flesh::Tri> {
+    walls_where(d, |_| true)
+}
+
+/// `walls` as `cam` can see them: nothing wholly behind it or past its fog, which the net
+/// is told nothing about either. Far fewer to draw for one view of a large level.
+pub fn walls_seen(d: &Dreamed, cam: &Camera) -> Vec<flesh::Tri> {
+    let eye = cam.pos.map(|c| c as f32);
+    let ahead = crate::world::view::view_matrix(cam).m[2].map(|e| e as f32 / 4096.0);
+    let far = cam.fog_far as f32 + TF;
+    walls_where(d, |corners| {
+        corners.iter().any(|&p| {
+            let to = sub(p, eye);
+            dot(to, ahead) > -0.5 * TF && dot(to, to) < far * far
+        })
+    })
+}
+
+/// `walls`, keeping only the triangles `keep` says yes to, by their corners as they are now.
+fn walls_where(d: &Dreamed, keep: impl Fn([[f32; 3]; 3]) -> bool) -> Vec<flesh::Tri> {
     let now: Vec<([f32; 3], [f32; 3], f32, f32)> = d
         .points
         .iter()
@@ -1337,7 +1356,7 @@ pub fn walls(d: &Dreamed) -> Vec<flesh::Tri> {
     let mut out = Vec::with_capacity(d.walls.len());
     for t in &d.walls {
         let c = t.points.map(|i| now[i as usize]);
-        if c.iter().all(|v| v.2 <= 0.0) {
+        if c.iter().all(|v| v.2 <= 0.0) || !keep(c.map(|v| v.0)) {
             continue;
         }
         let corner = |k: usize| flesh::Vertex { p: c[k].0, n: c[k].1, w: 1.0, uv: [t.uv[k]; 2], t: [t.along; 2], b: [t.down; 2], cap: [t.uv[k]; 2], wrap: [1.0; 2], grow: c[k].2 };

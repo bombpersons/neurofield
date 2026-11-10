@@ -23,6 +23,8 @@ const MAX_WAIT: u32 = 600;
 pub struct Renderer {
     app: App,
     parts: Vec<Entity>,
+    /// Flesh redrawn between views of the same scene (`set_moving`).
+    moving: Option<Entity>,
     width: u32,
 }
 
@@ -105,18 +107,38 @@ impl Renderer {
         for _ in 0..SETTLE_FRAMES {
             app.update();
         }
-        Renderer { app, parts: Vec::new(), width }
+        Renderer { app, parts: Vec::new(), moving: None, width }
     }
 
     /// Show `scene` from now on (replacing the last one).
     pub fn set_scene(&mut self, scene: &Scene) {
         let world = self.app.world_mut();
-        for e in self.parts.drain(..) {
+        for e in self.parts.drain(..).chain(self.moving.take()) {
             world.despawn(e);
         }
         let mut state: SystemState<(Commands, Gfx)> = SystemState::new(world);
         let (mut commands, mut gfx) = state.get_mut(world).expect("level graphics resources");
         self.parts = crate::render::spawn(&mut commands, &mut gfx, scene);
+        state.apply(world);
+    }
+
+    /// Draw `tris` in the flesh pass from now on in place of the last ones given, with the
+    /// skins and lights of the scene last set (`set_scene`, which must be `scene` and have
+    /// some flesh of its own): far cheaper than setting the scene again, which uploads every
+    /// skin anew.
+    pub fn set_moving(&mut self, scene: &Scene, tris: &[crate::world::flesh::Tri]) {
+        let world = self.app.world_mut();
+        if let Some(e) = self.moving.take() {
+            world.despawn(e);
+        }
+        if tris.is_empty() {
+            return;
+        }
+        type Own<'w, 's> = Query<'w, 's, &'static MeshMaterial3d<flesh::FleshMaterial>, Without<flesh::MovingFlesh>>;
+        let mut state: SystemState<(Commands, Gfx, Own)> = SystemState::new(world);
+        let (mut commands, mut gfx, own) = state.get_mut(world).expect("level graphics resources");
+        let material = own.iter().next().expect("the scene has no flesh of its own to borrow skins from").clone();
+        self.moving = Some(gfx.spawn_moving_flesh(&mut commands, &material, &scene.flesh, tris));
         state.apply(world);
     }
 

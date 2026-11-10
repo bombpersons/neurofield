@@ -19,7 +19,7 @@ START = time.time()
 
 def sh(cmd):
     print(f"$ {cmd}", flush=True)
-    r = subprocess.run(cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    r = subprocess.run(f"set -o pipefail; {cmd}", shell=True, executable="/bin/bash", text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(r.stdout[-3000:], flush=True)
     if r.returncode:
         raise RuntimeError(f"failed ({r.returncode}): {cmd}")

@@ -34,7 +34,9 @@ def main():
     for part in range(a.parts):
         if a.only and part not in a.only:
             continue
-        consts = f"PART, SEED, SCENES, VIEWS, SHARD, LEVEL_SHARE = {part}, {a.seed + part}, {a.scenes // a.parts}, 8, 250, 0.3"
+        # Sculpted shards are smaller, so that a kernel stopped partway still leaves most of its work.
+        shard = 125 if a.sculpt else 250
+        consts = f"PART, SEED, SCENES, VIEWS, SHARD, LEVEL_SHARE = {part}, {a.seed + part}, {a.scenes // a.parts}, 8, {shard}, 0.3"
         code = re.sub(r"^PART, SEED, .*$", consts, src, count=1, flags=re.M)
         if a.sculpt:
             code = re.sub(r"^SCULPT, BRANCH = .*$", f"SCULPT, BRANCH = True, {a.sculpt!r}", code, count=1, flags=re.M)
