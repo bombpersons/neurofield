@@ -447,7 +447,9 @@ fn update_uniforms(view: Res<View>, mut materials: ResMut<Assets<FleshMaterial>>
 }
 
 /// The level's parts again as depth for the flesh camera, and the scene's
-/// creatures as one mesh with its skins' material (none without creatures).
+/// creatures as one mesh with its skins' material (none without creatures). Grown
+/// creatures that move (`Scene::creatures_move`) are left out, to be drawn as they stand
+/// some other way (`spawn_creatures`); the material is still made, for other flesh to use.
 pub(crate) fn spawn(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -462,7 +464,19 @@ pub(crate) fn spawn(
         .iter()
         .map(|m| commands.spawn((Mesh3d(m.clone()), MeshMaterial3d(occluder.clone()), RenderLayers::layer(FLESH_LAYER))).id())
         .collect();
-    out.extend(spawn_flesh(commands, meshes, images, materials, &scene.flesh, view));
+    if !scene.creatures_move {
+        out.extend(spawn_flesh(commands, meshes, images, materials, &scene.flesh, view));
+        return out;
+    }
+    let moving = |i: usize| scene.grown.iter().any(|g| g.flesh.contains(&i));
+    let mut still: Vec<_> = scene.flesh.tris.iter().enumerate().filter(|&(i, _)| !moving(i)).map(|(_, t)| *t).collect();
+    // A triangle with no area keeps the skins' material for the creatures to borrow.
+    if still.is_empty() {
+        if let Some(t) = scene.flesh.tris.first() {
+            still.push(crate::world::flesh::Tri { v: [t.v[0]; 3], ..*t });
+        }
+    }
+    out.extend(spawn_flesh_tris(commands, meshes, images, materials, &scene.flesh, &still, view));
     out
 }
 
@@ -475,12 +489,25 @@ pub(crate) fn spawn_flesh(
     fl: &Flesh,
     view: &View,
 ) -> Option<Entity> {
-    if fl.tris.is_empty() || fl.skins.is_empty() {
+    spawn_flesh_tris(commands, meshes, images, materials, fl, &fl.tris, view)
+}
+
+/// `tris` with `fl`'s skins and lights, as `spawn_flesh`.
+fn spawn_flesh_tris(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<FleshMaterial>,
+    fl: &Flesh,
+    tris: &[crate::world::flesh::Tri],
+    view: &View,
+) -> Option<Entity> {
+    if tris.is_empty() || fl.skins.is_empty() {
         return None;
     }
     let (colour, normal) = skin_arrays(&fl.skins, fl.matte);
     let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal) };
-    let mesh = meshes.add(mesh(fl, &fl.tris));
+    let mesh = meshes.add(mesh(fl, tris));
     Some(commands.spawn((Mesh3d(mesh), MeshMaterial3d(materials.add(material)), RenderLayers::layer(FLESH_LAYER))).id())
 }
 

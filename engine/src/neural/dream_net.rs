@@ -893,6 +893,47 @@ pub fn composite(rgb: &mut [f32], layers: &[Layer], depth: &[f32], fog: [f32; 3]
     }
 }
 
+/// The layers as `composite` would lay them, laid over nothing instead: `rgba` gets sRGB
+/// colour and straight alpha, which laid over any picture in linear light gives what
+/// `composite` would have made of it.
+pub fn composite_alone(rgba: &mut [f32], layers: &[Layer], depth: &[f32], fog: [f32; 3], width: usize) {
+    let (x0, y0) = (layers.iter().map(|l| l.x0).min().unwrap_or(0), layers.iter().map(|l| l.y0).min().unwrap_or(0));
+    let (x1, y1) = (layers.iter().map(|l| l.x0 + l.w).max().unwrap_or(0), layers.iter().map(|l| l.y0 + l.h).max().unwrap_or(0));
+    let mut here: Vec<&[f32]> = Vec::with_capacity(layers.len());
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let at = y * width + x;
+            here.clear();
+            for l in layers {
+                if (l.x0..l.x0 + l.w).contains(&x) && (l.y0..l.y0 + l.h).contains(&y) {
+                    let px = &l.data[((y - l.y0) * l.w + x - l.x0) * LAYER..][..LAYER];
+                    if edge(px[3]) > 0.0 && px[5] < depth[at] {
+                        here.push(px);
+                    }
+                }
+            }
+            here.sort_by(|a, b| b[5].total_cmp(&a[5]));
+            // Premultiplied in linear light, furthest first.
+            let (mut c, mut a) = ([0.0f32; 3], 0.0f32);
+            for px in &here {
+                let alpha = edge(px[3]);
+                for k in 0..3 {
+                    let colour = px[k] * (1.0 - px[4]) + fog[k] * px[4];
+                    c[k] = c[k] * (1.0 - alpha) + lin(colour) * alpha;
+                }
+                a = a * (1.0 - alpha) + alpha;
+            }
+            if a > 0.0 {
+                let out = &mut rgba[at * 4..at * 4 + 4];
+                for k in 0..3 {
+                    out[k] = enc(c[k] / a);
+                }
+                out[3] = a;
+            }
+        }
+    }
+}
+
 /// A level's dream creatures, ready to be drawn over the level network's frames.
 pub struct DreamLayer {
     net: DreamNet,
@@ -914,6 +955,30 @@ impl DreamLayer {
     /// triangles `tris`. `warp` (in tiles) has already bent `tris`, and bends the creatures too.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(&mut self, scene: &mut Scene, version: u64, tris: &[f32], extra: Creature, warp: impl Fn([f32; 3]) -> [f32; 3], cam: &Camera, rgb: &mut [f32], width: u32) -> Result<()> {
+        let layers = self.layers(scene, version, extra, warp, cam, width)?;
+        if !layers.is_empty() {
+            let depth = level_depth(tris, cam, width);
+            composite(rgb, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
+        }
+        Ok(())
+    }
+
+    /// The creatures as `draw` lays them, but on their own: `rgba` ([H][width][4], sRGB
+    /// colour and straight alpha) is cleared and then holds them, to be laid over a picture
+    /// drawn some other way (the rasteriser's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_alone(&mut self, scene: &mut Scene, version: u64, tris: &[f32], extra: Creature, warp: impl Fn([f32; 3]) -> [f32; 3], cam: &Camera, rgba: &mut [f32], width: u32) -> Result<()> {
+        rgba.fill(0.0);
+        let layers = self.layers(scene, version, extra, warp, cam, width)?;
+        if !layers.is_empty() {
+            let depth = level_depth(tris, cam, width);
+            composite_alone(rgba, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layers(&mut self, scene: &mut Scene, version: u64, extra: Creature, warp: impl Fn([f32; 3]) -> [f32; 3], cam: &Camera, width: u32) -> Result<Vec<Layer>> {
         scene.creatures.push(extra);
         if self.parts.as_ref().is_none_or(|(v, _)| *v != version) {
             self.parts = Some((version, self.net.parts(scene, self.seed.wrapping_add(version))));
@@ -924,12 +989,7 @@ impl DreamLayer {
         part_features(scene, &mut parts.rows);
         scene.creatures.pop();
         warp_parts(&mut parts.rows, &warp);
-        let layers = self.net.render(parts, cam, width)?;
-        if !layers.is_empty() {
-            let depth = level_depth(tris, cam, width);
-            composite(rgb, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
-        }
-        Ok(())
+        self.net.render(parts, cam, width)
     }
 }
 
@@ -971,6 +1031,36 @@ fn warp_parts(rows: &mut [f32], warp: &impl Fn([f32; 3]) -> [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creatures_alone_laid_over_a_picture_give_what_composite_does() {
+        let (w, h) = (4usize, 3usize);
+        // Two overlapping layers, one in front of the other, part see-through; a wall at depth 5.
+        let layer = |x0: usize, rgb: [f32; 3], alpha: f32, fog: f32, depth: f32| Layer {
+            x0,
+            y0: 0,
+            w: 3,
+            h,
+            data: (0..3 * h).flat_map(|_| [rgb[0], rgb[1], rgb[2], alpha, fog, depth]).collect(),
+        };
+        let layers = [layer(0, [0.9, 0.2, 0.1], 0.6, 0.2, 2.0), layer(1, [0.1, 0.5, 0.8], 0.55, 0.0, 1.0), layer(1, [1.0; 3], 1.0, 0.0, 9.0)];
+        let depth = vec![5.0; w * h];
+        let fog = [0.1, 0.1, 0.2];
+        let picture: Vec<f32> = (0..w * h * 3).map(|i| (i % 7) as f32 / 7.0).collect();
+        let mut want = picture.clone();
+        composite(&mut want, &layers, &depth, fog, w);
+        let mut alone = vec![0.0; w * h * 4];
+        composite_alone(&mut alone, &layers, &depth, fog, w);
+        for i in 0..w * h {
+            let a = alone[i * 4 + 3];
+            for c in 0..3 {
+                let got = enc(lin(picture[i * 3 + c]) * (1.0 - a) + lin(alone[i * 4 + c]) * a);
+                assert!((got - want[i * 3 + c]).abs() < 1e-4, "pixel {i} channel {c}: {got} vs {}", want[i * 3 + c]);
+            }
+        }
+        // Behind the wall: nothing.
+        assert!(alone.chunks(4).all(|p| p[3] < 1.0));
+    }
 
     #[test]
     fn a_warped_part_moves_and_stays_square() {

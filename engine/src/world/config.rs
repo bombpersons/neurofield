@@ -9,6 +9,7 @@
 //!     strange: Some("data/strange"),
 //!     level_textures: None,
 //!     levels: "levels",
+//!     dream: Some("runs/dream_pilot/dream.safetensors"),
 //! )
 //! ```
 
@@ -30,6 +31,8 @@ pub struct Config {
     pub level_textures: Option<PathBuf>,
     /// Where hand-built levels live.
     pub levels: Option<PathBuf>,
+    /// The creature (dream) network, .safetensors (see `train/export_dream.py`).
+    pub dream: Option<PathBuf>,
 }
 
 impl Config {
@@ -40,7 +43,7 @@ impl Config {
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let mut c: Config = ron::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let dir = path.parent().unwrap_or(Path::new("."));
-        for p in [&mut c.model, &mut c.photos, &mut c.strange, &mut c.level_textures, &mut c.levels].into_iter().flatten() {
+        for p in [&mut c.model, &mut c.photos, &mut c.strange, &mut c.level_textures, &mut c.levels, &mut c.dream].into_iter().flatten() {
             *p = dir.join(&*p);
         }
         c

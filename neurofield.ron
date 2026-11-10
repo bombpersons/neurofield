@@ -11,4 +11,7 @@ Config(
     // Level textures alone (DIR/<slot>.png), used when `strange` is None.
     level_textures: None,
     levels: Some("levels"),
+    // The creature (dream) network: the game draws the creatures with it, and as PS1
+    // models while the player sees clearly.
+    dream: Some("runs/dream_pilot/dream.safetensors"),
 )

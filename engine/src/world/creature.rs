@@ -29,6 +29,10 @@ pub(crate) fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+/// A low-poly part's sides around its axis and rows along it.
+const LOW_AROUND: usize = 6;
+const LOW_ALONG: usize = 4;
+
 pub(crate) fn scale(a: [f32; 3], k: f32) -> [f32; 3] {
     a.map(|c| c * k)
 }
@@ -721,6 +725,14 @@ impl Grow {
     }
 }
 
+/// A creature grown for the level (not a sculpted wall's mouth): which of `Scene::creatures`,
+/// and its triangles in `Scene::flesh` (none through the PS1 pipeline).
+#[derive(Clone, Debug)]
+pub struct Grown {
+    pub creature: usize,
+    pub flesh: std::ops::Range<usize>,
+}
+
 impl Scene {
     pub(crate) fn build_creatures(&mut self, rng: &mut Rng) {
         for ri in 0..self.rooms.len() {
@@ -803,7 +815,9 @@ impl Scene {
         // The full-colour pass has skins of its own; PS1 ones are only for the PS1 pass.
         c.slots = if crate::world::flesh::enabled() { vec![0; c.skins.len()] } else { c.skins.iter().map(|s| self.skin_slot(s)).collect() };
         let start = self.creature_tris.len();
+        let flesh_start = self.flesh.tris.len();
         self.mesh_creature(&c);
+        self.grown.push(Grown { creature: self.creatures.len(), flesh: flesh_start..self.flesh.tris.len() });
         self.creature_spans.push(start..self.creature_tris.len());
         self.creatures.push(c);
     }
@@ -833,6 +847,70 @@ impl Scene {
         }
         let lights: Vec<_> = placed.iter().map(|at| self.light_sh(at.centre)).collect();
         self.mesh_flesh(c, &placed, &lights);
+    }
+
+    /// Say whether something (the game's herd) moves the grown creatures. When it does the
+    /// renderer leaves their full-colour meshes out, and they are drawn instead as
+    /// `low_poly_creatures` through the PS1 pipeline, with PS1 skins made for them here.
+    pub fn set_creatures_move(&mut self, on: bool) {
+        self.creatures_move = on;
+        if !on {
+            return;
+        }
+        for g in self.grown.clone() {
+            let skins = self.creatures[g.creature].skins.clone();
+            self.creatures[g.creature].slots = skins.iter().map(|s| self.skin_slot(s)).collect();
+        }
+    }
+
+    /// The grown creatures `wanted` (those in view, say) as they stand now, as PS1 models: each
+    /// part a few triangles, lit where it is and wearing one copy of its PS1 skin (see
+    /// `set_creatures_move`). Cheap enough to make afresh every frame as they move.
+    pub fn low_poly_creatures(&self, wanted: impl Fn(&Creature) -> bool) -> Vec<Tri> {
+        let mut out = Vec::new();
+        for g in &self.grown {
+            let c = &self.creatures[g.creature];
+            if !wanted(c) {
+                continue;
+            }
+            for (p, at) in c.parts.iter().zip(c.pose()) {
+                let skin = &c.skins[p.skin];
+                let tex = c.slots.get(p.skin).copied().unwrap_or(tex::SKIN_BASE);
+                self.low_poly_part(p, &at, skin, tex, &mut out);
+            }
+        }
+        out
+    }
+
+    /// One part as `LOW_AROUND` sides by `LOW_ALONG` rows, its ends closing to points.
+    fn low_poly_part(&self, p: &Part, at: &Placed, skin: &Skin, tex: u8, out: &mut Vec<Tri>) {
+        let (na, nl) = (LOW_AROUND, LOW_ALONG);
+        let mut pos = Vec::with_capacity((nl + 1) * (na + 1));
+        let mut nrm = Vec::with_capacity(pos.capacity());
+        for k in 0..=nl {
+            let t = k as f32 / nl as f32 * 2.0 - 1.0;
+            let mid = at.world(p.axis(t));
+            for j in 0..=na {
+                let q = at.world(p.local(t, j as f32 / na as f32 * TAU, 1.0));
+                let out_of = sub(q, mid);
+                let yaxis = [at.axes[0][1], at.axes[1][1], at.axes[2][1]];
+                // At the closed ends the way out is along the part.
+                nrm.push(if dot(out_of, out_of) > 1.0 { norm(out_of) } else { scale(yaxis, t.signum()) });
+                pos.push(q);
+            }
+        }
+        let (u0, v0) = tex::uv_origin(tex);
+        let alb = skin.tint.map(|c| (c * 128.0).clamp(0.0, 255.0) as u8);
+        let coord = |i: usize, n: usize| (63 * i / n) as u8;
+        for k in 0..nl {
+            for j in 0..na {
+                let v = |kk: usize, jj: usize| (kk * (na + 1) + jj, [u0 + coord(jj, na), v0 + coord(kk, nl)]);
+                let quad = [v(k, j), v(k, j + 1), v(k + 1, j), v(k + 1, j + 1)];
+                for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
+                    out.extend(self.creature_tri_of([quad[a], quad[b], quad[c]], &pos, &nrm, tex, skin.tint, alb));
+                }
+            }
+        }
     }
 
     /// The creature for the full-colour pass, `lights` being each part's baked light.
@@ -959,18 +1037,55 @@ impl Scene {
     }
 
     fn creature_tri(&mut self, v: [(usize, [u8; 2]); 3], pos: &[[f32; 3]], nrm: &[[f32; 3]], tex: u8, tint: [f32; 3], alb: [u8; 3]) {
+        if let Some(t) = self.creature_tri_of(v, pos, nrm, tex, tint, alb) {
+            self.creature_tris.push(t);
+        }
+    }
+
+    /// A lit creature triangle facing out, or none if it has no area.
+    fn creature_tri_of(&self, v: [(usize, [u8; 2]); 3], pos: &[[f32; 3]], nrm: &[[f32; 3]], tex: u8, tint: [f32; 3], alb: [u8; 3]) -> Option<Tri> {
         let p = v.map(|(i, _)| pos[i].map(|c| c.round() as i32));
         let e1 = [0, 1, 2].map(|c| (p[1][c] - p[0][c]) as f32);
         let e2 = [0, 1, 2].map(|c| (p[2][c] - p[0][c]) as f32);
         let cr = cross(e1, e2);
         if dot(cr, cr) < 1.0 {
-            return;
+            return None;
         }
         let n_sum = add(add(nrm[v[0].0], nrm[v[1].0]), nrm[v[2].0]);
         let mut verts = [0, 1, 2].map(|i| Vert { p: p[i], uv: v[i].1, col: self.shade(p[i], nrm[v[i].0], tint), alb });
         if dot(cr, n_sum) < 0.0 {
             verts.swap(1, 2);
         }
-        self.creature_tris.push(Tri { v: verts, tex, n: norm(n_sum), tint });
+        Some(Tri { v: verts, tex, n: norm(n_sum), tint })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::world::rng::Rng;
+    use crate::world::scene::Scene;
+
+    #[test]
+    fn grown_creatures_are_low_poly_models_where_they_stand() {
+        let mut scene = Scene::generate(&mut Rng::new(3));
+        assert!(!scene.grown.is_empty());
+        scene.set_creatures_move(true);
+        let g = scene.grown[0].creature;
+        let one = |s: &Scene| s.low_poly_creatures(|c| std::ptr::eq(c, &s.creatures[g]));
+        let was = one(&scene);
+        assert!(!was.is_empty() && was.len() < 30 * scene.creatures[g].parts.len(), "{} tris", was.len());
+        assert!(was.iter().all(|t| t.tex >= crate::world::tex::SKIN_BASE));
+        let t0 = std::time::Instant::now();
+        let all = scene.low_poly_creatures(|_| true);
+        eprintln!("{} creatures, {} tris in {:?}", scene.grown.len(), all.len(), t0.elapsed());
+        scene.creatures[g].base[0] += 100.0;
+        let moved = one(&scene);
+        assert_eq!(moved.len(), was.len());
+        for (m, w) in moved.iter().zip(&was) {
+            for (a, b) in m.v.iter().zip(&w.v) {
+                assert!((a.p[0] - b.p[0] - 100).abs() <= 1 && a.p[1] == b.p[1] && a.p[2] == b.p[2]);
+            }
+        }
+        assert!(scene.low_poly_creatures(|_| false).is_empty());
     }
 }

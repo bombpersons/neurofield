@@ -4,7 +4,10 @@
 //!     The model, skins and textures come from `neurofield.ron` (`engine::world::config`);
 //!     options of the same name override it: `--model x.safetensors`, `--photos DIR`,
 //!     `--strange DIR`, `--level DIR` (level textures alone).
-//!     `--dream x.safetensors` draws the creatures with the dream net (train/export_dream.py).
+//!     `--dream x.safetensors` draws the creatures with that dream net (train/export_dream.py;
+//!     `neurofield.ron` names the usual one); `--dream none` leaves them out of the network's
+//!     picture and still. With it they walk about, and show as low-poly PS1 models when the
+//!     rasteriser is on (a clear seeing potion, or F1).
 //!     `--window 1280x720` sets the window's starting size; the frame follows its shape.
 //!     `--sculpt data/eye` turns the level to folded flesh with filmed eyes, veins and mouths and
 //!     draws it with the rasteriser, as the level net might one day (`engine::world::dreamed`);
@@ -190,6 +193,12 @@ impl Sim {
         self.shown() != Mode::Network || self.veil > 0.0
     }
 
+    /// Whether a clear seeing potion has the dream draining, gone, or coming back: then the
+    /// creatures are seen as they really are, as PS1 models.
+    fn seeing_clearly(&self) -> bool {
+        self.calm > 0.0
+    }
+
     /// Clarity drains the strangeness with the network still drawing, then fades to the
     /// plain picture; when it runs out, the same backwards.
     fn fade(&mut self, dt: f32) {
@@ -243,6 +252,8 @@ impl Sim {
             self.sculpted = Some(engine::world::dreamed::sculpt(&mut self.level.scene, self.rng.next() as u64, Some(dir)));
             self.strangeness = self.level.scene.strange.base;
         }
+        let moving = self.growths.is_some();
+        self.level.scene.set_creatures_move(moving);
         self.relight();
         self.level.set_strange_amount(1.0 - self.calm);
         if self.growths.is_some() {
@@ -338,6 +349,20 @@ struct Frame(Handle<Image>);
 /// Shows the network's frame in the window, over psx-bevy's display of its screen.
 #[derive(Component)]
 struct NetworkSprite;
+
+/// The dream creatures alone, laid over the rasteriser's picture when it shows without a
+/// clear seeing potion (F1, `--view raster`, `--sculpt`): for now, until the level network
+/// can draw what the rasteriser does, and perhaps for special cases after.
+#[derive(Resource)]
+struct Creatures {
+    image: Handle<Image>,
+    /// [H][W][4], from `DreamLayer::draw_alone`.
+    rgba: Vec<f32>,
+    on: bool,
+}
+
+#[derive(Component)]
+struct CreatureSprite;
 
 /// The scene's meshes in psx-bevy, and the versions of the scene they were built from,
 /// and the version of each moving part's meshes (`Scene::things`).
@@ -441,10 +466,20 @@ fn main() {
     }
     let net = Network::load(&model);
     // The dream creatures, drawn by their own network over the level network's frames.
-    let dream = opts.get("dream").map(|d| {
-        let layer = engine::neural::dream_net::DreamLayer::load(std::path::Path::new(d), seed).unwrap_or_else(|e| panic!("{e}"));
+    // One named on the command line must load; the config's may be missing on this machine.
+    let dream_path = match opts.get("dream").map(String::as_str) {
+        Some("none") => None,
+        Some(d) => Some((PathBuf::from(d), true)),
+        None => config.dream.clone().map(|d| (d, false)),
+    };
+    let dream = dream_path.and_then(|(d, asked)| {
+        if !asked && !d.is_file() {
+            eprintln!("no dream net at {}: the creatures stay still and the network leaves them out", d.display());
+            return None;
+        }
+        let layer = engine::neural::dream_net::DreamLayer::load(&d, seed).unwrap_or_else(|e| panic!("{e}"));
         eprintln!("dream creatures on {}", layer.adapter());
-        layer
+        Some(layer)
     });
     let mut rng = Rng::new(seed);
     let start = opts.get("start").map(|s| {
@@ -462,6 +497,8 @@ fn main() {
     let sculpted = eyes.as_deref().map(|dir| engine::world::dreamed::sculpt(&mut level.scene, seed, Some(dir)));
     let strangeness = level.scene.strange.base;
     let growths = dream.is_some().then(|| Growths::new(&level.scene));
+    // The herd walks the dream creatures about, so the rasteriser draws them as they stand.
+    level.scene.set_creatures_move(dream.is_some());
 
     let mut player = Player::new();
     if let Some(a) = opts.get("affliction") {
@@ -555,7 +592,7 @@ fn main() {
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
-        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, raster_camera, status, update_hud, auto_screenshot).chain())
+        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, pose_creatures, raster_camera, status, update_hud, auto_screenshot).chain())
         .add_systems(Update, egui_on_display)
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
@@ -612,6 +649,16 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         NetworkSprite,
     ));
     commands.insert_resource(Frame(frame));
+    let creatures = images.add(hud_image());
+    // Between the rasteriser's picture and the network's frame.
+    commands.spawn((
+        Sprite::from_image(creatures.clone()),
+        Transform::from_xyz(0.0, 0.0, 0.5),
+        RenderLayers::layer(DISPLAY_LAYER),
+        Visibility::Hidden,
+        CreatureSprite,
+    ));
+    commands.insert_resource(Creatures { image: creatures, rgba: vec![0.0; (W * H * 4) as usize], on: false });
     let hud = images.add(hud_image());
     commands.spawn((
         Sprite::from_image(hud.clone()),
@@ -1077,6 +1124,7 @@ fn draw(
     mut net: NonSendMut<Network>,
     mut dream: Option<NonSendMut<engine::neural::dream_net::DreamLayer>>,
     frame: Res<Frame>,
+    mut creatures: ResMut<Creatures>,
     mut images: ResMut<Assets<Image>>,
     mut sprite: Query<&mut Sprite, With<NetworkSprite>>,
 ) {
@@ -1113,6 +1161,39 @@ fn draw(
         }
         sim.tris = tokens.len();
         sim.net_ms = sim.net_ms * 0.9 + 0.1 * t0.elapsed().as_secs_f32() * 1000.0;
+    }
+    // The dream creatures over the rasteriser's picture, unless the player sees clearly. The
+    // rasteriser doesn't swell the level, so neither are they.
+    creatures.on = false;
+    if sim.shown() != Mode::Network && !sim.seeing_clearly() {
+        let sim = &mut *sim;
+        if let (Some(layer), Some(growths)) = (dream.as_mut(), &sim.growths) {
+            let cam = sim.level.walker.camera();
+            let rgba = &mut creatures.rgba;
+            match layer.draw_alone(&mut sim.level.scene, sim.version, &sim.level.tris, growths.creature(), |p| p, &cam, rgba, W) {
+                Ok(()) => creatures.on = true,
+                Err(e) => eprintln!("dream layer: {e}"),
+            }
+        }
+        if creatures.on {
+            if let Some(mut image) = images.get_mut(&creatures.image) {
+                upload_rgba(&mut image, &creatures.rgba, W);
+            }
+        }
+    }
+}
+
+/// sRGB colour and straight alpha floats (0..1) into an RGBA8 image as wide as the widest frame.
+fn upload_rgba(image: &mut Image, rgba: &[f32], width: u32) {
+    let stride = MAX_W as usize * 4;
+    let data = image.data.get_or_insert_with(Vec::new);
+    data.resize(stride * H as usize, 0);
+    for (row, from) in data.chunks_exact_mut(stride).zip(rgba.chunks_exact(width as usize * 4)) {
+        for (px, c) in row.chunks_exact_mut(4).zip(from.chunks_exact(4)) {
+            for i in 0..4 {
+                px[i] = (c[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
     }
 }
 
@@ -1220,6 +1301,44 @@ fn pose_sculpted(
     }
 }
 
+/// How far a creature can reach from where it stands, world units: two tiles.
+const CREATURE_REACH: f32 = 512.0;
+
+/// While a clear seeing potion has the rasteriser showing, the creatures as the herd has
+/// walked them, as low-poly PS1 models made afresh each frame; otherwise the dream net
+/// draws them, over the network's picture or the rasteriser's (`draw`).
+fn pose_creatures(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    mut shown: Local<Vec<Entity>>,
+    // Each skin's material, for the level `Sim::version`.
+    mut skins: Local<(u64, HashMap<u8, Handle<psx_bevy::psx::PsxMaterial>>)>,
+    mut gfx: engine::render::Gfx,
+) {
+    for e in shown.drain(..) {
+        commands.entity(e).despawn();
+    }
+    let scene = &sim.level.scene;
+    if !scene.creatures_move || !sim.raster_on() || !sim.seeing_clearly() {
+        return;
+    }
+    if skins.0 != sim.version {
+        *skins = (sim.version, HashMap::new());
+    }
+    // Only those that could be in view: ahead of the camera and short of the fog.
+    let cam = sim.level.walker.camera();
+    let eye = cam.pos.map(|c| c as f32);
+    let ahead = engine::world::view::view_matrix(&cam).m[2].map(|e| e as f32 / 4096.0);
+    let reach = cam.fog_far as f32 + CREATURE_REACH;
+    let in_view = |c: &engine::world::creature::Creature| {
+        let d = [c.base[0] - eye[0], c.base[1] - eye[1], c.base[2] - eye[2]];
+        let far = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        far < reach && d[0] * ahead[0] + d[1] * ahead[1] + d[2] * ahead[2] > -CREATURE_REACH
+    };
+    let tris = scene.low_poly_creatures(in_view);
+    *shown = gfx.spawn_creatures(&mut commands, scene, &tris, &mut skins.1);
+}
+
 /// The level camera follows the walker; it rests while only the network is shown.
 fn raster_camera(sim: Res<Sim>, mut view: ResMut<engine::render::View>) {
     let cam = sim.level.walker.camera();
@@ -1255,7 +1374,9 @@ fn layout(
     window: Query<&Window, With<PrimaryWindow>>,
     mut network: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<NetworkSprite>>,
     mut hud: Query<(&mut Sprite, &mut Transform), (With<HudSprite>, Without<NetworkSprite>)>,
-    mut display: Query<(&Sprite, &mut Transform), (Without<NetworkSprite>, Without<HudSprite>)>,
+    mut over: Query<(&mut Sprite, &mut Transform, &mut Visibility), (With<CreatureSprite>, Without<NetworkSprite>, Without<HudSprite>)>,
+    mut display: Query<(&Sprite, &mut Transform), (Without<NetworkSprite>, Without<HudSprite>, Without<CreatureSprite>)>,
+    creatures: Res<Creatures>,
 ) {
     let Ok(window) = window.single() else { return };
     let mode = sim.shown();
@@ -1268,6 +1389,16 @@ fn layout(
         if sprite.image == screen.image {
             t.scale = Vec3::splat(raster);
             t.translation.x = -half;
+        }
+    }
+    // The dream creatures lie on the rasteriser's picture, as it does.
+    if let Ok((mut os, mut ot, mut ov)) = over.single_mut() {
+        os.rect = Some(Rect::new(0.0, 0.0, W as f32, H as f32));
+        os.custom_size = Some(Vec2::new(W as f32, H as f32) * raster);
+        ot.translation.x = -half;
+        let want = if creatures.on { Visibility::Visible } else { Visibility::Hidden };
+        if *ov != want {
+            *ov = want;
         }
     }
     let wanted = (room.x / room.y.max(1.0) * H as f32).clamp(NET_WIDTHS.0, NET_WIDTHS.1);

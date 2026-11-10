@@ -251,6 +251,36 @@ impl Gfx<'_> {
         flesh::spawn_flesh(commands, &mut self.meshes, &mut self.images, &mut self.flesh, flesh, &self.view)
     }
 
+    /// Creatures drawn through the PS1 pipeline as they are this frame (say
+    /// `Scene::low_poly_creatures`), one mesh per skin; `skins` keeps each skin's material
+    /// from frame to frame, and must be emptied for a new scene.
+    pub fn spawn_creatures(
+        &mut self,
+        commands: &mut Commands,
+        scene: &Scene,
+        tris: &[Tri],
+        skins: &mut HashMap<u8, Handle<PsxMaterial>>,
+    ) -> Vec<Entity> {
+        let mut by_skin: HashMap<u8, Vec<&Tri>> = HashMap::new();
+        for t in tris {
+            by_skin.entry(t.tex).or_default().push(t);
+        }
+        let mut out = Vec::new();
+        for (id, tris) in by_skin {
+            let m = match skins.get(&id) {
+                Some(m) => m.clone(),
+                None => {
+                    let Some(skin) = scene.skins.get(id.wrapping_sub(tex::SKIN_BASE) as usize) else { continue };
+                    let m = self.materials.add(material(self.images.add(image(skin))));
+                    skins.insert(id, m.clone());
+                    m
+                }
+            };
+            out.push(spawn_part(commands, &mut self.meshes, &tris, m, &self.torch).0);
+        }
+        out
+    }
+
     /// Triangles of `fl`'s that change every frame, drawn with the skins of `material`.
     pub fn spawn_moving_flesh(
         &mut self,
@@ -335,9 +365,11 @@ fn spawn_psx(
         out.push(e);
         level.push(mesh);
     }
-    // Creatures drawn through the PS1 pipeline use the scene's own skins.
+    // Creatures drawn through the PS1 pipeline use the scene's own skins. Moving ones are
+    // drawn as they stand instead (`Gfx::spawn_creatures`).
     let mut skins: HashMap<u8, Vec<&Tri>> = HashMap::new();
-    for t in &scene.creature_tris {
+    let still = if scene.creatures_move { &[][..] } else { &scene.creature_tris[..] };
+    for t in still {
         skins.entry(t.tex).or_default().push(t);
     }
     for (id, tris) in skins {

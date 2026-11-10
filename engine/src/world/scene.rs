@@ -333,6 +333,11 @@ pub struct Scene {
     pub(crate) skin_kinds: Vec<(skin::Motif, f32)>,
     /// The creatures again for the full-colour pass that draws them over the PS1 frame.
     pub flesh: crate::world::flesh::Flesh,
+    /// The creatures grown for the level, apart from the walls' mouths.
+    pub grown: Vec<creature::Grown>,
+    /// Whether something moves the grown creatures (the game's herd): see
+    /// `set_creatures_move`.
+    pub creatures_move: bool,
     pub(crate) sun_dir: [f32; 3],
     pub(crate) sun_col: [f32; 3],
     pub(crate) ambient: [f32; 3],
@@ -661,6 +666,8 @@ impl Scene {
             skins: Vec::new(),
             skin_kinds: Vec::new(),
             flesh: Default::default(),
+            grown: Vec::new(),
+            creatures_move: false,
             sun_dir: norm([rng.fr(-1.0, 1.0), rng.fr(0.6, 1.5), rng.fr(-1.0, 1.0)]),
             sun_col,
             ambient,
@@ -952,6 +959,8 @@ impl Scene {
             skins: Vec::new(),
             skin_kinds: Vec::new(),
             flesh: Default::default(),
+            grown: Vec::new(),
+            creatures_move: false,
             sun_dir: [0.0, 1.0, 0.0],
             sun_col: [0.0; 3],
             ambient: [0.2; 3],
