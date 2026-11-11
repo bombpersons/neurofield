@@ -54,7 +54,8 @@ class Trainer:
         self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
         self.cfg["up"] = up
         ckpt = self.out / "ckpt.pt"
-        state = torch.load(ckpt, map_location=self.device) if ckpt.exists() else None
+        # On the CPU, where `migrate` makes its new weights; loading puts them on the device.
+        state = torch.load(ckpt, map_location="cpu") if ckpt.exists() else None
         migrated, warmup = False, WARMUP
         if state is not None:
             self.cfg = state.get("cfg", self.cfg)
