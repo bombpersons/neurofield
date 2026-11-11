@@ -31,7 +31,8 @@ The opening area is a castle with an outdoor market and houses around it.
 - **People.** The player can talk to townsfolk outside and to people inside the
   castle. They are drawn with the normal PSX renderer.
 - **Shops.** The player can buy supplies, weapons, shields and armour.
-- **Blacksmith.** Repairs some rare items, such as the monocle.
+- **Blacksmith.** Repairs broken weapons and shields, and some rare items such
+  as the monocle.
 - **Opening.** When the game starts, the player character talks to themselves
   about why they have come here, which sets up the premise.
 - **The queen.** When the player speaks to her, she sends them down to the
@@ -81,7 +82,7 @@ plain PSX renderer instead of the neural one.
   about ten seconds. The strangeness and the swell drain away while the
   neural renderer is still drawing, then the picture fades to the plain PSX
   renderer. When it runs out, the same happens backwards. A pale bar under the
-  MP bar shows the time left. It doesn't change affliction. It can be used from
+  stamina bar shows the time left. It doesn't change affliction. It can be used from
   the inventory or the hotbar.
 - **Monocle.** A lens the player moves around the screen. Only the part of the
   screen inside the lens is drawn with the PSX renderer.
@@ -107,9 +108,13 @@ plain PSX renderer instead of the neural one.
 
 ## Player, inventory and equipment
 
-- The player has an inventory and equipment slots: weapon, shield, helmet,
-  armour (body), gloves and two rings.
-- The player has health (HP) and mana (MP). Spells use MP.
+- The player has an inventory and equipment slots: right hand, left hand,
+  helmet, armour (body), gloves and two rings.
+- **Hands.** Each hand holds a weapon or a shield, so the player can carry two
+  weapons, two shields, or one of each either way round. Whatever is held shows
+  on that side of the screen.
+- The player has health (HP), mana (MP) and stamina. Spells use MP. For what
+  uses stamina, see [Stamina](#stamina).
 - **Stats** for now: Attack, Defence and Magic. What is worn adds to them.
 - There is no limit on how many kinds of item the player carries, but at most
   99 of any one.
@@ -122,9 +127,64 @@ plain PSX renderer instead of the neural one.
 - The game is first person.
 - The camera **bobs** slightly as the player walks.
 - The player can **jump**.
-- **Sprint** starts with L3. It stops when the camera turns faster than a set
-  speed, so the player can still turn very slowly while sprinting. It
-  is for running in a straight line.
+- **Walking is slow.** By default the player walks slowly.
+- **Sprint** starts with L3 and lets the player run a little faster. It uses
+  stamina while they run, and they drop back to a walk when stamina runs out.
+  It also stops when the camera turns faster than a set speed, so the player
+  can still turn very slowly while sprinting. It is for running in a straight
+  line.
+
+## Combat
+
+Fights are meant to be costly. Weapons and shields wear out quickly, so the
+player often has to choose between fighting a creature and running from it.
+
+### Hands
+
+- Holding a hand's button uses what is in that hand: a weapon swings, and a
+  shield is raised for as long as the button is held.
+- A raised shield blocks attacks and spells that come from the direction it
+  faces, not from behind. A blocked blow pushes the camera back with a wobble,
+  and the shield moves with it.
+
+### Stamina
+
+Stamina is shown as a bar under the MP bar. It comes back at a fixed rate,
+but not while a shield is raised. These use it:
+
+- **Holding up a shield**, for as long as it is up. At zero the shield drops,
+  and the player has to press the button again to raise it.
+- **Blocking a blow.** If a blocked blow takes stamina to zero, the guard
+  breaks: the shield is knocked aside, the camera wobbles, and the player is
+  stunned for a moment.
+- **Being hit.**
+- **Attacking.** At zero stamina an attack is a slow, laboured swing that does
+  very little damage.
+- **Sprinting.** At zero the player stops running.
+
+### Durability
+
+- Weapons and shields have durability. A weapon wears whenever it strikes
+  something, a creature or a wall, and a shield wears when it blocks.
+- They don't last long. The menu shows how much wear each one has left.
+- **Breaking.** When durability runs out the item breaks and is unequipped at
+  once, leaving that hand empty. A sound plays and a short toast-style notice
+  tells the player what broke.
+- **Broken items** stay in the inventory, clearly labelled as broken, and can't
+  be equipped. The blacksmith in the castle can repair them.
+- **No bare hands.** An empty hand does nothing: the player can't fight
+  without a weapon.
+
+### Hits
+
+- **Hitting a creature** makes a wet, fleshy sound, and blood spurts from where
+  the blow landed.
+- **Hitting a wall** makes the weapon clang off it with a short recoil
+  animation. If the wall has turned to flesh where the blow lands, it responds
+  like a creature instead: the fleshy sound and a spurt of blood.
+- **Being hit** pushes the player back a little and stuns them for a short
+  while. A blow the shield blocks doesn't push the player back; it only kicks
+  the camera, unless it breaks the guard.
 
 ## Controls
 
@@ -133,15 +193,14 @@ plain PSX renderer instead of the neural one.
 | Jump               | Space                | X          |
 | Sprint             | Shift                | L3 (click left stick) |
 | Use door or lever  | E                    | Circle     |
-| Raise shield       | Left click           | L2         |
-| Attack with weapon | Right click          | R2         |
+| Use left hand      | Left click           | L2         |
+| Use right hand     | Right click          | R2         |
 | Cast selected spell| *TBD*                | L1         |
 | Use hotbar item    | 1, 2, 3, 4           | D-pad up / right / down / left |
 | Quick-change spell | *TBD*                | Hold Triangle + d-pad |
 | Pause menu         | *TBD (probably Esc)* | Start      |
 
-The shield goes on the left button or trigger and the weapon on the right, so
-each hand matches a side.
+Each hand's button or trigger is on its own side of the mouse or controller.
 
 ## HUD
 
@@ -149,7 +208,7 @@ each hand matches a side.
 ┌───────────────────────────────────────────────┐
 │ ███████ HP (red)                     (compass) │
 │ ████ MP (blue)                                 │
-│                                                │
+│ █████ stamina (green)                          │
 │                                                │
 │                                                │
 │ [1]                                            │
@@ -159,7 +218,8 @@ each hand matches a side.
 └───────────────────────────────────────────────┘
 ```
 
-- **Top left:** a red health bar with a blue MP bar under it.
+- **Top left:** a red health bar, with a blue MP bar and then a green stamina
+  bar under it.
 - **Top right:** a floating compass.
 - **Bottom left:** quick-use items.
   - With mouse and keyboard, a Minecraft-style hotbar used with keys 1–4,
@@ -271,7 +331,6 @@ options:
   list (mouse wheel? number keys?)
 - Does "cast now" from the pause menu cast the spell the moment the menu
   closes? This would allow mid-fight healing without the game running.
-- What the artifact is, and why the dungeon is strange.
-- What goes in Options. psx-bevy's controls menu rebinds keys the game doesn't
+- What the artifact is, and why the dungeon is strange.- What goes in Options. psx-bevy's controls menu rebinds keys the game doesn't
   read through it, and its display menu changes the screen size the networks
   draw at.
