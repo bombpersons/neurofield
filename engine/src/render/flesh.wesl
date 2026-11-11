@@ -18,6 +18,9 @@ struct FleshUniform {
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var colour_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var normal_tex: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var skin_sampler: sampler;
+// What the parts of flesh that moves are doing (world::dreamed::Moving::state): first the
+// time and the heartbeat's period, then each part's numbers, which its corners point at.
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var<storage, read> parts: array<vec4<f32>>;
 
 struct Vertex {
     @location(0) position: vec3<f32>,
@@ -40,6 +43,9 @@ struct Vertex {
     @location(13) sh2: vec4<f32>,
     // How far the surface has grown in; below 1 it has a ragged edge.
     @location(14) grow: f32,
+    // Flesh that moves: how (Moving::how), where its part's numbers start, two of its own.
+    @if(MOVING)
+    @location(15) moves: vec4<f32>,
 };
 
 struct Varying {
@@ -62,14 +68,34 @@ struct Varying {
     @location(14) grow: f32,
 };
 
+// How the parts move: as world::dreamed's BALL, LID, VEIN, MOUTH and FILMED.
+const BALL: i32 = 1;
+const LID: i32 = 2;
+const VEIN: i32 = 3;
+const MOUTH: i32 = 4;
+const FILMED: i32 = 5;
+
+// How much of a heartbeat is passing, x beats after the last: world::dreamed::beat.
+fn beat(x: f32) -> f32 {
+    let f = x - floor(x);
+    let a = (f - 0.1) / 0.06;
+    let b = (f - 0.34) / 0.07;
+    return min(exp(-a * a) + 0.6 * exp(-b * b), 1.0);
+}
+
+// `v` turned by `angle` round the unit `axis`.
+fn turn(v: vec3<f32>, axis: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    return v * c + cross(axis, v) * sin(angle) + axis * dot(axis, v) * (1.0 - c);
+}
+
 @vertex
 fn vertex(v: Vertex) -> Varying {
-    // Meshes are built in the world (identity transform).
+    // Meshes are built in the world (identity transform), in tiles with y and z turned
+    // round; parts move in the engine's own world.
     var out: Varying;
-    out.position = position_world_to_clip(v.position);
-    let t = u.eye.w;
-    let depth = -position_world_to_view(v.position).z * t;
-    out.pz = vec4(v.position.x * t, -v.position.y * t, -v.position.z * t, depth);
+    let tile = u.eye.w;
+    var p = vec3(v.position.x, -v.position.y, -v.position.z) * tile;
     out.nw = v.nw;
     out.uvcap0 = v.uvcap0;
     out.tw0 = v.tw0;
@@ -80,6 +106,84 @@ fn vertex(v: Vertex) -> Varying {
     out.ax0 = v.ax0;
     out.ax1 = v.ax1;
     out.ax2 = v.ax2;
+    var shown = true;
+    @if(MOVING)
+    {
+        let how = i32(round(v.moves.x));
+        let at = u32(round(v.moves.y));
+        let first = parts[at];
+        if how == BALL {
+            // Turned in its socket to look at the viewer, with everything that points.
+            shown = first.w > 0.0;
+            let turned = mat3x3<f32>(first.xyz, parts[at + 1u].xyz, parts[at + 2u].xyz);
+            let centre = parts[at + 3u].xyz;
+            p = centre + turned * (p - centre);
+            out.nw = vec4(turned * v.nw.xyz, v.nw.w);
+            out.tw0 = vec4(turned * v.tw0.xyz, v.tw0.w);
+            out.bs0 = vec4(turned * v.bs0.xyz, v.bs0.w);
+            out.tw1 = vec4(turned * v.tw1.xyz, v.tw1.w);
+            out.bs1 = vec4(turned * v.bs1.xyz, v.bs1.w);
+            let cu0 = turned * v.ax0.xyz;
+            let cv0 = turned * vec3(v.ax0.w, v.ax1.xy);
+            let cu1 = turned * vec3(v.ax1.zw, v.ax2.x);
+            let cv1 = turned * v.ax2.yzw;
+            out.ax0 = vec4(cu0, cv0.x);
+            out.ax1 = vec4(cv0.yz, cu1.xy);
+            out.ax2 = vec4(cu1.z, cv1);
+        } else if how == LID {
+            // Further down the eyeball along its own line of longitude, the more shut it is.
+            shown = first.w > 0.0;
+            let side = v.moves.w;
+            let centre = parts[at + 3u].xyz;
+            let up = parts[at + 4u].xyz * side;
+            let more = select(parts[at + 2u].w, parts[at + 1u].w, side > 0.0) * v.moves.z;
+            let axis = cross(up, p - centre);
+            if dot(axis, axis) > 1e-12 {
+                let k = normalize(axis);
+                p = centre + turn(p - centre, k, more);
+                out.nw = vec4(turn(v.nw.xyz, k, more), v.nw.w);
+            }
+        } else if how == VEIN {
+            // Fattened where the beat has got to, and flushed red with it.
+            shown = first.x > 0.0;
+            let b = beat(parts[0].x / parts[0].y - v.moves.z);
+            p += v.nw.xyz * v.moves.w * b;
+            out.nw = vec4(v.nw.xyz, 1.0 - b);
+        } else if how == MOUTH {
+            // Drawn shut towards the middle and bulging, the outside of the rim staying put
+            // (world::dreamed::mesh_mouth).
+            let rim = 1.9;
+            let shut = 0.06;
+            let out_of_wall = first.w;
+            shown = out_of_wall > 0.0;
+            let across = parts[at + 1u];
+            let up = parts[at + 2u];
+            let n = parts[at + 3u].xyz;
+            let clench = parts[at + 3u].w;
+            let pull = 1.0 + clench * (rim / (rim - 1.0 + shut) - 1.0);
+            let d = p - first.xyz;
+            let x = dot(d, across.xyz) / across.w;
+            let y = dot(d, up.xyz) / up.w;
+            let z = dot(d, n);
+            let far = max(length(vec2(x, y)), 1e-4);
+            let to = select(far, max(rim - (rim - far) * pull, shut * 0.3), far < rim);
+            let rise = max(clench, 0.0) * 0.35 * up.w * (1.0 - min(to / rim, 1.0));
+            let k = to / far * out_of_wall;
+            p = first.xyz + across.xyz * (x * k * across.w) + up.xyz * (y * k * up.w) + n * ((z + rise) * out_of_wall);
+        } else if how == FILMED {
+            // The frame of the film and the gaze it's on.
+            shown = first.y > 0.0;
+            out.bs0 = vec4(v.bs0.xyz, first.x);
+        }
+    }
+    let world = vec3(p.x, -p.y, -p.z) / tile;
+    out.position = position_world_to_clip(world);
+    if !shown {
+        // Out of sight: nothing of it is drawn.
+        out.position = vec4(0.0, 0.0, -2.0, 1.0);
+    }
+    let depth = -position_world_to_view(world).z * tile;
+    out.pz = vec4(p, depth);
     out.sh0 = v.sh0;
     out.sh1 = v.sh1;
     out.sh2 = v.sh2;

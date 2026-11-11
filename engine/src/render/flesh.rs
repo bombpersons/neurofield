@@ -19,6 +19,7 @@ use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerD
 use bevy::mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef, PrimitiveTopology, VertexFormat};
 use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
+use bevy::render::storage::ShaderBuffer;
 use bevy::render::render_resource::{
     AsBindGroup, Extent3d, Face, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError, TextureDataOrder,
     TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, TextureViewDimension,
@@ -41,6 +42,9 @@ const SS: u32 = 2;
 const FLESH_SHADER: Handle<Shader> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b11");
 const OCCLUDER_SHADER: Handle<Shader> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b12");
 const OVERLAY_SHADER: Handle<Shader> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b13");
+const DREAM_SHADER: Handle<Shader> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b14");
+/// The parts' numbers for flesh with nothing that moves (see `FleshMaterial::parts`).
+const NO_PARTS: Handle<ShaderBuffer> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b15");
 
 // A flesh vertex. Each skin's values ride with each corner (the triangle's own
 // ones repeated): the normal and blend weight, per skin the wrapped and cap
@@ -72,6 +76,8 @@ const ATTR_SH: [MeshVertexAttribute; 3] = [
 ];
 
 const ATTR_GROW: MeshVertexAttribute = MeshVertexAttribute::new("Flesh_Grow", 0x6e66_000e, VertexFormat::Float32);
+/// How a corner of flesh that moves (`world::dreamed::Moving`) is moved: only those have it.
+const ATTR_MOVES: MeshVertexAttribute = MeshVertexAttribute::new("Flesh_Moves", 0x6e66_000f, VertexFormat::Float32x4);
 
 #[derive(Clone, Copy, Default, ShaderType, Debug)]
 struct FleshUniform {
@@ -96,6 +102,9 @@ pub struct FleshMaterial {
     /// Tangent-space normals, encoded n / 2 + 0.5.
     #[texture(2, dimension = "2d_array")]
     normal: Handle<Image>,
+    /// What each part of the flesh that moves is doing now (`world::dreamed::Moving::state`).
+    #[storage(4, read_only)]
+    parts: Handle<ShaderBuffer>,
 }
 
 impl Material for FleshMaterial {
@@ -128,6 +137,10 @@ impl Material for FleshMaterial {
             .chain(ATTR_SH);
         attrs.extend(rest.enumerate().map(|(i, a)| a.at_shader_location(2 + i as u32)));
         attrs.push(ATTR_GROW.at_shader_location(14));
+        if layout.0.contains(ATTR_MOVES) {
+            attrs.push(ATTR_MOVES.at_shader_location(15));
+            descriptor.vertex.shader_defs.push("MOVING".into());
+        }
         descriptor.vertex.buffers = vec![layout.0.get_layout(&attrs)?];
         // Triangles face out of the creature (see `mesh`); the rest are culled.
         descriptor.primitive.cull_mode = Some(Face::Back);
@@ -162,6 +175,84 @@ impl Material for OccluderMaterial {
         // The level's back faces are culled here too.
         descriptor.primitive.cull_mode = Some(Face::Back);
         Ok(())
+    }
+}
+
+/// Creatures drawn some other way, laid into the flesh image (`DreamCreatures`).
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+struct DreamMaterial {
+    #[texture(0, sample_type = "float", filterable = false)]
+    colour: Handle<Image>,
+    #[texture(1, sample_type = "float", filterable = false)]
+    near: Handle<Image>,
+}
+
+impl Material for DreamMaterial {
+    fn vertex_shader() -> ShaderRef {
+        DREAM_SHADER.into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        DREAM_SHADER.into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn specialize(
+        _: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.vertex.buffers = vec![layout.0.get_layout(&[Mesh::ATTRIBUTE_POSITION.at_shader_location(0)])?];
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
+}
+
+/// Creatures drawn some other way than as flesh (the dream net draws them as a picture),
+/// to be hidden by the level and the flesh in front of them as the flesh is, and laid over
+/// the screen with it. `colour` is [H][W] RGBA32 floats, encoded colour and straight
+/// alpha; `near` is [H][W] R32 floats, their depth in tiles. Shown while `on`.
+#[derive(Resource)]
+pub struct DreamCreatures {
+    pub colour: Handle<Image>,
+    pub near: Handle<Image>,
+    pub on: bool,
+}
+
+#[derive(Component)]
+struct DreamQuad;
+
+fn float_image(format: TextureFormat, texel: usize) -> Image {
+    use crate::world::view::{H, W};
+    let mut image = Image::new_fill(
+        Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        &vec![0; texel],
+        format,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    image
+}
+
+fn dream_on(dream: Res<DreamCreatures>, mut quads: Query<&mut Visibility, With<DreamQuad>>) {
+    let want = if dream.on { Visibility::Visible } else { Visibility::Hidden };
+    for mut v in &mut quads {
+        if *v != want {
+            *v = want;
+        }
     }
 }
 
@@ -270,21 +361,28 @@ pub(crate) fn plugin(app: &mut App) {
         (FLESH_SHADER, wesl(include_str!("flesh.wesl"), "flesh.wesl")),
         (OCCLUDER_SHADER, wesl(include_str!("occluder.wesl"), "occluder.wesl")),
         (OVERLAY_SHADER, wesl(include_str!("flesh_overlay.wesl"), "flesh_overlay.wesl")),
+        (DREAM_SHADER, wesl(include_str!("dream_creatures.wesl"), "dream_creatures.wesl")),
     ]))
     .add_systems(PreUpdate, add_shaders.run_if(resource_exists::<Pending>));
     app.add_plugins((
         MaterialPlugin::<FleshMaterial>::default(),
         MaterialPlugin::<OccluderMaterial>::default(),
+        MaterialPlugin::<DreamMaterial>::default(),
         Material2dPlugin::<OverlayMaterial>::default(),
     ))
-    .add_systems(Startup, setup)
+    .add_systems(Startup, (setup, no_parts))
     .init_resource::<FleshLayers>()
-    .add_systems(Update, (display_after_overlay, overlay_on))
+    .add_systems(Update, (display_after_overlay, overlay_on, dream_on))
     .add_systems(
         PostUpdate,
         (follow_screen, follow_camera.after(crate::render::apply_view)).before(bevy::camera::CameraUpdateSystems),
     )
     .add_systems(PostUpdate, update_uniforms);
+}
+
+fn no_parts(mut buffers: ResMut<Assets<ShaderBuffer>>) {
+    let none = ShaderBuffer::new(vec![[0.0f32; 4]], RenderAssetUsages::default());
+    buffers.insert(&NO_PARTS, none).expect("a handle of our own");
 }
 
 fn flesh_image(size: UVec2) -> Image {
@@ -300,6 +398,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut overlays: ResMut<Assets<OverlayMaterial>>,
+    mut dreams: ResMut<Assets<DreamMaterial>>,
 ) {
     let size = screen.size() * SS;
     let image = images.add(flesh_image(size));
@@ -334,6 +433,18 @@ fn setup(
         Overlay,
     ));
     commands.insert_resource(FleshTarget { image, size });
+    let colour = images.add(float_image(TextureFormat::Rgba32Float, 16));
+    let near = images.add(float_image(TextureFormat::R32Float, 4));
+    let quad = Mesh::from(Rectangle::new(2.0, 2.0));
+    commands.spawn((
+        Mesh3d(meshes.add(quad)),
+        MeshMaterial3d(dreams.add(DreamMaterial { colour: colour.clone(), near: near.clone() })),
+        RenderLayers::layer(FLESH_LAYER),
+        bevy::camera::visibility::NoFrustumCulling,
+        Visibility::Hidden,
+        DreamQuad,
+    ));
+    commands.insert_resource(DreamCreatures { colour, near, on: false });
 }
 
 /// psx-bevy shows the screen in the window at order 1000; the overlay must be
@@ -506,8 +617,8 @@ fn spawn_flesh_tris(
         return None;
     }
     let (colour, normal) = skin_arrays(&fl.skins, fl.matte);
-    let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal) };
-    let mesh = meshes.add(mesh(fl, tris));
+    let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal), parts: NO_PARTS };
+    let mesh = meshes.add(mesh(fl, tris, None));
     Some(commands.spawn((Mesh3d(mesh), MeshMaterial3d(materials.add(material)), RenderLayers::layer(FLESH_LAYER))).id())
 }
 
@@ -523,10 +634,37 @@ pub(crate) fn spawn_moving(
     fl: &Flesh,
     tris: &[crate::world::flesh::Tri],
 ) -> Entity {
-    commands.spawn((Mesh3d(meshes.add(mesh(fl, tris))), material.clone(), RenderLayers::layer(FLESH_LAYER), MovingFlesh)).id()
+    commands.spawn((Mesh3d(meshes.add(mesh(fl, tris, None))), material.clone(), RenderLayers::layer(FLESH_LAYER), MovingFlesh)).id()
 }
 
-fn mesh(fl: &Flesh, tris: &[crate::world::flesh::Tri]) -> Mesh {
+/// The flesh that moves, built once (see `world::dreamed::Moving`), with the skins of
+/// `material` and `fl`'s lights; and the numbers that move it, for `set_parts`.
+pub(crate) fn spawn_parts(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<FleshMaterial>,
+    buffers: &mut Assets<ShaderBuffer>,
+    material: &MeshMaterial3d<FleshMaterial>,
+    fl: &Flesh,
+    moving: &crate::world::dreamed::Moving,
+) -> Option<(Entity, Handle<ShaderBuffer>)> {
+    let mut own = materials.get(&material.0)?.clone();
+    own.parts = buffers.add(ShaderBuffer::new(moving.state.clone(), RenderAssetUsages::default()));
+    let parts = own.parts.clone();
+    let mesh = meshes.add(mesh(fl, &moving.tris, Some(&moving.how)));
+    let e = commands.spawn((Mesh3d(mesh), MeshMaterial3d(materials.add(own)), RenderLayers::layer(FLESH_LAYER), MovingFlesh)).id();
+    Some((e, parts))
+}
+
+/// What the parts of `spawn_parts`'s flesh are doing now.
+pub(crate) fn set_parts(buffers: &mut Assets<ShaderBuffer>, parts: &Handle<ShaderBuffer>, state: &[[f32; 4]]) {
+    if let Some(slice) = buffers.get_mut(parts).and_then(|b| b.into_inner().cast_slice_mut::<[f32; 4]>()) {
+        slice.copy_from_slice(state);
+    }
+}
+
+/// `tris` as a mesh, with how each corner moves (`spawn_parts`) when they do.
+fn mesh(fl: &Flesh, tris: &[crate::world::flesh::Tri], how: Option<&[[[f32; 4]; 3]]>) -> Mesh {
     let n = tris.len() * 3;
     let mut pos = Vec::with_capacity(n);
     let mut nw = Vec::with_capacity(n);
@@ -536,8 +674,9 @@ fn mesh(fl: &Flesh, tris: &[crate::world::flesh::Tri]) -> Mesh {
     let mut axes = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
     let mut sh = [Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n)];
     let mut grow = Vec::with_capacity(n);
+    let mut moves = Vec::with_capacity(if how.is_some() { n } else { 0 });
     let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-    for t in tris {
+    for (i, t) in tris.iter().enumerate() {
         // Wound to face out of the creature, by its vertex normals.
         let p = t.v.map(|v| v.p);
         let (e1, e2) = (sub(p[1], p[0]), sub(p[2], p[0]));
@@ -552,6 +691,9 @@ fn mesh(fl: &Flesh, tris: &[crate::world::flesh::Tri]) -> Mesh {
             pos.push(to_view(v.p).to_array());
             nw.push([v.n[0], v.n[1], v.n[2], v.w]);
             grow.push(v.grow);
+            if let Some(how) = how {
+                moves.push(how[i][k]);
+            }
             for s in 0..2 {
                 uvcap[s].push([v.uv[s][0], v.uv[s][1], v.cap[s][0], v.cap[s][1]]);
                 tw[s].push([v.t[s][0], v.t[s][1], v.t[s][2], v.wrap[s]]);
@@ -579,6 +721,9 @@ fn mesh(fl: &Flesh, tris: &[crate::world::flesh::Tri]) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
     mesh.insert_attribute(ATTR_NW, nw);
     mesh.insert_attribute(ATTR_GROW, grow);
+    if how.is_some() {
+        mesh.insert_attribute(ATTR_MOVES, moves);
+    }
     for s in 0..2 {
         mesh.insert_attribute(ATTR_UVCAP[s], std::mem::take(&mut uvcap[s]));
         mesh.insert_attribute(ATTR_TW[s], std::mem::take(&mut tw[s]));

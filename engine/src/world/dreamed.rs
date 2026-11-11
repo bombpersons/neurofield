@@ -78,6 +78,15 @@ pub const ORGAN_FEATURES: usize = 19;
 pub const MAX_ORGANS: usize = 128;
 /// How many points of a vein one organ token covers: half a tile.
 const VEIN_TOKEN: usize = 4;
+/// Each lid's side (1 the top), and how far down the eye it comes open and shut (see `lid`).
+const LIDS: [(f32, f32, f32); 2] = [(1.0, 0.9, 1.72), (-1.0, 1.05, 1.42)];
+/// How a corner of `Moving` moves, as the flesh shader knows it: with its eyeball, as a lid,
+/// a vein, a sphincter, or a filmed eye.
+const BALL: f32 = 1.0;
+const LID: f32 = 2.0;
+const VEIN: f32 = 3.0;
+const MOUTH: f32 = 4.0;
+const FILMED: f32 = 5.0;
 
 fn smooth(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
@@ -493,8 +502,8 @@ fn place_mouth(scene: &mut Scene, at: [f32; 3], n: [f32; 3], across: [f32; 3], u
         roots.push((add(at, scale(out, r * 1.6)), norm(out), rng.fr(0.06, 0.085)));
     }
     let start = scene.flesh.tris.len();
+    // Only meshed: in the scene's creatures the herd would walk it off the wall.
     scene.mesh_creature(&c);
-    scene.creatures.push(c);
     let tris = scene.flesh.tris.split_off(start);
     mouths.push(Mouth { tris, at, n, across, up, size: [r * wide, r * open], phase: rng.fr(0.0, TAU), every: rng.fr(4.0, 8.0), due: rng.fr(0.9, 1.0) });
 }
@@ -1124,7 +1133,8 @@ fn centre_of(t: &Tri) -> [f32; 3] {
 
 /// One eyelid: a shell just outside the eyeball at `centre`, from the top (`side` 1) or bottom
 /// of the eye down to `reach` radians from there at the middle, curving back at the corners.
-fn lid(scene: &mut Scene, e: &Eye, centre: [f32; 3], side: f32, reach: f32, skin: u16) {
+/// Returns how each corner moves as part `base` of `Moving` (see `LID`).
+fn lid(scene: &mut Scene, e: &Eye, centre: [f32; 3], side: f32, reach: f32, skin: u16, base: usize) -> Vec<[[f32; 4]; 3]> {
     const ACROSS: usize = 16;
     const DOWN: usize = 8;
     let radius = 1.07 * e.r;
@@ -1133,12 +1143,12 @@ fn lid(scene: &mut Scene, e: &Eye, centre: [f32; 3], side: f32, reach: f32, skin
         let a = (i as f32 / ACROSS as f32 * 2.0 - 1.0) * 1.45;
         let along = j as f32 / DOWN as f32;
         // A narrower opening at the corners: an almond.
-        let end = reach * (0.55 + 0.45 * a.cos().max(0.0).sqrt()).max(0.3) + 0.25 * (1.0 - a.cos().max(0.0));
-        let b = along * end;
+        let narrow = (0.55 + 0.45 * a.cos().max(0.0).sqrt()).max(0.3);
+        let b = along * (reach * narrow + 0.25 * (1.0 - a.cos().max(0.0)));
         // From the pole above the eye, down the sphere at longitude `a` from the front.
         let out = [0, 1, 2].map(|c| up[c] * b.cos() + (e.n[c] * a.cos() + e.across[c] * a.sin()) * b.sin());
         let uv = [i as f32 / ACROSS as f32 * 2.0, along * 0.8];
-        flesh::Vertex {
+        let v = flesh::Vertex {
             p: add(centre, scale(out, radius)),
             n: out,
             w: 1.0,
@@ -1148,16 +1158,21 @@ fn lid(scene: &mut Scene, e: &Eye, centre: [f32; 3], side: f32, reach: f32, skin
             cap: [uv; 2],
             wrap: [1.0; 2],
             grow: 1.0,
-        }
+        };
+        // How far down the sphere the corner goes for each radian more of `reach`.
+        (v, [LID, base as f32, along * narrow, side])
     };
+    let mut how = Vec::new();
     for i in 0..ACROSS {
         for j in 0..DOWN {
             let q = [vert(i, j), vert(i + 1, j), vert(i, j + 1), vert(i + 1, j + 1)];
             for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
-                scene.flesh.tris.push(flesh::Tri { v: [q[a], q[b], q[c]], skin: [skin; 2], light: [e.light; 2], corners: None, cap_axes: [[e.across, e.up]; 2] });
+                scene.flesh.tris.push(flesh::Tri { v: [q[a].0, q[b].0, q[c].0], skin: [skin; 2], light: [e.light; 2], corners: None, cap_axes: [[e.across, e.up]; 2] });
+                how.push([q[a].1, q[b].1, q[c].1]);
             }
         }
     }
+    how
 }
 
 /// How much of a heartbeat is passing a point, 0..1, `x` beats after the last one: two
@@ -1186,38 +1201,47 @@ fn vein_now(q: &VeinPoint, t: f32, amount: f32) -> ([f32; 3], f32, f32) {
 }
 
 /// A vein as it stands at `t` seconds: half a tube lying on the wall, fattened where the
-/// beat has got to, and flushed red with it.
-fn mesh_vein(scene: &mut Scene, v: &Vein, skin: [u16; 2], t: f32, amount: f32) {
+/// beat has got to, and flushed red with it. Without `t`, with no beat in it, for the flesh
+/// shader to beat as part `base` of `Moving` (see `VEIN`): returns how each corner moves.
+fn mesh_vein(scene: &mut Scene, v: &Vein, skin: [u16; 2], t: Option<f32>, amount: f32, base: usize) -> Vec<[[f32; 4]; 3]> {
     const AROUND: usize = 4;
     const SPREAD: f32 = 1.9;
-    let Some(last) = vein_end(v, amount) else { return };
-    let ring = |i: usize| -> [flesh::Vertex; AROUND + 1] {
+    let Some(last) = vein_end(v, amount) else { return Vec::new() };
+    let ring = |i: usize| -> [(flesh::Vertex, [f32; 4]); AROUND + 1] {
         let q = v.points[i];
         let along = norm(sub(v.points[(i + 1).min(last)].p, v.points[i.saturating_sub(1)].p));
         let side = norm(cross(along, q.n));
         let out = cross(side, along);
-        let (on_wall, r, b) = vein_now(&q, t, amount);
-        let mid = add(on_wall, scale(out, 0.15 * r));
+        let (on_wall, r, b) = vein_now(&q, t.unwrap_or(0.0), amount);
+        // A beat swells the tube out of its middle, which stays where it is.
+        let rest = r / (1.0 + BEAT_SWELL * b);
+        let b = if t.is_some() { b } else { 0.0 };
+        let r = rest * (1.0 + BEAT_SWELL * b);
+        let mid = add(on_wall, scale(out, 0.15 * rest));
         std::array::from_fn(|j| {
             let a = (j as f32 / AROUND as f32 * 2.0 - 1.0) * SPREAD;
             let n = add(scale(out, a.cos()), scale(side, a.sin()));
             let uv = [j as f32 / AROUND as f32, q.along * 3.0];
-            flesh::Vertex { p: add(mid, scale(n, r)), n, w: 1.0 - b, uv: [uv; 2], t: [side; 2], b: [along; 2], cap: [uv; 2], wrap: [1.0; 2], grow: 1.0 }
+            let vert = flesh::Vertex { p: add(mid, scale(n, r)), n, w: 1.0 - b, uv: [uv; 2], t: [side; 2], b: [along; 2], cap: [uv; 2], wrap: [1.0; 2], grow: 1.0 };
+            (vert, [VEIN, base as f32, q.along / BEAT_WAVE, rest * BEAT_SWELL])
         })
     };
+    let mut how = Vec::new();
     let mut near = ring(0);
     for i in 1..=last {
         let far = ring(i);
         for j in 0..AROUND {
             for [a, b, c] in [[near[j], near[j + 1], far[j]], [near[j + 1], far[j + 1], far[j]]] {
                 // Triangles wind so that this is against what they face (see `lid`).
-                let flip = dot(cross(sub(b.p, a.p), sub(c.p, a.p)), a.n) > 0.0;
-                let tv = if flip { [a, c, b] } else { [a, b, c] };
-                scene.flesh.tris.push(flesh::Tri { v: tv, skin, light: [v.light; 2], corners: None, cap_axes: [[a.t[0], a.b[0]]; 2] });
+                let flip = dot(cross(sub(b.0.p, a.0.p), sub(c.0.p, a.0.p)), a.0.n) > 0.0;
+                let [a, b, c] = if flip { [a, c, b] } else { [a, b, c] };
+                scene.flesh.tris.push(flesh::Tri { v: [a.0, b.0, c.0], skin, light: [v.light; 2], corners: None, cap_axes: [[a.0.t[0], a.0.b[0]]; 2] });
+                how.push([a.1, b.1, c.1]);
             }
         }
         near = far;
     }
+    how
 }
 
 /// How clenched a sphincter is at `t` seconds: 0 relaxed, 1 shut, and a little past either.
@@ -1388,19 +1412,65 @@ impl Sight {
     }
 }
 
-/// Point the eyes in view at `cam`, blink them and beat the veins, at `t` seconds.
+impl Sight {
+    fn of(cam: &Camera) -> Sight {
+        Sight { eye: cam.pos.map(|c| c as f32), ahead: crate::world::view::view_matrix(cam).m[2].map(|e| e as f32 / 4096.0) }
+    }
+}
+
+/// Where an eyeball sits in its socket.
+fn ball_centre(e: &Eye) -> [f32; 3] {
+    sub(e.at, scale(e.n, 0.45 * e.r))
+}
+
+/// An eyeball's axes as it looks along `want`, as far round as it can turn; straight out of
+/// the wall without.
+fn ball_axes(e: &Eye, want: Option<[f32; 3]>) -> [[f32; 3]; 3] {
+    let y = match want {
+        Some(want) => {
+            let off = dot(want, e.n).clamp(-1.0, 1.0).acos();
+            let k = if off > GAZE { GAZE / off } else { 1.0 };
+            norm(add(scale(e.n, 1.0 - k), scale(want, k)))
+        }
+        None => e.n,
+    };
+    let x = norm(cross(y, e.up));
+    [x, y, cross(x, y)]
+}
+
+/// An eyeball looking along `want` (see `ball_axes`).
+fn mesh_ball(scene: &mut Scene, e: &Eye, want: Option<[f32; 3]>) {
+    let centre = ball_centre(e);
+    let [x, y, z] = ball_axes(e, want);
+    let ball = part(Shape::Ellipsoid, [e.r; 3], 0);
+    let at = Placed { joint: centre, centre, axes: columns(x, y, z) };
+    let look = Skin { motif: Motif::Eyes, density: 0.0, scale: 2.0 * e.r, tint: [1.0; 3], seed: 0 };
+    scene.mesh_part(&ball, &at, &look, 0, Some((e.skin, e.light)));
+}
+
+/// How far shut an eye's lids are at `t` seconds, 0..1: they close over it now and then.
+fn shut_of(e: &Eye, t: f32) -> f32 {
+    let beat = (t + e.phase).rem_euclid(BLINK_EVERY);
+    if beat < BLINK {
+        (beat / BLINK * TAU / 2.0).sin()
+    } else {
+        0.0
+    }
+}
+
+/// Point the eyes in view at `cam`, blink them and beat the veins, at `t` seconds. `Moving`
+/// does the same on the GPU, and the two must look alike.
 pub fn pose(scene: &mut Scene, d: &Dreamed, cam: &Camera, t: f32) {
     scene.flesh.tris.truncate(d.fixed);
-    let eye = cam.pos.map(|c| c as f32);
-    let sight = Sight { eye, ahead: crate::world::view::view_matrix(cam).m[2].map(|e| e as f32 / 4096.0) };
+    let sight = Sight::of(cam);
     for m in &d.mouths {
-        if sight.near(m.at) && dot(sub(eye, m.at), m.n) > 0.0 {
+        if sight.near(m.at) && dot(sub(sight.eye, m.at), m.n) > 0.0 {
             mesh_mouth(scene, m, t, d.amount);
         }
     }
     for v in &d.veins {
         if sight.near(v.points[v.points.len() / 2].p) {
-            mesh_vein(scene, v, d.vein_skin, t, d.amount);
+            mesh_vein(scene, v, d.vein_skin, Some(t), d.amount, 0);
         }
     }
     for e in &d.eyes {
@@ -1409,22 +1479,146 @@ pub fn pose(scene: &mut Scene, d: &Dreamed, cam: &Camera, t: f32) {
             mesh_filmed(scene, e, patch, footage, want, t, d.amount);
             continue;
         }
-        let off = dot(want, e.n).clamp(-1.0, 1.0).acos();
-        let k = if off > GAZE { GAZE / off } else { 1.0 };
-        let y = norm(add(scale(e.n, 1.0 - k), scale(want, k)));
-        let x = norm(cross(y, e.up));
-        let z = cross(x, y);
-        let centre = sub(e.at, scale(e.n, 0.45 * e.r));
-        let ball = part(Shape::Ellipsoid, [e.r; 3], 0);
-        let at = Placed { joint: centre, centre, axes: columns(x, y, z) };
-        let look = Skin { motif: Motif::Eyes, density: 0.0, scale: 2.0 * e.r, tint: [1.0; 3], seed: 0 };
-        scene.mesh_part(&ball, &at, &look, 0, Some((e.skin, e.light)));
+        mesh_ball(scene, e, Some(want));
+        let shut = shut_of(e, t);
+        for (side, open, closed) in LIDS {
+            lid(scene, e, ball_centre(e), side, open + (closed - open) * shut, d.lid, 0);
+        }
+    }
+}
 
-        // The lids close over it now and then.
-        let beat = (t + e.phase).rem_euclid(BLINK_EVERY);
-        let shut = if beat < BLINK { (beat / BLINK * TAU / 2.0).sin() } else { 0.0 };
-        for (side, open, closed) in [(1.0, 0.9, 1.72), (-1.0, 1.05, 1.42)] {
-            lid(scene, e, centre, side, open + (closed - open) * shut, d.lid);
+/// The flesh that moves (the eyes and their lids, the veins and the sphincters) as one mesh
+/// built at the dial's `amount`, for the flesh shader to move by `state` each frame: what
+/// `pose` remakes on the CPU, without remaking it. Whatever `pose` leaves out for being out
+/// of sight is hidden instead.
+pub struct Moving {
+    pub tris: Vec<flesh::Tri>,
+    /// Per corner of `tris`: how it moves (`BALL` and on), where its part's numbers start in
+    /// `state`, and two numbers of its own.
+    pub how: Vec<[[f32; 4]; 3]>,
+    /// The time and the beat's period, then each part's numbers: those that change are
+    /// `pose`'s to write.
+    pub state: Vec<[f32; 4]>,
+    amount: f32,
+    /// Where each eye's, sphincter's and vein's numbers start, if it was built.
+    eyes: Vec<Option<usize>>,
+    mouths: Vec<Option<usize>>,
+    veins: Vec<Option<usize>>,
+}
+
+impl Moving {
+    /// Everything of `d`'s that moves, as far as its dial has turned. Uses `scene`'s flesh to
+    /// build in, and leaves it with only what doesn't move.
+    pub fn new(scene: &mut Scene, d: &Dreamed) -> Moving {
+        scene.flesh.tris.truncate(d.fixed);
+        let mut how: Vec<[[f32; 4]; 3]> = Vec::new();
+        let mut state = vec![[0.0, BEAT_EVERY, 0.0, 0.0]];
+        // A part whose corners all move alike.
+        let whole = |scene: &Scene, how: &mut Vec<[[f32; 4]; 3]>, kind: f32, base: usize| {
+            how.resize(scene.flesh.tris.len() - d.fixed, [[kind, base as f32, 0.0, 0.0]; 3]);
+        };
+        let mut mouths = Vec::new();
+        for m in &d.mouths {
+            if stage(d.amount, (m.due - 0.1, m.due)) <= 0.0 {
+                mouths.push(None);
+                continue;
+            }
+            // Where it is, and its size: how far out of the wall and how clenched, `pose`'s.
+            let base = state.len();
+            state.extend([[m.at[0], m.at[1], m.at[2], 0.0], [m.across[0], m.across[1], m.across[2], m.size[0]]]);
+            state.extend([[m.up[0], m.up[1], m.up[2], m.size[1]], [m.n[0], m.n[1], m.n[2], 0.0]]);
+            scene.flesh.tris.extend_from_slice(&m.tris);
+            whole(scene, &mut how, MOUTH, base);
+            mouths.push(Some(base));
+        }
+        let mut veins = Vec::new();
+        for v in &d.veins {
+            if vein_end(v, d.amount).is_none() {
+                veins.push(None);
+                continue;
+            }
+            // Whether it's shown.
+            let base = state.len();
+            state.push([0.0; 4]);
+            how.extend(mesh_vein(scene, v, d.vein_skin, None, d.amount, base));
+            veins.push(Some(base));
+        }
+        let mut eyes = Vec::new();
+        for e in &d.eyes {
+            let base = state.len();
+            if let (Some(patch), Some(footage)) = (&e.patch, &d.footage) {
+                if filmed_frame(e, footage.skins.len() - 1, 0.0, d.amount).0 <= 0.0 {
+                    eyes.push(None);
+                    continue;
+                }
+                // The skin it shows, and whether it's shown.
+                state.push([0.0; 4]);
+                mesh_filmed(scene, e, patch, footage, e.n, 0.0, d.amount);
+                whole(scene, &mut how, FILMED, base);
+            } else {
+                // How it has turned from straight out (columns), whether it's shown, how far
+                // each lid is from open; where it sits, and its up.
+                let (c, up) = (ball_centre(e), e.up);
+                state.extend([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]);
+                state.extend([[c[0], c[1], c[2], 0.0], [up[0], up[1], up[2], 0.0]]);
+                mesh_ball(scene, e, None);
+                whole(scene, &mut how, BALL, base);
+                for (side, open, _) in LIDS {
+                    how.extend(lid(scene, e, c, side, open, d.lid, base));
+                }
+            }
+            eyes.push(Some(base));
+        }
+        let tris = scene.flesh.tris.split_off(d.fixed);
+        debug_assert_eq!(tris.len(), how.len());
+        Moving { tris, how, state, amount: d.amount, eyes, mouths, veins }
+    }
+
+    /// The dial's turn it was built at.
+    pub fn amount(&self) -> f32 {
+        self.amount
+    }
+
+    /// Everything as `pose` would have it for `cam` at `t` seconds, in `state`.
+    pub fn pose(&mut self, d: &Dreamed, cam: &Camera, t: f32) {
+        let sight = Sight::of(cam);
+        let s = &mut self.state;
+        s[0][0] = t;
+        for (m, at) in d.mouths.iter().zip(&self.mouths) {
+            let Some(i) = *at else { continue };
+            let shown = sight.near(m.at) && dot(sub(sight.eye, m.at), m.n) > 0.0;
+            s[i][3] = if shown { stage(self.amount, (m.due - 0.1, m.due)) } else { 0.0 };
+            s[i + 3][3] = clench_of(m, t);
+        }
+        for (v, at) in d.veins.iter().zip(&self.veins) {
+            let Some(i) = *at else { continue };
+            s[i][0] = sight.near(v.points[v.points.len() / 2].p) as i32 as f32;
+        }
+        for (e, at) in d.eyes.iter().zip(&self.eyes) {
+            let Some(i) = *at else { continue };
+            let want = sight.of_eye(e);
+            if let (Some(patch), Some(footage)) = (&e.patch, &d.footage) {
+                let Some(want) = want else {
+                    s[i][1] = 0.0;
+                    continue;
+                };
+                let (_, frame) = filmed_frame(e, footage.skins.len() - 1, t, self.amount);
+                let (gx, gy) = gaze_of(e, patch, want);
+                s[i] = [footage.skins[frame][gx * GAZES_Y + gy] as f32, 1.0, 0.0, 0.0];
+                continue;
+            }
+            s[i][3] = want.is_some() as i32 as f32;
+            let Some(want) = want else { continue };
+            // The turn from straight out to `want`: each column is where an axis goes.
+            let (rest, now) = (ball_axes(e, None), ball_axes(e, Some(want)));
+            for c in 0..3 {
+                let column = [0, 1, 2].map(|r| (0..3).map(|k| now[k][r] * rest[k][c]).sum::<f32>());
+                s[i + c][..3].copy_from_slice(&column);
+            }
+            let shut = shut_of(e, t);
+            for (k, (_, open, closed)) in LIDS.iter().enumerate() {
+                s[i + 1 + k][3] = (closed - open) * shut;
+            }
         }
     }
 }
@@ -1432,6 +1626,15 @@ pub fn pose(scene: &mut Scene, d: &Dreamed, cam: &Camera, t: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sphincters_stay_out_of_the_creatures() {
+        let (mut scene, _) = crate::world::walkable_scene(&mut Rng::new(3), 30);
+        let before = scene.creatures.len();
+        let d = sculpt(&mut scene, 3, None);
+        assert!(!d.mouths.is_empty(), "no sphincters to check");
+        assert_eq!(scene.creatures.len(), before);
+    }
 
     #[test]
     fn a_filmed_eye_turns_up_and_down_as_well_as_sideways() {

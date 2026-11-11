@@ -1,6 +1,7 @@
 // Lays the creatures over the finished PS1 screen: each screen pixel averages
-// its 2x2 flesh samples that a creature covered, over the screen by how many
-// were.
+// its 2x2 flesh samples that a creature covered, over the screen by how much
+// of them was. The samples are premultiplied: the flesh covers each wholly or
+// not at all, but the dream creatures' edges are soft.
 
 import bevy_sprite_render::mesh2d::vertex_output::VertexOutput;
 
@@ -20,13 +21,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var y = 0; y < 2; y++) {
         for (var x = 0; x < 2; x++) {
             let s = textureLoad(flesh, at + vec2(x, y), 0);
-            if s.a > 0.5 {
+            if s.a > 0.0 {
                 sum += s.rgb;
-                n += 1.0;
+                n += s.a;
             }
         }
     }
-    if n == 0.0 {
+    if n <= 0.0 {
         discard;
     }
     // Encoded colour, as the screen holds it when it composites in sRGB.

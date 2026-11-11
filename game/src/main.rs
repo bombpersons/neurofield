@@ -350,19 +350,16 @@ struct Frame(Handle<Image>);
 #[derive(Component)]
 struct NetworkSprite;
 
-/// The dream creatures alone, laid over the rasteriser's picture when it shows without a
-/// clear seeing potion (F1, `--view raster`, `--sculpt`): for now, until the level network
-/// can draw what the rasteriser does, and perhaps for special cases after.
+/// The dream creatures alone, laid into the rasteriser's picture when it shows without a
+/// clear seeing potion (F1, `--view raster`, `--sculpt`), hidden by the level and its flesh
+/// (`engine::render::DreamCreatures`): for now, until the level network can draw what the
+/// rasteriser does, and perhaps for special cases after.
 #[derive(Resource)]
 struct Creatures {
-    image: Handle<Image>,
-    /// [H][W][4], from `DreamLayer::draw_alone`.
+    /// [H][W][4] and [H][W], from `DreamLayer::draw_alone`.
     rgba: Vec<f32>,
-    on: bool,
+    near: Vec<f32>,
 }
-
-#[derive(Component)]
-struct CreatureSprite;
 
 /// The scene's meshes in psx-bevy, and the versions of the scene they were built from,
 /// and the version of each moving part's meshes (`Scene::things`).
@@ -649,16 +646,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         NetworkSprite,
     ));
     commands.insert_resource(Frame(frame));
-    let creatures = images.add(hud_image());
-    // Between the rasteriser's picture and the network's frame.
-    commands.spawn((
-        Sprite::from_image(creatures.clone()),
-        Transform::from_xyz(0.0, 0.0, 0.5),
-        RenderLayers::layer(DISPLAY_LAYER),
-        Visibility::Hidden,
-        CreatureSprite,
-    ));
-    commands.insert_resource(Creatures { image: creatures, rgba: vec![0.0; (W * H * 4) as usize], on: false });
+    commands.insert_resource(Creatures { rgba: vec![0.0; (W * H * 4) as usize], near: vec![f32::MAX; (W * H) as usize] });
     let hud = images.add(hud_image());
     commands.spawn((
         Sprite::from_image(hud.clone()),
@@ -1125,6 +1113,7 @@ fn draw(
     mut dream: Option<NonSendMut<engine::neural::dream_net::DreamLayer>>,
     frame: Res<Frame>,
     mut creatures: ResMut<Creatures>,
+    mut shown: ResMut<engine::render::DreamCreatures>,
     mut images: ResMut<Assets<Image>>,
     mut sprite: Query<&mut Sprite, With<NetworkSprite>>,
 ) {
@@ -1162,38 +1151,30 @@ fn draw(
         sim.tris = tokens.len();
         sim.net_ms = sim.net_ms * 0.9 + 0.1 * t0.elapsed().as_secs_f32() * 1000.0;
     }
-    // The dream creatures over the rasteriser's picture, unless the player sees clearly. The
-    // rasteriser doesn't swell the level, so neither are they.
-    creatures.on = false;
+    // The dream creatures in the rasteriser's picture, unless the player sees clearly. The
+    // rasteriser doesn't swell the level, so neither are they; the flesh pass hides them
+    // behind the level and its flesh.
+    let mut on = false;
     if sim.shown() != Mode::Network && !sim.seeing_clearly() {
         let sim = &mut *sim;
         if let (Some(layer), Some(growths)) = (dream.as_mut(), &sim.growths) {
             let cam = sim.level.walker.camera();
-            let rgba = &mut creatures.rgba;
-            match layer.draw_alone(&mut sim.level.scene, sim.version, &sim.level.tris, growths.creature(), |p| p, &cam, rgba, W) {
-                Ok(()) => creatures.on = true,
+            let Creatures { rgba, near } = &mut *creatures;
+            match layer.draw_alone(&mut sim.level.scene, sim.version, &[], growths.creature(), |p| p, &cam, rgba, near, W) {
+                Ok(()) => on = true,
                 Err(e) => eprintln!("dream layer: {e}"),
             }
         }
-        if creatures.on {
-            if let Some(mut image) = images.get_mut(&creatures.image) {
-                upload_rgba(&mut image, &creatures.rgba, W);
+        if on {
+            for (image, floats) in [(&shown.colour, &creatures.rgba), (&shown.near, &creatures.near)] {
+                if let Some(mut image) = images.get_mut(image) {
+                    image.data = Some(floats.iter().flat_map(|f| f.to_ne_bytes()).collect());
+                }
             }
         }
     }
-}
-
-/// sRGB colour and straight alpha floats (0..1) into an RGBA8 image as wide as the widest frame.
-fn upload_rgba(image: &mut Image, rgba: &[f32], width: u32) {
-    let stride = MAX_W as usize * 4;
-    let data = image.data.get_or_insert_with(Vec::new);
-    data.resize(stride * H as usize, 0);
-    for (row, from) in data.chunks_exact_mut(stride).zip(rgba.chunks_exact(width as usize * 4)) {
-        for (px, c) in row.chunks_exact_mut(4).zip(from.chunks_exact(4)) {
-            for i in 0..4 {
-                px[i] = (c[i].clamp(0.0, 1.0) * 255.0).round() as u8;
-            }
-        }
+    if shown.on != on {
+        shown.on = on;
     }
 }
 
@@ -1240,19 +1221,20 @@ fn move_things(
     }
 }
 
-/// How many times a second the sculpted level's moving parts are remade.
-const POSE_RATE: f32 = 20.0;
+/// How many times a second, at most, the sculpted level's flesh is remade while the dial turns.
+const REMAKE_RATE: f32 = 20.0;
 /// How much of the sculpted level's dial [ and ] move a second.
 const DIAL_SPEED: f32 = 0.25;
 
-/// The filmed eyes and the veins as they stand this frame (with `--sculpt`), a mesh of their own
-/// made afresh so that the rest of the level's flesh stays put.
+/// The sculpted level's flesh (with `--sculpt`): its walls and what moves on them (the eyes,
+/// veins and sphincters), each a mesh of its own remade only when the dial turns, so that the
+/// rest of the level's flesh stays put; the GPU moves the eyes and the rest every frame.
 fn pose_sculpted(
     mut commands: Commands,
     mut sim: ResMut<Sim>,
     time: Res<Time>,
     key: Res<ButtonInput<KeyCode>>,
-    mut moving: Local<Option<Entity>>,
+    mut moving: Local<Option<(Entity, Handle<bevy::render::storage::ShaderBuffer>, engine::world::dreamed::Moving)>>,
     mut walls: Local<Option<Entity>>,
     mut walls_of: Local<Option<(AssetId<engine::render::flesh::FleshMaterial>, f32)>>,
     mut since: Local<f32>,
@@ -1267,37 +1249,32 @@ fn pose_sculpted(
     let dt = time.delta_secs();
     let held = key.pressed(KeyCode::BracketRight) as i32 as f32 - key.pressed(KeyCode::BracketLeft) as i32 as f32;
     sim.dial = (sim.dial + held * DIAL_SPEED * dt).clamp(0.0, 1.0);
-    // The mesh is in the world, so turning the camera doesn't need a new one, and what moves
-    // in it is slow: remaking it every frame was the slowest part of the frame.
     *since += dt;
-    if *since < 1.0 / POSE_RATE {
-        return;
-    }
-    *since = 0.0;
     let Some(sculpted) = &mut sim.sculpted else { return };
     // Clear seeing takes the flesh back into the stone as well.
     sculpted.amount = sim.dial * (1.0 - sim.calm);
     let Some(material) = flesh.iter().next() else { return };
     let scene = &mut sim.level.scene;
     let now = (material.id(), sculpted.amount);
-    if *walls_of != Some(now) {
-        if let Some(e) = walls.take() {
+    // Remaking the meshes is the slow part of a frame: not every frame while the dial turns.
+    if *walls_of != Some(now) && *since >= 1.0 / REMAKE_RATE {
+        *since = 0.0;
+        for e in walls.take().into_iter().chain(moving.take().map(|m| m.0)) {
             commands.entity(e).despawn();
         }
         let tris = engine::world::dreamed::walls(sculpted);
         if !tris.is_empty() {
             *walls = Some(gfx.spawn_moving_flesh(&mut commands, material, &scene.flesh, &tris));
         }
+        let parts = engine::world::dreamed::Moving::new(scene, sculpted);
+        if !parts.tris.is_empty() {
+            *moving = gfx.spawn_moving_parts(&mut commands, material, &scene.flesh, &parts).map(|(e, h)| (e, h, parts));
+        }
         *walls_of = Some(now);
     }
-    if let Some(e) = moving.take() {
-        commands.entity(e).despawn();
-    }
-    let cam = sim.level.walker.camera();
-    engine::world::dreamed::pose(scene, sculpted, &cam, sim.dream_time);
-    let tris = scene.flesh.tris.split_off(sculpted.fixed);
-    if !tris.is_empty() {
-        *moving = Some(gfx.spawn_moving_flesh(&mut commands, material, &scene.flesh, &tris));
+    if let Some((_, handle, parts)) = &mut *moving {
+        parts.pose(sculpted, &sim.level.walker.camera(), sim.dream_time);
+        gfx.set_moving_parts(handle, parts);
     }
 }
 
@@ -1374,9 +1351,7 @@ fn layout(
     window: Query<&Window, With<PrimaryWindow>>,
     mut network: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<NetworkSprite>>,
     mut hud: Query<(&mut Sprite, &mut Transform), (With<HudSprite>, Without<NetworkSprite>)>,
-    mut over: Query<(&mut Sprite, &mut Transform, &mut Visibility), (With<CreatureSprite>, Without<NetworkSprite>, Without<HudSprite>)>,
-    mut display: Query<(&Sprite, &mut Transform), (Without<NetworkSprite>, Without<HudSprite>, Without<CreatureSprite>)>,
-    creatures: Res<Creatures>,
+    mut display: Query<(&Sprite, &mut Transform), (Without<NetworkSprite>, Without<HudSprite>)>,
 ) {
     let Ok(window) = window.single() else { return };
     let mode = sim.shown();
@@ -1389,16 +1364,6 @@ fn layout(
         if sprite.image == screen.image {
             t.scale = Vec3::splat(raster);
             t.translation.x = -half;
-        }
-    }
-    // The dream creatures lie on the rasteriser's picture, as it does.
-    if let Ok((mut os, mut ot, mut ov)) = over.single_mut() {
-        os.rect = Some(Rect::new(0.0, 0.0, W as f32, H as f32));
-        os.custom_size = Some(Vec2::new(W as f32, H as f32) * raster);
-        ot.translation.x = -half;
-        let want = if creatures.on { Visibility::Visible } else { Visibility::Hidden };
-        if *ov != want {
-            *ov = want;
         }
     }
     let wanted = (room.x / room.y.max(1.0) * H as f32).clamp(NET_WIDTHS.0, NET_WIDTHS.1);
@@ -1471,9 +1436,22 @@ fn auto_screenshot(mut commands: Commands, time: Res<Time>, mut frames: Local<u3
     }
 }
 
-fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status>>) {
+/// How often the frame rate on show is counted afresh, seconds.
+const FPS_EVERY: f32 = 0.5;
+
+/// `counted`: the seconds and frames since the frame rate was last counted, and what it was.
+fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status>>, mut counted: Local<(f32, u32, f32)>) {
     let Ok(mut text) = text.single_mut() else { return };
-    let fps = 1.0 / time.delta_secs().max(1e-6);
+    // Counted over a while, not from the last frame alone: frames can come unevenly (the
+    // sculpted level's flesh is remade while its dial turns).
+    let (secs, frames, fps) = &mut *counted;
+    *secs += time.delta_secs();
+    *frames += 1;
+    if *secs >= FPS_EVERY {
+        *fps = *frames as f32 / *secs;
+        (*secs, *frames) = (0.0, 0);
+    }
+    let fps = *fps;
     let mode = sim.shown().name();
     let walk = if sim.auto_walk { "auto-walk" } else { "walking" };
     let pause = if sim.paused { " | frozen" } else if sim.menu.is_some() { " | menu" } else { "" };

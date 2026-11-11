@@ -895,8 +895,9 @@ pub fn composite(rgb: &mut [f32], layers: &[Layer], depth: &[f32], fog: [f32; 3]
 
 /// The layers as `composite` would lay them, laid over nothing instead: `rgba` gets sRGB
 /// colour and straight alpha, which laid over any picture in linear light gives what
-/// `composite` would have made of it.
-pub fn composite_alone(rgba: &mut [f32], layers: &[Layer], depth: &[f32], fog: [f32; 3], width: usize) {
+/// `composite` would have made of it, and `near` the depth (tiles) of the nearest layer
+/// in each pixel it covers.
+pub fn composite_alone(rgba: &mut [f32], near: &mut [f32], layers: &[Layer], depth: &[f32], fog: [f32; 3], width: usize) {
     let (x0, y0) = (layers.iter().map(|l| l.x0).min().unwrap_or(0), layers.iter().map(|l| l.y0).min().unwrap_or(0));
     let (x1, y1) = (layers.iter().map(|l| l.x0 + l.w).max().unwrap_or(0), layers.iter().map(|l| l.y0 + l.h).max().unwrap_or(0));
     let mut here: Vec<&[f32]> = Vec::with_capacity(layers.len());
@@ -929,6 +930,7 @@ pub fn composite_alone(rgba: &mut [f32], layers: &[Layer], depth: &[f32], fog: [
                     out[k] = enc(c[k] / a);
                 }
                 out[3] = a;
+                near[at] = here.last().map_or(f32::MAX, |px| px[5]);
             }
         }
     }
@@ -965,14 +967,16 @@ impl DreamLayer {
 
     /// The creatures as `draw` lays them, but on their own: `rgba` ([H][width][4], sRGB
     /// colour and straight alpha) is cleared and then holds them, to be laid over a picture
-    /// drawn some other way (the rasteriser's).
+    /// drawn some other way (the rasteriser's), and `near` ([H][width]) their depth in
+    /// tiles, for it to hide them by (`f32::MAX` where there are none).
     #[allow(clippy::too_many_arguments)]
-    pub fn draw_alone(&mut self, scene: &mut Scene, version: u64, tris: &[f32], extra: Creature, warp: impl Fn([f32; 3]) -> [f32; 3], cam: &Camera, rgba: &mut [f32], width: u32) -> Result<()> {
+    pub fn draw_alone(&mut self, scene: &mut Scene, version: u64, tris: &[f32], extra: Creature, warp: impl Fn([f32; 3]) -> [f32; 3], cam: &Camera, rgba: &mut [f32], near: &mut [f32], width: u32) -> Result<()> {
         rgba.fill(0.0);
+        near.fill(f32::MAX);
         let layers = self.layers(scene, version, extra, warp, cam, width)?;
         if !layers.is_empty() {
             let depth = level_depth(tris, cam, width);
-            composite_alone(rgba, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
+            composite_alone(rgba, near, &layers, &depth, scene.fog_colour(cam.pos), width as usize);
         }
         Ok(())
     }
@@ -1050,7 +1054,10 @@ mod tests {
         let mut want = picture.clone();
         composite(&mut want, &layers, &depth, fog, w);
         let mut alone = vec![0.0; w * h * 4];
-        composite_alone(&mut alone, &layers, &depth, fog, w);
+        let mut near = vec![f32::MAX; w * h];
+        composite_alone(&mut alone, &mut near, &layers, &depth, fog, w);
+        // The nearest in front of the wall.
+        assert!(near.chunks(w).all(|row| row == [2.0, 1.0, 1.0, 1.0]), "{near:?}");
         for i in 0..w * h {
             let a = alone[i * 4 + 3];
             for c in 0..3 {

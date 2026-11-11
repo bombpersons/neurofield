@@ -25,7 +25,7 @@ use crate::world::tex;
 use psx_bevy::psx::{PsxMaterial, PsxView};
 use std::collections::HashMap;
 
-pub use flesh::{FleshLayers, FleshTarget};
+pub use flesh::{DreamCreatures, FleshLayers, FleshTarget};
 
 pub const TF: f32 = T as f32;
 /// Level triangles are split until no edge is longer than this (world units):
@@ -242,6 +242,7 @@ pub struct Gfx<'w> {
     torch: Res<'w, Torch>,
     view: Res<'w, View>,
     layers: Res<'w, FleshLayers>,
+    buffers: ResMut<'w, Assets<bevy::render::storage::ShaderBuffer>>,
 }
 
 impl Gfx<'_> {
@@ -291,6 +292,23 @@ impl Gfx<'_> {
     ) -> Entity {
         flesh::spawn_moving(commands, &mut self.meshes, material, fl, tris)
     }
+
+    /// `fl`'s flesh that moves, built once at its dial's turn, with the skins of `material`:
+    /// it and what moves it (`set_moving_parts`), or nothing when `material` has gone.
+    pub fn spawn_moving_parts(
+        &mut self,
+        commands: &mut Commands,
+        material: &MeshMaterial3d<flesh::FleshMaterial>,
+        fl: &crate::world::flesh::Flesh,
+        moving: &crate::world::dreamed::Moving,
+    ) -> Option<(Entity, Handle<bevy::render::storage::ShaderBuffer>)> {
+        flesh::spawn_parts(commands, &mut self.meshes, &mut self.flesh, &mut self.buffers, material, fl, moving)
+    }
+
+    /// Move the flesh `spawn_moving_parts` made as `moving` has it posed now.
+    pub fn set_moving_parts(&mut self, parts: &Handle<bevy::render::storage::ShaderBuffer>, moving: &crate::world::dreamed::Moving) {
+        flesh::set_parts(&mut self.buffers, parts, &moving.state);
+    }
 }
 
 /// Spawn `scene` as meshes: the level and any PS1-pipeline creatures one mesh
@@ -298,7 +316,7 @@ impl Gfx<'_> {
 /// the moving things (`spawn_thing`), and full-colour creatures for the flesh
 /// pass. Returns the entities, to despawn when the scene goes.
 pub fn spawn(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene) -> Vec<Entity> {
-    let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view, layers } = gfx;
+    let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view, layers, .. } = gfx;
     let (mut out, level) = spawn_psx(commands, meshes, images, materials, textures, scene, torch);
     // Kept apart, the creatures are drawn whole: nothing of the level hides them.
     let level = if layers.0 { Vec::new() } else { level };
