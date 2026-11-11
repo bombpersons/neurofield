@@ -1,11 +1,14 @@
 //! The Neural view mode: the trained network drawing the editor camera's view.
 //! It runs on a worker thread, which loads the model the first time it is asked
 //! for, so editing stays smooth however long a frame takes; the latest frame is
-//! drawn over the 3D view, with the tools' outlines on top.
+//! drawn over the 3D view, with the tools' outlines on top. With the Flesh toggle on, the
+//! dream net lays the creatures over each frame, as the game does (see `crate::dream`).
 
+use crate::dream::{Creatures, Dreamer, SharedLevel};
 use crate::view3d::{Built, EditorCam};
 use bevy_egui::egui;
 use engine::neural::{dream::Dream, features, tokens, Network};
+use engine::world::level::Level;
 use engine::world::view::{H, W};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -18,17 +21,22 @@ struct Key {
     version: u64,
     cut: Option<i32>,
     cam: [u32; 5],
+    /// The creatures' shapes (`dream::shapes_key`), when the dream net draws them.
+    creatures: Option<u64>,
 }
 
 struct Job {
     key: Key,
     tris: Arc<Vec<f32>>,
     view: Vec<f32>,
+    creatures: Option<Creatures>,
 }
 
 enum Reply {
     Loaded(String),
     Failed(String),
+    /// The dream net couldn't be had: the frames go on without the creatures.
+    NoDream(String),
     Frame { key: Key, rgb: Vec<f32>, ms: f32 },
 }
 
@@ -55,17 +63,32 @@ pub struct NeuralView {
     /// Milliseconds the last frame took.
     pub ms: f32,
     pub frame: Option<egui::TextureHandle>,
+    /// Why the dream net isn't drawing the creatures, if it was wanted and isn't.
+    pub no_dream: Option<String>,
+    level: SharedLevel,
 }
 
 impl Default for NeuralView {
     fn default() -> Self {
-        NeuralView { jobs: None, replies: None, state: State::Off, busy: false, asked: None, tris: None, ms: 0.0, frame: None }
+        NeuralView {
+            jobs: None,
+            replies: None,
+            state: State::Off,
+            busy: false,
+            asked: None,
+            tris: None,
+            ms: 0.0,
+            frame: None,
+            no_dream: None,
+            level: SharedLevel::default(),
+        }
     }
 }
 
 impl NeuralView {
-    /// Start the worker, which loads the model at `model`.
-    fn start(&mut self, model: PathBuf) {
+    /// Start the worker, which loads the model at `model`, and the dream net at `dream` the
+    /// first time a frame wants the creatures.
+    fn start(&mut self, model: PathBuf, dream: Option<PathBuf>) {
         let (jobs, rx) = mpsc::channel::<Job>();
         let (tx, replies) = mpsc::channel();
         std::thread::Builder::new()
@@ -79,6 +102,8 @@ impl NeuralView {
                     }
                 };
                 _ = tx.send(Reply::Loaded(net.adapter().to_string()));
+                // None until wanted; then the dream net, or why there isn't one.
+                let mut dreamer: Option<Result<Dreamer, String>> = None;
                 while let Ok(mut job) = rx.recv() {
                     // Only the newest view matters.
                     while let Ok(newer) = rx.try_recv() {
@@ -86,10 +111,27 @@ impl NeuralView {
                     }
                     let t0 = Instant::now();
                     let t = tokens::tokens(&job.tris, &job.view);
-                    let reply = match net.try_render(&t, &Dream::calm(t.width)) {
-                        Ok(rgb) => Reply::Frame { key: job.key, rgb, ms: t0.elapsed().as_secs_f32() * 1000.0 },
-                        Err(e) => Reply::Failed(e),
+                    let mut rgb = match net.try_render(&t, &Dream::calm(t.width)) {
+                        Ok(rgb) => rgb,
+                        Err(e) => {
+                            _ = tx.send(Reply::Failed(e));
+                            return;
+                        }
                     };
+                    if let Some(c) = &job.creatures {
+                        let d = dreamer.get_or_insert_with(|| match &dream {
+                            Some(p) if p.is_file() => Dreamer::load(p),
+                            p => Err(format!("no dream net at {}", p.as_ref().map_or("(none set)".into(), |p| p.display().to_string()))),
+                        });
+                        let drawn = match d {
+                            Ok(d) => d.over(c, &job.tris, &mut rgb, W),
+                            Err(e) => Err(e.clone()),
+                        };
+                        if let Err(e) = drawn {
+                            _ = tx.send(Reply::NoDream(e));
+                        }
+                    }
+                    let reply = Reply::Frame { key: job.key, rgb, ms: t0.elapsed().as_secs_f32() * 1000.0 };
                     if tx.send(reply).is_err() {
                         return;
                     }
@@ -102,11 +144,13 @@ impl NeuralView {
     }
 
     /// Ask for a new frame when the level or the camera has moved and the last one
-    /// is done, and take in finished ones. `model` is where the network is, if set.
-    pub fn update(&mut self, ctx: &egui::Context, built: &Built, cam: &EditorCam, model: Option<PathBuf>) {
+    /// is done, and take in finished ones. `model` and `dream` are where the network and
+    /// the dream net are, if set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(&mut self, ctx: &egui::Context, level: &Level, built: &Built, cam: &EditorCam, model: Option<PathBuf>, dream: Option<PathBuf>) {
         if self.state == State::Off {
             match model {
-                Some(m) if m.is_file() => self.start(m),
+                Some(m) if m.is_file() => self.start(m, dream),
                 m => {
                     self.state = State::Failed(format!(
                         "no model at {}: run ./model.sh, or set `model` in neurofield.ron",
@@ -122,6 +166,7 @@ impl NeuralView {
                     self.state = State::Failed(e);
                     self.jobs = None;
                 }
+                Reply::NoDream(e) => self.no_dream = Some(e),
                 Reply::Frame { key, rgb, ms } => {
                     self.busy = false;
                     self.ms = ms;
@@ -141,10 +186,12 @@ impl NeuralView {
             return;
         }
         let c = cam.psx();
+        let dreamed = built.full_colour && !built.scene.creatures.is_empty();
         let key = Key {
             version: built.version,
             cut: built.cut_at,
             cam: [c.pos[0] as u32, c.pos[1] as u32, c.pos[2] as u32, c.yaw as u32, c.pitch as u32],
+            creatures: dreamed.then(|| crate::dream::shapes_key(&built.shapes)),
         };
         if self.asked == Some(key) {
             return;
@@ -157,7 +204,8 @@ impl NeuralView {
         let mut view = Vec::new();
         features::view_features(&built.scene, 0, &c, engine::world::view::W, &mut view);
         let tris = self.tris.as_ref().unwrap().2.clone();
-        if self.jobs.as_ref().is_some_and(|j| j.send(Job { key, tris, view }).is_ok()) {
+        let creatures = key.creatures.map(|shapes| Creatures { version: built.version, level: self.level.of(built.version, level), cut: built.cut_at, shapes, cam: c });
+        if self.jobs.as_ref().is_some_and(|j| j.send(Job { key, tris, view, creatures }).is_ok()) {
             self.busy = true;
             self.asked = Some(key);
         }

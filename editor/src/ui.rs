@@ -230,7 +230,7 @@ pub fn draw(
     time: Res<Time>,
     mut window: Query<&mut Window>,
     atlas: Res<crate::view3d::Atlas>,
-    sculpts: Res<crate::flesh::Sculpts>,
+    dream: Res<crate::dream::DreamView>,
     mut exit: MessageWriter<AppExit>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?.clone();
@@ -273,7 +273,7 @@ pub fn draw(
     s.screen = Some(ctx.viewport_rect());
     built.brushing = s.tools.tool == Tool::Strange;
     if built.mode == ViewMode::Neural {
-        s.neural.update(&ctx, &built, &cam, s.config.model.clone());
+        s.neural.update(&ctx, &doc.level, &built, &cam, s.config.model.clone(), s.config.dream.clone());
         if let crate::neural::State::Failed(e) = &s.neural.state {
             s.message = e.clone();
             s.neural = Default::default();
@@ -292,7 +292,7 @@ pub fn draw(
         egui::UiBuilder::new().layer_id(egui::LayerId::background()).max_rect(ctx.viewport_rect()),
     );
     egui::Panel::top("menu").show(&mut root, |ui| menu_bar(ui, s, doc, &mut built, &mut input, &cam));
-    egui::Panel::bottom("status").show(&mut root, |ui| status_bar(ui, s, doc, &built, &cam, sculpts.pending()));
+    egui::Panel::bottom("status").show(&mut root, |ui| status_bar(ui, s, doc, &built, &cam, &dream));
 
     let mut dock = std::mem::replace(&mut s.settings.dock, DockState::new(Vec::new()));
     let mut style = egui_dock::Style::from_egui(root.style());
@@ -459,8 +459,12 @@ fn delete_selected(s: &mut Ui, doc: &mut Doc) {
 
 fn play(s: &mut Ui, doc: &Doc, from: Option<&EditorCam>) {
     let start = from.map(|c| c.player_start());
-    s.message = match crate::play(&doc.level, start) {
-        Ok(()) => if start.is_some() { "playing from the camera".into() } else { "playing".into() },
+    let flesh = s.settings.play_flesh;
+    s.message = match crate::play(&doc.level, start, flesh) {
+        Ok(()) => {
+            let from = if start.is_some() { " from the camera" } else { "" };
+            format!("playing{from}{}", if flesh { ", walls of flesh" } else { "" })
+        }
         Err(e) => e,
     };
 }
@@ -684,7 +688,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             ui.checkbox(&mut built.cut, "Cut above the slice");
             ui.checkbox(&mut built.show_entities, "Entity markers");
             ui.checkbox(&mut built.overlay, "Strangeness overlay").on_hover_text("Tint the 3D view and the plan by strangeness (always on with the Strangeness tool)");
-            ui.checkbox(&mut built.full_colour, "Full-colour creatures");
+            ui.checkbox(&mut built.full_colour, "Dream-net creatures").on_hover_text(FLESH_HINT);
             s.settings.full_colour = built.full_colour;
             ui.separator();
             if ui.add(egui::Button::new("Frame selection").shortcut_text("F")).clicked() {
@@ -719,6 +723,11 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
             if ui.add(egui::Button::new("Play from here").shortcut_text("Shift+F5")).clicked() {
                 play(s, doc, Some(cam));
             }
+            ui.separator();
+            let hint = "Play with the walls turning to flesh, with filmed eyes, veins and sphincters ([ and ] in the game turn the dial)";
+            if ui.checkbox(&mut s.settings.play_flesh, "Flesh walls").on_hover_text(hint).changed() {
+                s.settings.save();
+            }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("▶ From here").on_hover_text("Play from the camera (Shift+F5)").clicked() {
@@ -740,7 +749,7 @@ fn menu_bar(ui: &mut egui::Ui, s: &mut Ui, doc: &mut Doc, built: &mut Built, inp
     });
 }
 
-fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorCam, sculpting: usize) {
+fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorCam, dream: &crate::dream::DreamView) {
     ui.horizontal(|ui| {
         let t = s.tools.tool;
         let hint = match (s.tools.link, t.coming()) {
@@ -787,9 +796,19 @@ fn status_bar(ui: &mut egui::Ui, s: &Ui, doc: &Doc, built: &Built, cam: &EditorC
                 ui.label(format!("cell ({x}, {l}, {z}) {face}, texture {tex}, strangeness {strange:.2}"));
                 ui.separator();
             }
-            if sculpting > 0 {
-                ui.label(format!("sculpting {sculpting} creature{}", if sculpting == 1 { "" } else { "s" }));
-                ui.separator();
+            // How the creatures are drawn, when the dream net is wanted for them.
+            if built.full_colour && !built.scene.creatures.is_empty() {
+                use crate::dream::State;
+                let text = match (built.mode, &dream.state) {
+                    (ViewMode::Neural, _) => s.neural.no_dream.as_ref().map(|e| format!("creatures as PS1 models: {e}")),
+                    (_, State::Ready(adapter)) => Some(format!("dream net {:.0} ms on {adapter}", dream.ms)),
+                    (_, State::Failed(e)) => Some(format!("creatures as PS1 models: {e}")),
+                    _ => Some("dream net loading".into()),
+                };
+                if let Some(text) = text {
+                    ui.label(text);
+                    ui.separator();
+                }
             }
             let w = to_world(cam.pos);
             ui.label(format!(
@@ -893,8 +912,7 @@ impl Viewer<'_> {
             ui.add_enabled_ui(!b.brushing, |ui| ui.toggle_value(&mut b.overlay, "Strange"))
                 .response
                 .on_hover_text("Tint by strangeness: blue grounded, through teal and yellow, to magenta (always on with the Strangeness tool)");
-            ui.toggle_value(&mut b.full_colour, "Flesh")
-                .on_hover_text("Creatures in full colour, as the game draws them (sculpted in the background)");
+            ui.toggle_value(&mut b.full_colour, "Flesh").on_hover_text(FLESH_HINT);
             self.s.settings.full_colour = b.full_colour;
         });
         // The tools get the pointer where no panel (or the toggles) has it.
@@ -1005,7 +1023,7 @@ impl Viewer<'_> {
         let filter = self.s.filter.to_lowercase();
         let shown = |label: &str| filter.is_empty() || label.to_lowercase().contains(&filter);
         ui.separator();
-        let kinds = ["PlayerStart", "Creature", "Door", "Key", "Chest", "Prop", "Lever"];
+        let kinds = ["PlayerStart", "Creature", "Door", "Key", "Chest", "Item", "Prop", "Lever"];
         for k in kinds {
             let items: Vec<(u32, String, Color32)> = self
                 .doc
@@ -1355,6 +1373,8 @@ fn egui_colour(c: Color) -> Color32 {
     Color32::from_rgb((s.red * 255.0) as u8, (s.green * 255.0) as u8, (s.blue * 255.0) as u8)
 }
 
+const FLESH_HINT: &str = "Creatures drawn by the dream net, as the game draws them (neurofield.ron's `dream`); off, they are PS1 models";
+
 /// Issues that stop the level playing as meant, and ones worth a look.
 const ERROR: Color32 = Color32::from_rgb(255, 110, 100);
 const WARNING: Color32 = Color32::from_rgb(240, 200, 90);
@@ -1368,7 +1388,19 @@ pub(crate) fn kind_name(k: &EntityKind) -> &'static str {
         EntityKind::Chest { .. } => "Chest",
         EntityKind::Prop { .. } => "Prop",
         EntityKind::Lever { .. } => "Lever",
+        EntityKind::Item { .. } => "Item",
     }
+}
+
+/// A list of the items there are, for `name`; one the game doesn't know shows in red.
+fn item_choice(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, name: &mut String) {
+    let known = engine::world::level::ITEMS.contains(&name.as_str());
+    let shown = if known { RichText::new(name.as_str()) } else { RichText::new(format!("{name}?")).color(ERROR) };
+    egui::ComboBox::from_id_salt(id).selected_text(shown).show_ui(ui, |ui| {
+        for n in engine::world::level::ITEMS {
+            ui.selectable_value(name, n.to_string(), n);
+        }
+    });
 }
 
 /// Height in tiles, up from world y (which points down), without a "-0".
@@ -1382,6 +1414,9 @@ fn entity_label(e: &LevelEntity) -> String {
         EntityKind::Creature { kind, .. } => format!("#{} {kind:?} {at}", e.id),
         EntityKind::Key { name } => format!("#{} {name} {at}", e.id),
         EntityKind::Prop { shape, .. } => format!("#{} {shape:?} {at}", e.id),
+        EntityKind::Item { name, count: 1 } => format!("#{} {name} {at}", e.id),
+        EntityKind::Item { name, count } => format!("#{} {count} {name} {at}", e.id),
+        EntityKind::Chest { contents, .. } if !contents.is_empty() => format!("#{} {} {at}", e.id, contents.join(", ")),
         _ => format!("#{} {at}", e.id),
     }
 }
@@ -1572,10 +1607,37 @@ fn entity_properties(
                 place_button(ui, &text, "Lock the chest, then click a floor for the key that opens it", For::Key(me), place);
                 ui.end_row();
                 ui.label("contents");
-                let mut text = contents.join(", ");
-                if ui.text_edit_singleline(&mut text).changed() {
-                    *contents = text.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
-                }
+                ui.vertical(|ui| {
+                    let mut gone = None;
+                    for (i, name) in contents.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            item_choice(ui, ("in chest", i), name);
+                            if ui.small_button(egui_phosphor::regular::X).on_hover_text("Take it out").clicked() {
+                                gone = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = gone {
+                        contents.remove(i);
+                    }
+                    let mut add = String::new();
+                    egui::ComboBox::from_id_salt("add to chest").selected_text(format!("{} Add", egui_phosphor::regular::PLUS)).show_ui(ui, |ui| {
+                        for name in engine::world::level::ITEMS {
+                            ui.selectable_value(&mut add, name.to_string(), name);
+                        }
+                    });
+                    if !add.is_empty() {
+                        contents.push(add);
+                    }
+                });
+                ui.end_row();
+            }
+            EntityKind::Item { name, count } => {
+                ui.label("item");
+                item_choice(ui, "item", name);
+                ui.end_row();
+                ui.label("how many");
+                ui.add(egui::DragValue::new(count).range(1..=99));
                 ui.end_row();
             }
             EntityKind::Prop { shape, size, tex, tint } => {

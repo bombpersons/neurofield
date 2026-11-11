@@ -14,7 +14,9 @@ pub const EYE: f32 = 0.62 * TF;
 /// Focal length for a ~83° horizontal field of view. The near plane is H/2 = 90.
 pub const H: u16 = 180;
 /// Body radius for shortcuts: kept above H/2 so nearby walls are not cut by the near plane.
-const RADIUS: f32 = 100.0;
+pub const RADIUS: f32 = 100.0;
+/// A creature further above or below the feet than this is on another floor.
+const CREATURE_FLOOR: f32 = 1.5 * TF;
 const SPEED: f32 = 14.0;
 /// Turn rate cap per frame (4096 = 360°).
 const MAX_TURN: f32 = 40.0;
@@ -49,6 +51,17 @@ struct Body {
     bob_amount: f32,
 }
 
+/// A knock to the view, on top of where the walker is and looks: pushed `back` (world
+/// units) and turned by `yaw`, `pitch` and `roll` (4096 units a turn). The game's own; the
+/// generated walks' cameras have none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Kick {
+    pub back: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+}
+
 pub struct Walker {
     pub x: f32,
     pub z: f32,
@@ -67,6 +80,7 @@ pub struct Walker {
     torch: [f32; 3],
     torch_radius: i32,
     body: Body,
+    pub kick: Kick,
 }
 
 fn centre(c: Node) -> (f32, f32) {
@@ -76,6 +90,40 @@ fn centre(c: Node) -> (f32, f32) {
 /// Yaw that faces along (dx, dz); the inverse of the GTE rot_y forward (-sin, cos).
 pub fn yaw_towards(dx: f32, dz: f32) -> f32 {
     (-dx).atan2(dz) / std::f32::consts::TAU * 4096.0
+}
+
+/// Creatures on the same floor as feet at `at` and how near each lets the body come: its
+/// base, and its girth and the body's together.
+fn creatures_near(scene: &Scene, at: [f32; 3]) -> impl Iterator<Item = ([f32; 3], f32)> + '_ {
+    scene
+        .creatures
+        .iter()
+        .filter(move |c| c.girth > 0.0 && (c.base[1] - at[1]).abs() < CREATURE_FLOOR)
+        .map(|c| (c.base, c.girth + RADIUS))
+}
+
+/// Would moving from `at` to (x, z) take the body into a creature? Only a move that comes
+/// nearer counts, so a body a creature has walked into can always back out of it.
+fn creature_in_way(scene: &Scene, at: [f32; 3], x: f32, z: f32) -> bool {
+    creatures_near(scene, at).any(|(b, near)| {
+        let to = (x - b[0]).hypot(z - b[2]);
+        to < near && to < (at[0] - b[0]).hypot(at[2] - b[2])
+    })
+}
+
+/// The move (dx, dz) from `at` with whatever would push into a creature taken out, so the
+/// body slides round it.
+fn slide_round_creatures(scene: &Scene, at: [f32; 3], mut dx: f32, mut dz: f32) -> (f32, f32) {
+    for (b, near) in creatures_near(scene, at) {
+        let (ox, oz) = (at[0] + dx - b[0], at[2] + dz - b[2]);
+        let to = ox.hypot(oz);
+        if to < near && to > 1e-3 {
+            let (nx, nz) = (ox / to, oz / to);
+            let inward = (dx * nx + dz * nz).min(0.0);
+            (dx, dz) = (dx - inward * nx, dz - inward * nz);
+        }
+    }
+    (dx, dz)
 }
 
 /// `target` shifted by whole turns to be nearest `from`.
@@ -112,6 +160,7 @@ impl Walker {
             torch: if rng.chance(0.75) { torch_colour(rng) } else { [0.0; 3] },
             torch_radius: (rng.fr(2.0, 4.0) * TF) as i32,
             body: Body::default(),
+            kick: Kick::default(),
         })
     }
 
@@ -135,6 +184,7 @@ impl Walker {
             torch: torch_colour(rng),
             torch_radius: (3.0 * TF) as i32,
             body: Body::default(),
+            kick: Kick::default(),
         })
     }
 
@@ -199,11 +249,15 @@ impl Walker {
     }
 
     pub fn camera(&self) -> Camera {
+        let k = self.kick;
+        let (s, c) = (self.yaw / 4096.0 * std::f32::consts::TAU).sin_cos();
+        // Forward is (-sin, cos).
+        let (x, z) = (self.x + s * k.back, self.z - c * k.back);
         Camera {
-            pos: [self.x as i32, (self.y + self.bob()) as i32, self.z as i32],
-            yaw: self.yaw.round() as i32,
-            pitch: self.pitch.round() as i32,
-            roll: 0,
+            pos: [x as i32, (self.y + self.bob()) as i32, z as i32],
+            yaw: (self.yaw + k.yaw).round() as i32,
+            pitch: (self.pitch + k.pitch).round() as i32,
+            roll: k.roll.round() as i32,
             h: H,
             fog_near: self.fog_near,
             fog_far: self.fog_far,
@@ -423,12 +477,13 @@ impl Walker {
         let feet = self.feet();
         let took_off = self.body.took_off;
         let (x0, z0) = (self.x, self.z);
+        let (dx, dz) = slide_round_creatures(scene, [x0, feet, z0], dx, dz);
         for (mx, mz) in [(dx, dz), (dx, 0.0), (0.0, dz)] {
             let (x, z) = (self.x + mx, self.z + mz);
             let free = match took_off {
                 Some(t) => Self::free_in_air(scene, x, z, feet, t),
                 None => Self::free(scene, x, z, from).is_some(),
-            };
+            } && !creature_in_way(scene, [x0, feet, z0], x, z);
             if (mx != 0.0 || mz != 0.0) && free {
                 self.x = x;
                 self.z = z;
@@ -490,6 +545,73 @@ mod tests {
         let scene = l.to_scene();
         let w = Walker::at(&scene, [1.5 * TF, 0.0, 1.5 * TF], 0.0, &mut Rng::new(1)).expect("standing");
         (scene, w)
+    }
+
+    /// The hall with a creature standing in the way, five tiles ahead, free to move.
+    fn hall_with_creature() -> (Scene, Walker) {
+        let (_, w) = hall();
+        let mut l = Level::new("hall");
+        for z in 0..20 {
+            for x in 0..3 {
+                l.open(x, z, 0, 12);
+            }
+        }
+        let kind = crate::world::creature::Kind::Humanoid;
+        l.entities.push(Entity { id: 2, kind: EntityKind::Creature { kind, size: 1.0, seed: 3 }, pos: [1.5 * TF, 0.0, 6.5 * TF], yaw: 0.0 });
+        let mut scene = l.to_scene();
+        scene.set_creatures_move(true);
+        (scene, w)
+    }
+
+    #[test]
+    fn creatures_stop_the_body_wherever_they_stand_and_the_dead_do_not() {
+        let (mut scene, mut w) = hall_with_creature();
+        let c = scene.creatures[0].clone();
+        assert!(c.girth > 0.0);
+        for _ in 0..200 {
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        }
+        let gap = (c.base[2] - w.z).hypot(c.base[0] - w.x);
+        assert!(gap >= c.girth + RADIUS - 1.0 && gap < c.girth + RADIUS + 2.0 * SPEED, "stopped {gap} from it");
+        // Walked off, it leaves nothing behind where it stood; and where it went, it blocks.
+        scene.creatures[0].base[2] = 15.5 * TF;
+        for _ in 0..200 {
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        }
+        assert!(w.z > 8.0 * TF && w.z < 15.5 * TF - c.girth - RADIUS + 1.0, "at {}", w.z / TF);
+        scene.creatures[0].girth = 0.0;
+        for _ in 0..200 {
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        }
+        assert!(w.z > 16.0 * TF, "the dead are in the way at {}", w.z / TF);
+    }
+
+    #[test]
+    fn a_body_slides_round_a_creature_and_backs_out_of_one() {
+        let (scene, mut w) = hall_with_creature();
+        let c = scene.creatures[0].clone();
+        // Walking at it a little to one side slides round its edge rather than sticking.
+        let near = c.girth + RADIUS;
+        w.x = 1.5 * TF + 0.3 * near;
+        let gap = |w: &Walker| (c.base[2] - w.z).hypot(c.base[0] - w.x);
+        for _ in 0..200 {
+            if gap(&w) < near + SPEED {
+                break;
+            }
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+        }
+        let before = w.x;
+        for _ in 0..3 {
+            w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
+            assert!(gap(&w) >= near - 1.0);
+        }
+        assert!(w.x > before + 1.0, "stuck on its front");
+        // Caught inside one (it walked into the body), the body can still step away.
+        w.x = c.base[0];
+        w.z = c.base[2] - 0.5 * c.girth;
+        let z = w.z;
+        w.drive(&scene, -1.0, 0.0, 0.0, 0.0);
+        assert!(w.z < z);
     }
 
     #[test]

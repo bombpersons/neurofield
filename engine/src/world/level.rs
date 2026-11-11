@@ -17,6 +17,21 @@ use std::path::Path;
 pub const VERSION: u32 = 1;
 const TF: f32 = T as f32;
 
+/// Every item a level can hold, lying about (`EntityKind::Item`) or in a chest, by the names
+/// the game knows them by (`Item::name` in the game, whose tests keep the two the same).
+pub const ITEMS: [&str; 10] = [
+    "healing potion",
+    "mana potion",
+    "clear seeing potion",
+    "calming potion",
+    "sword",
+    "buckler",
+    "leather cap",
+    "leather vest",
+    "work gloves",
+    "copper ring",
+];
+
 /// Compass directions on the grid: east is +x, south is +z.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Dir {
@@ -188,6 +203,10 @@ pub struct Strangeness {
     pub light_hues: (f32, f32),
 }
 
+fn one() -> u32 {
+    1
+}
+
 fn default_morph() -> (f32, f32) {
     crate::world::scene::MORPH
 }
@@ -255,7 +274,14 @@ pub enum EntityKind {
     /// Sits on the cell edge it faces across; `width` in tiles, `height` in layers.
     Door { width: i32, height: i32, hinge: Hinge, open: bool, locked: bool, key: Option<u32> },
     Key { name: String },
+    /// `contents` are item names (`ITEMS`), one a thing: a name twice is two of it.
     Chest { locked: bool, key: Option<u32>, contents: Vec<String> },
+    /// Things lying on the floor to be picked up: `count` of the item named `name` (`ITEMS`).
+    Item {
+        name: String,
+        #[serde(default = "one")]
+        count: u32,
+    },
     Creature { kind: Kind, size: f32, seed: u64 },
     /// `size` is (width, height, depth) in world units.
     Prop { shape: PropShape, size: [f32; 3], tex: u8, tint: [f32; 3] },
@@ -633,12 +659,17 @@ impl Level {
                     }
                     scene.span_mut(n).blocked = true;
                 }
-                // A stand-in until chests get their own mesh.
+                // The body; its lid is a thing (`things::Chest`).
                 EntityKind::Chest { .. } => {
-                    scene.add_box([x, floor, z], [0.3 * TF, 0.2 * TF], 0.35 * TF, e.yaw, 2, [0.7, 0.55, 0.4]);
+                    scene.add_box([x, floor, z], crate::world::things::CHEST, crate::world::things::CHEST_BODY, e.yaw, 2, [0.7, 0.55, 0.4]);
                     scene.span_mut(n).blocked = true;
                 }
-                EntityKind::PlayerStart | EntityKind::Door { .. } | EntityKind::Key { .. } | EntityKind::Lever { .. } => {}
+                // Items are the game's to draw and pick up.
+                EntityKind::PlayerStart
+                | EntityKind::Door { .. }
+                | EntityKind::Key { .. }
+                | EntityKind::Lever { .. }
+                | EntityKind::Item { .. } => {}
             }
         }
         scene.build_things(&self.entities);
@@ -702,11 +733,11 @@ mod tests {
             w.drive(&scene, 1.0, 0.0, 0.0, 0.0);
         }
         assert!(w.x < 6.0 * TF, "the locked door is in the way: x {}", w.x);
-        assert_eq!(scene.use_thing(at, east, &[]).as_deref(), Some("locked"));
+        assert_eq!(scene.use_thing(at, east, &[]).map(|u| u.said).as_deref(), Some("locked"));
         let keys = scene.take_pickups([1.5 * TF, 0.0, 3.5 * TF]);
-        assert_eq!(scene.use_thing(at, east, &keys).as_deref(), Some("unlocked with the iron key"));
+        assert_eq!(scene.use_thing(at, east, &keys).map(|u| u.said).as_deref(), Some("unlocked with the iron key"));
         // The lever, to the north, raises the portcullis at the top.
-        assert!(scene.use_thing(at, std::f32::consts::PI, &keys).unwrap().contains("lever"));
+        assert!(scene.use_thing(at, std::f32::consts::PI, &keys).unwrap().said.contains("lever"));
         for _ in 0..30 {
             scene.tick_things(0.1);
         }

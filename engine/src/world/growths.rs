@@ -156,7 +156,7 @@ pub struct Growths {
 impl Growths {
     /// None will grow in a level with no creature to borrow skins from.
     pub fn new(scene: &Scene) -> Growths {
-        let mut creature = Creature { base: [0.0; 3], yaw: 0.0, skins: Vec::new(), parts: Vec::new(), slots: Vec::new() };
+        let mut creature = Creature { base: [0.0; 3], yaw: 0.0, skins: Vec::new(), parts: Vec::new(), slots: Vec::new(), girth: 0.0 };
         if let Some(like) = scene.creatures.first() {
             creature.skins = like.skins.clone();
             creature.slots = like.slots.clone();

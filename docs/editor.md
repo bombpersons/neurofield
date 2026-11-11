@@ -163,7 +163,8 @@ default but stored as floats), a yaw, and properties that depend on its kind:
 | `PlayerStart` | (exactly one) |
 | `Door` | Sits on a cell face between two open cells. Width in tiles, height in layers, `hinge` (left, right, or slides up), `open` (starting state), `locked`, `key` (an entity id) |
 | `Key` | `name` (shown in the UI) |
-| `Chest` | `contents` (entity ids or item names), `locked`, `key` |
+| `Chest` | `contents` (item names, one a thing: a name twice is two of it), `locked`, `key` |
+| `Item` | `name` (an item name), `count` (1–99) |
 | `Creature` | `kind` (humanoid, beast, blob, floater, mass), `size`, `seed`, an optional skin motif, `extra_parts` |
 | `Prop` | `shape` (box, pillar, pyramid, floating cube, …), size, texture, tint |
 | `Light` | as in Lights above |
@@ -199,9 +200,18 @@ are part of the level:
   toggles its target doors, locked or not, and its handle flips over.
 - Keys lie on a small plinth until picked up. Levers stand on the floor and
   don't block the cell.
+- **Chests:** E (or circle) with a chest in front opens it, and a locked one
+  needs its key as a door does. Its lid swings back and what it holds goes into
+  the inventory; what there's no room for lands on the floor before it. Opened, it
+  stays open and empty. A chest blocks its cell.
+- **Items** lie on the floor as the game's dropped things do, and walking over
+  one picks it up.
+- Item names are the game's (`engine::world::level::ITEMS`, kept the same as the
+  game's items by its tests). The Properties window picks them from a list, and
+  the Issues window warns about a name the game doesn't know.
 
-Door states aren't saved in the level file: every play starts from each door's
-`open` setting.
+Door, chest and item states aren't saved in the level file: every play starts
+from the level as built.
 
 ## File format
 
@@ -332,7 +342,7 @@ the mouse drives the 3D camera. The PS1 view mode fills the window the same way.
 | Edit | Undo, Redo, Cut, Copy, Paste, Duplicate, Delete, Select all, Select none, Preferences |
 | View | Each window on or off, Reset layout, viewport mode (plain / PS1 / neural), Grid, Strangeness overlay (blue where grounded, through teal and yellow, to magenta; also the viewport's *Strange* toggle), Links, Lights, Height slice up/down |
 | Tools | One entry per tool, with its shortcut |
-| Play | Play, Play from here |
+| Play | Play, Play from here, Flesh walls (play with the level turning to flesh, `game --sculpt` with `neurofield.ron`'s `eyes`) |
 
 **Status bar**, left to right:
 - the current tool's hint;
@@ -371,13 +381,20 @@ The layout is saved between sessions.
   would, with the tools' outlines and entity markers drawn over it. Without a
   model the editor says so and stays in Plain.
 
-In every mode creatures are drawn in full colour as the game draws them (the
-**Flesh** toggle, also in the View menu). Sculpting one takes 30–400 ms, so each
-is sculpted in the background once the level has been still for a moment, and
-kept by its shape: until then it is drawn through the PS1 pipeline like the
-level. Moving a light only bakes a kept sculpt's light again; moving, resizing
-or re-rolling a creature sculpts it afresh. The status bar counts sculpts in
-progress.
+In every mode creatures are drawn by the dream net as the game draws them (the
+**Flesh** toggle, also in the View menu as Dream-net creatures), found through
+`neurofield.ron`'s `dream`. They stand as placed: nothing walks them about. The
+dream net runs on a worker thread that always draws the newest view (about 65 ms
+on an RX 580). In Plain and PS1 it draws a 240-line picture the window's shape,
+laid into the view behind the level as the game's rasteriser does; in Neural the
+network's worker lays it over each frame. Without a dream net, or with the toggle
+off, they are PS1 models. Each creature's look follows the creature set, so moving
+a light or a wall keeps it, while adding, moving or re-rolling a creature gives
+them all new looks. The status bar says what the dream net is doing.
+
+Both networks share one GPU adapter, found before Bevy starts drawing
+(`engine::neural::gpu`): looking for adapters on a worker thread while Bevy draws
+can crash the Vulkan loader.
 
 ### Camera
 

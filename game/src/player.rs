@@ -17,32 +17,54 @@ pub enum Item {
     CopperRing,
 }
 
-/// Where something is worn.
+/// Where something is worn. Either hand takes a weapon or a shield.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
-    Weapon,
-    Shield,
+    RightHand,
+    LeftHand,
     Helmet,
     Armour,
     Gloves,
     Ring,
 }
 
-/// The equipment slots in order, as the inventory lists them: two for rings.
-pub const EQUIPMENT: [Slot; 7] = [Slot::Weapon, Slot::Shield, Slot::Helmet, Slot::Armour, Slot::Gloves, Slot::Ring, Slot::Ring];
+/// The equipment slots in order, as the inventory lists them: the hands first, two for rings.
+pub const EQUIPMENT: [Slot; 7] = [Slot::RightHand, Slot::LeftHand, Slot::Helmet, Slot::Armour, Slot::Gloves, Slot::Ring, Slot::Ring];
 
 impl Slot {
     pub fn name(self) -> &'static str {
         match self {
-            Slot::Weapon => "Weapon",
-            Slot::Shield => "Shield",
+            Slot::RightHand => "Right",
+            Slot::LeftHand => "Left",
             Slot::Helmet => "Helmet",
             Slot::Armour => "Armour",
             Slot::Gloves => "Gloves",
             Slot::Ring => "Ring",
         }
     }
+
+    /// The name heading its window.
+    pub fn title(self) -> &'static str {
+        match self {
+            Slot::RightHand => "Right hand",
+            Slot::LeftHand => "Left hand",
+            _ => self.name(),
+        }
+    }
+
+    fn hand(self) -> bool {
+        matches!(self, Slot::RightHand | Slot::LeftHand)
+    }
 }
+
+/// Which hand: its equipment slot is `EQUIPMENT[side as usize]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Right,
+    Left,
+}
+
+pub const SIDES: [Side; 2] = [Side::Right, Side::Left];
 
 /// Attack, defence and magic, the player's own or what a piece of gear adds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,6 +82,24 @@ impl std::ops::Add for Stats {
 }
 
 impl Item {
+    pub const ALL: [Item; 10] = [
+        Item::HealingPotion,
+        Item::ManaPotion,
+        Item::ClearSeeingPotion,
+        Item::CalmingPotion,
+        Item::Sword,
+        Item::Buckler,
+        Item::LeatherCap,
+        Item::LeatherVest,
+        Item::WorkGloves,
+        Item::CopperRing,
+    ];
+
+    /// The item a level names (`engine::world::level::ITEMS`).
+    pub fn named(name: &str) -> Option<Item> {
+        Item::ALL.into_iter().find(|i| i.name() == name)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Item::HealingPotion => "healing potion",
@@ -91,17 +131,26 @@ impl Item {
         }
     }
 
-    /// Where it's worn, for gear.
+    /// Where it's worn, for gear: for what's held, the hand it goes in first.
     pub fn slot(self) -> Option<Slot> {
         match self {
-            Item::Sword => Some(Slot::Weapon),
-            Item::Buckler => Some(Slot::Shield),
+            Item::Sword => Some(Slot::RightHand),
+            Item::Buckler => Some(Slot::LeftHand),
             Item::LeatherCap => Some(Slot::Helmet),
             Item::LeatherVest => Some(Slot::Armour),
             Item::WorkGloves => Some(Slot::Gloves),
             Item::CopperRing => Some(Slot::Ring),
             _ => None,
         }
+    }
+
+    /// Whether it can be worn in `slot`: what's held goes in either hand.
+    pub fn fits(self, slot: Slot) -> bool {
+        self.slot().is_some_and(|s| s == slot || s.hand() && slot.hand())
+    }
+
+    pub fn is_shield(self) -> bool {
+        self == Item::Buckler
     }
 
     /// What wearing it adds.
@@ -126,6 +175,9 @@ const HEAL: i32 = 15;
 const RESTORE: i32 = 6;
 /// How fast affliction rises by itself, per second: from nothing to all in ten minutes.
 const AFFLICTION_RISE: f32 = 1.0 / 600.0;
+/// Stamina: the most, and how much comes back a second while no shield is held up.
+pub const STAMINA: f32 = 40.0;
+const RECOVER: f32 = 10.0;
 /// How long a clear seeing potion lasts, in seconds: the plain picture shows for about ten
 /// of them, the rest being the fades.
 pub const CLARITY_SECS: f32 = 12.0;
@@ -139,6 +191,8 @@ pub struct Player {
     pub affliction: f32,
     /// Seconds left of seeing the dungeon as it is.
     pub clarity: f32,
+    /// What holding up a shield, being hit and attacking use up, 0..`STAMINA`.
+    pub stamina: f32,
     /// What is carried and how many, in the order first picked up.
     pub items: Vec<(Item, u32)>,
     pub hotbar: [Option<Item>; SLOTS],
@@ -155,16 +209,17 @@ impl Player {
             max_mp: 12,
             affliction: 0.0,
             clarity: 0.0,
+            stamina: STAMINA,
             items: Vec::new(),
             hotbar: [None; SLOTS],
             equipped: [None; EQUIPMENT.len()],
         };
         p.equipped[0] = Some(Item::Sword);
+        p.equipped[1] = Some(Item::Buckler);
         p.add(Item::HealingPotion, 3);
         p.add(Item::ManaPotion, 2);
         p.add(Item::ClearSeeingPotion, 2);
         p.add(Item::CalmingPotion, 1);
-        p.add(Item::Buckler, 1);
         p.add(Item::LeatherCap, 1);
         p.add(Item::LeatherVest, 1);
         p.add(Item::WorkGloves, 1);
@@ -187,7 +242,7 @@ impl Player {
     /// Wear one of `item` in equipment slot `at`, the one there going back into the bag.
     /// False if it doesn't go there, none is carried, or there's no room for the old one.
     pub fn equip(&mut self, item: Item, at: usize) -> bool {
-        if item.slot() != Some(EQUIPMENT[at]) || self.count(item) == 0 {
+        if !item.fits(EQUIPMENT[at]) || self.count(item) == 0 {
             return false;
         }
         if let Some(old) = self.equipped[at] {
@@ -202,9 +257,11 @@ impl Player {
         true
     }
 
-    /// Where `item` would go on: its slot, or for a ring the first free ring slot.
+    /// Where `item` would go on: the first free slot it fits, its own first (a weapon's the
+    /// right hand, a shield's the left), else its own.
     pub fn slot_for(&self, item: Item) -> Option<usize> {
-        let fits: Vec<usize> = (0..EQUIPMENT.len()).filter(|&i| Some(EQUIPMENT[i]) == item.slot()).collect();
+        let mut fits: Vec<usize> = (0..EQUIPMENT.len()).filter(|&i| item.fits(EQUIPMENT[i])).collect();
+        fits.sort_by_key(|&i| Some(EQUIPMENT[i]) != item.slot());
         fits.iter().copied().find(|&i| self.equipped[i].is_none()).or(fits.first().copied())
     }
 
@@ -227,8 +284,21 @@ impl Player {
         had
     }
 
-    pub fn weapon(&self) -> Option<Item> {
-        self.equipped[0]
+    /// What is held in a hand.
+    pub fn hand(&self, side: Side) -> Option<Item> {
+        self.equipped[side as usize]
+    }
+
+    /// The attack of a blow from the weapon in hand `side`: the other hand's weapon doesn't
+    /// add to it.
+    pub fn attack_with(&self, side: Side) -> i32 {
+        let other = 1 - side as usize;
+        self.stats_with(other, None).attack
+    }
+
+    /// Use up `n` stamina.
+    pub fn tire(&mut self, n: f32) {
+        self.stamina = (self.stamina - n).max(0.0);
     }
 
     pub fn count(&self, item: Item) -> u32 {
@@ -278,9 +348,13 @@ impl Player {
         self.affliction = (self.affliction + n).clamp(0.0, 1.0);
     }
 
-    /// `dt` seconds pass: clarity runs out and affliction creeps up.
-    pub fn update(&mut self, dt: f32) {
+    /// `dt` seconds pass: clarity runs out, affliction creeps up and stamina comes back,
+    /// unless a shield is held up (`guarding`).
+    pub fn update(&mut self, dt: f32, guarding: bool) {
         self.clarity = (self.clarity - dt).max(0.0);
+        if !guarding {
+            self.stamina = (self.stamina + RECOVER * dt).min(STAMINA);
+        }
         self.afflict(AFFLICTION_RISE * dt);
     }
 
@@ -341,6 +415,14 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn levels_name_the_same_items() {
+        let names: Vec<&str> = Item::ALL.iter().map(|i| i.name()).collect();
+        assert_eq!(names, engine::world::level::ITEMS);
+        assert_eq!(Item::named("copper ring"), Some(Item::CopperRing));
+        assert_eq!(Item::named("a sandwich"), None);
+    }
 
     #[test]
     fn starts_with_potions_on_the_hotbar() {
@@ -412,7 +494,9 @@ mod tests {
     #[test]
     fn gear_is_worn_in_its_slot_and_the_old_piece_comes_back() {
         let mut p = Player::new();
-        assert_eq!(p.stats(), Stats { attack: 5, defence: 0, magic: 0 });
+        assert_eq!(p.stats(), Stats { attack: 5, defence: 2, magic: 0 });
+        assert!(p.unequip(1));
+        assert_eq!(p.stats().defence, 0);
         assert!(!p.equip(Item::Buckler, 2));
         p.items.retain(|s| s.0 != Item::LeatherVest);
         assert!(!p.equip(Item::LeatherVest, 3));
@@ -424,6 +508,40 @@ mod tests {
         assert_eq!(p.stats().attack, 0);
         assert_eq!(p.stats_with(0, Some(Item::Sword)).attack, 5);
         assert!(!p.unequip(0));
+    }
+
+    #[test]
+    fn either_hand_holds_a_weapon_or_a_shield() {
+        let mut p = Player::new();
+        p.unequip(0);
+        p.unequip(1);
+        assert_eq!(p.slot_for(Item::Sword), Some(0));
+        assert_eq!(p.slot_for(Item::Buckler), Some(1));
+        assert!(p.equip(Item::Sword, 1));
+        assert!(p.equip(Item::Buckler, 0));
+        assert_eq!((p.hand(Side::Right), p.hand(Side::Left)), (Some(Item::Buckler), Some(Item::Sword)));
+        assert!(!p.equip(Item::LeatherCap, 0));
+        // A second sword: each hand's blow is its own.
+        p.unequip(0);
+        p.add(Item::Sword, 1);
+        assert!(p.equip(Item::Sword, 0));
+        assert_eq!(p.stats().attack, 10);
+        assert_eq!(p.attack_with(Side::Left), 5);
+    }
+
+    #[test]
+    fn stamina_comes_back_steadily_but_not_behind_a_shield() {
+        let mut p = Player::new();
+        p.tire(30.0);
+        assert_eq!(p.stamina, STAMINA - 30.0);
+        p.update(1.0, true);
+        assert_eq!(p.stamina, STAMINA - 30.0);
+        p.update(1.0, false);
+        assert_eq!(p.stamina, STAMINA - 30.0 + RECOVER);
+        p.update(10.0, false);
+        assert_eq!(p.stamina, STAMINA);
+        p.tire(99.0);
+        assert_eq!(p.stamina, 0.0);
     }
 
     #[test]
@@ -461,9 +579,9 @@ mod tests {
     #[test]
     fn affliction_creeps_up_and_stops_at_all() {
         let mut p = Player::new();
-        p.update(60.0);
+        p.update(60.0, false);
         assert!((p.affliction - 0.1).abs() < 1e-5);
-        p.update(6000.0);
+        p.update(6000.0, false);
         assert_eq!(p.affliction, 1.0);
     }
 
@@ -475,7 +593,7 @@ mod tests {
         assert_eq!(p.clarity, CLARITY_SECS);
         assert_eq!(p.count(Item::ClearSeeingPotion), 1);
         assert_eq!(p.affliction, 0.5);
-        p.update(CLARITY_SECS);
+        p.update(CLARITY_SECS, false);
         assert_eq!(p.clarity, 0.0);
         assert!(p.affliction > 0.5);
     }

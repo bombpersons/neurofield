@@ -12,7 +12,6 @@ use engine::world::scene::{Camera as PsxCamera, Scene, STEP};
 use engine::world::tex;
 pub use engine::render::{dir_to_world, to_view, to_world, TF};
 use psx_bevy::psx::{PsxLook, PsxScreen};
-use std::collections::HashSet;
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -106,16 +105,17 @@ pub struct Built {
     pub cut_at: Option<i32>,
     pub show_grid: bool,
     pub show_entities: bool,
-    /// Creatures in full colour once sculpted (see `crate::flesh`), else as PS1 meshes.
+    /// Creatures drawn by the dream net, as the game draws them (see `crate::dream`), else as
+    /// PS1 meshes.
     pub full_colour: bool,
+    /// The dream net is drawing them, so `parts` leaves their PS1 meshes out.
+    pub dreamed: bool,
     /// `Creature::shape_hash` of each of the scene's creatures.
     pub shapes: Vec<u64>,
-    /// When the level last changed (`Time::elapsed_secs_f64`).
-    pub changed_at: f64,
     /// The level's mesh entities.
     pub parts: Vec<Entity>,
-    /// Shapes of the creatures left out of `parts` because they are shown in full colour.
-    pub hidden: Vec<u64>,
+    /// Whether `parts` left the creatures out.
+    pub hidden: bool,
     /// Outlines from the current tool, drawn over the level.
     pub lines: Vec<(Vec3, Vec3, Color)>,
     /// The strangeness overlay: switched on, or on because the Strangeness tool is.
@@ -165,7 +165,7 @@ fn tint(scene: &mut Scene) {
 /// The level with everything from `CUT_ABOVE` layers above `slice` filled in, and
 /// the entities up there left out. From above, the fill's undersides are back faces,
 /// so the cut shows as open tops.
-fn cut_level(level: &engine::world::level::Level, slice: i32) -> engine::world::level::Level {
+pub fn cut_level(level: &engine::world::level::Level, slice: i32) -> engine::world::level::Level {
     let mut l = level.clone();
     let top = slice + CUT_ABOVE;
     let keys: Vec<_> = l.columns.keys().copied().collect();
@@ -204,17 +204,9 @@ pub fn rgb_image(w: u32, h: u32, rgb: &[u8]) -> Image {
     image
 }
 
-/// Rebuild the scene when the level changes, and its meshes when it or the set of
-/// creatures shown in full colour does.
-#[allow(clippy::too_many_arguments)]
-pub fn rebuild(
-    mut commands: Commands,
-    doc: Res<crate::Document>,
-    time: Res<Time>,
-    mut built: ResMut<Built>,
-    mut sculpts: ResMut<crate::flesh::Sculpts>,
-    mut gfx: engine::render::Gfx,
-) {
+/// Rebuild the scene when the level changes, and its meshes when it does or the dream net
+/// takes over the creatures or gives them back.
+pub fn rebuild(mut commands: Commands, doc: Res<crate::Document>, mut built: ResMut<Built>, mut gfx: engine::render::Gfx) {
     let cut_at = built.cut.then_some(built.slice);
     let tinted = built.overlay_on();
     let changed = built.version != doc.0.version || built.version == 0 || built.cut_at != cut_at || built.tinted != tinted;
@@ -236,42 +228,22 @@ pub fn rebuild(
             tint(&mut built.scene);
         }
         built.shapes = built.scene.creatures.iter().map(|c| c.shape_hash()).collect();
-        built.changed_at = time.elapsed_secs_f64();
     }
-    let ready: Vec<u64> = if built.full_colour {
-        built.shapes.iter().copied().filter(|&s| sculpts.is_done(s)).collect()
-    } else {
-        Vec::new()
-    };
-    if !changed && ready == built.hidden {
+    let hide = built.dreamed;
+    if !changed && hide == built.hidden {
         return;
     }
     let b = &mut *built;
     for e in b.parts.drain(..) {
         commands.entity(e).despawn();
     }
-    // The level without the PS1 meshes of creatures drawn in full colour.
-    let all = if ready.is_empty() {
-        None
-    } else {
-        let hide: HashSet<u64> = ready.iter().copied().collect();
-        let kept = b
-            .scene
-            .creature_spans
-            .iter()
-            .zip(&b.shapes)
-            .filter(|(_, s)| !hide.contains(s))
-            .flat_map(|(span, _)| b.scene.creature_tris[span.clone()].iter().copied())
-            .collect();
-        Some(std::mem::replace(&mut b.scene.creature_tris, kept))
-    };
+    // The level without the PS1 meshes of the creatures the dream net draws.
+    let all = hide.then(|| std::mem::take(&mut b.scene.creature_tris));
     b.parts = engine::render::spawn(&mut commands, &mut gfx, &b.scene);
     if let Some(all) = all {
         b.scene.creature_tris = all;
     }
-    let shown = if b.full_colour { &b.shapes[..] } else { &[] };
-    sculpts.show(&mut commands, &mut gfx, &b.scene, shown);
-    b.hidden = ready;
+    b.hidden = hide;
 }
 
 /// Fly with the right mouse button held (WASD, Q/E down/up, Shift faster), orbit
@@ -415,5 +387,6 @@ pub fn entity_colour(k: &EntityKind) -> Color {
         EntityKind::Chest { .. } => Color::srgb(0.7, 0.45, 0.2),
         EntityKind::Prop { .. } => Color::srgb(0.6, 0.6, 0.7),
         EntityKind::Lever { .. } => Color::srgb(0.4, 0.8, 1.0),
+        EntityKind::Item { .. } => Color::srgb(0.85, 0.4, 1.0),
     }
 }

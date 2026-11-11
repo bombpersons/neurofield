@@ -223,7 +223,9 @@ impl Material for DreamMaterial {
 /// Creatures drawn some other way than as flesh (the dream net draws them as a picture),
 /// to be hidden by the level and the flesh in front of them as the flesh is, and laid over
 /// the screen with it. `colour` is [H][W] RGBA32 floats, encoded colour and straight
-/// alpha; `near` is [H][W] R32 floats, their depth in tiles. Shown while `on`.
+/// alpha; `near` is [H][W] R32 floats, their depth in tiles. Either may be replaced with
+/// another size of the screen's shape (the editor's are 240 lines at any resolution); they
+/// are stretched over it. Shown while `on`.
 #[derive(Resource)]
 pub struct DreamCreatures {
     pub colour: Handle<Image>,
@@ -247,12 +249,24 @@ fn float_image(format: TextureFormat, texel: usize) -> Image {
     image
 }
 
-fn dream_on(dream: Res<DreamCreatures>, mut quads: Query<&mut Visibility, With<DreamQuad>>) {
+fn dream_on(
+    dream: Res<DreamCreatures>,
+    images: Res<Assets<Image>>,
+    mut materials: ResMut<Assets<DreamMaterial>>,
+    mut size: Local<UVec2>,
+    mut quads: Query<&mut Visibility, With<DreamQuad>>,
+) {
     let want = if dream.on { Visibility::Visible } else { Visibility::Hidden };
     for mut v in &mut quads {
         if *v != want {
             *v = want;
         }
+    }
+    // Pictures of a new size are new textures, which the material must be bound to afresh.
+    let now = images.get(&dream.colour).map_or(UVec2::ZERO, |i| i.size());
+    if *size != now {
+        *size = now;
+        for _ in materials.iter_mut() {}
     }
 }
 

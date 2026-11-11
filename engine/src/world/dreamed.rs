@@ -489,7 +489,7 @@ fn mouth(at: [f32; 3], n: [f32; 3], across: [f32; 3], up: [f32; 3], r: f32, rng:
         tooth.taper = 0.1;
         parts.push(tooth);
     }
-    (Creature { base: [0.0; 3], yaw: 0.0, slots: vec![0; skins.len()], skins, parts }, wide, open)
+    (Creature { base: [0.0; 3], yaw: 0.0, slots: vec![0; skins.len()], skins, parts, girth: 0.0 }, wide, open)
 }
 
 /// Put a sphincter on the wall at `at`, with veins leading away from it.

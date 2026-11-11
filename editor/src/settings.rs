@@ -16,6 +16,8 @@ pub struct Settings {
     pub mode: ViewMode,
     /// Creatures in full colour, as the game draws them.
     pub full_colour: bool,
+    /// Play with the level's walls turned to flesh (`game --sculpt`).
+    pub play_flesh: bool,
     /// The agent server (Tools > Agents): whether it runs, its port and token.
     pub agents_on: bool,
     pub agents_port: u16,
@@ -33,6 +35,7 @@ impl Default for Settings {
             dock: crate::ui::default_dock(),
             mode: ViewMode::Plain,
             full_colour: true,
+            play_flesh: false,
             agents_on: false,
             agents_port: 7801,
             agents_token: String::new(),

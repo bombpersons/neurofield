@@ -463,22 +463,8 @@ impl GpuNet {
             end: alloc(0),
         };
 
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no GPU adapter: {e}"))?;
         let bytes = s.end as u64 * 4;
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(bytes);
-        limits.max_buffer_size = limits.max_buffer_size.max(bytes);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("neurofield"),
-            required_limits: limits,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("GPU device: {e}"))?;
+        let (device, queue, adapter) = crate::neural::gpu::device("neurofield", bytes)?;
 
         let mem = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mem"),
@@ -587,7 +573,7 @@ impl GpuNet {
             proj,
             ups,
             rgb,
-            adapter: adapter.get_info().name,
+            adapter,
         })
     }
 

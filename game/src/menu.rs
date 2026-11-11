@@ -63,7 +63,7 @@ pub fn choices(player: &Player, item: Item) -> Vec<Choice> {
 /// taking off what is worn (`None`).
 pub fn gear_choices(player: &Player, at: usize) -> Vec<Option<Item>> {
     let mut out: Vec<Option<Item>> =
-        player.items.iter().filter(|s| s.0.slot() == Some(EQUIPMENT[at])).map(|s| Some(s.0)).collect();
+        player.items.iter().filter(|s| s.0.fits(EQUIPMENT[at])).map(|s| Some(s.0)).collect();
     if player.equipped[at].is_some() {
         out.push(None);
     }
@@ -406,6 +406,7 @@ mod tests {
         presses(&mut m, &mut p, &[Press::Slot(0)]);
         assert_eq!(p.hotbar[0], Some(Item::ClearSeeingPotion));
         assert_eq!(p.hotbar[2], None);
+        p.unequip(1);
         let buckler = p.items.iter().position(|s| s.0 == Item::Buckler).unwrap();
         let mut m = at(buckler);
         presses(&mut m, &mut p, &[Press::Slot(1)]);
@@ -458,7 +459,8 @@ mod tests {
         let mut m = Menu::inventory();
         presses(&mut m, &mut p, &[Press::Right, Press::Down]);
         assert_eq!(m.screen, Screen::Inventory { row: 0, gear: Some(1), window: None });
-        // The shield slot offers the buckler and nothing to take off.
+        // With the buckler taken off, the left hand offers it and nothing to take off.
+        p.unequip(1);
         assert_eq!(gear_choices(&p, 1), [Some(Item::Buckler)]);
         presses(&mut m, &mut p, &[Press::Confirm, Press::Confirm]);
         assert_eq!(p.equipped[1], Some(Item::Buckler));

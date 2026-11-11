@@ -149,6 +149,7 @@ pub fn entity_icon(kind: &EntityKind) -> &'static str {
         EntityKind::Chest { .. } => i::TREASURE_CHEST,
         EntityKind::Prop { .. } => i::PACKAGE,
         EntityKind::Lever { .. } => i::JOYSTICK,
+        EntityKind::Item { .. } => i::FLASK,
     }
 }
 
@@ -162,6 +163,7 @@ pub fn entity_kinds() -> Vec<(&'static str, EntityKind)> {
         ("Chest", EntityKind::Chest { locked: false, key: None, contents: Vec::new() }),
         ("Prop", EntityKind::Prop { shape: PropShape::Box, size: [80.0, 120.0, 80.0], tex: 2, tint: [0.8, 0.75, 0.7] }),
         ("Lever", EntityKind::Lever { targets: Vec::new() }),
+        ("Item", EntityKind::Item { name: engine::world::level::ITEMS[0].into(), count: 1 }),
     ]
 }
 

@@ -23,9 +23,11 @@ struct Out {
 
 @fragment
 fn fragment(@builtin(position) position: vec4<f32>) -> Out {
-    // The flesh image has two samples a screen pixel along each axis.
+    // The pictures cover the screen, whatever their size: the game's are the screen's, the
+    // editor's 240 lines however big its view (the flesh image has two samples a screen
+    // pixel along each axis).
     let size = vec2<i32>(textureDimensions(colour));
-    let at = min(vec2<i32>(position.xy) / 2, size - 1);
+    let at = min(vec2<i32>(position.xy / view.viewport.zw * vec2<f32>(size)), size - 1);
     let c = textureLoad(colour, at, 0);
     if c.a <= 0.0 {
         discard;

@@ -117,6 +117,15 @@ pub fn check(l: &Level, scene: &Scene) -> (Vec<Issue>, Option<Budget>) {
                 out.push(issue(Group::Keys, Severity::Error, format!("{} #{} needs key #{k}, which isn't a key", crate::ui::kind_name(&e.kind), e.id), Some(e.pos), Some(e.id)));
             }
         }
+        let names: &[String] = match &e.kind {
+            EntityKind::Item { name, .. } => std::slice::from_ref(name),
+            EntityKind::Chest { contents, .. } => contents,
+            _ => &[],
+        };
+        for name in names.iter().filter(|n| !engine::world::level::ITEMS.contains(&n.as_str())) {
+            let text = format!("{} #{} holds {name:?}, which the game has no item for", crate::ui::kind_name(&e.kind), e.id);
+            out.push(issue(Group::Entities, Severity::Warning, text, Some(e.pos), Some(e.id)));
+        }
         if let EntityKind::Lever { targets } = &e.kind {
             for t in targets {
                 if !l.entities.iter().any(|o| o.id == *t && matches!(o.kind, EntityKind::Door { .. })) {

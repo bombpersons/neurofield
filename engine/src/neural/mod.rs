@@ -1,12 +1,14 @@
 //! The neural renderer: the trained network drawing a scene from what it is
 //! told about it. `features` and `tokens` build its inputs (the same floats the
 //! training data stores), `gpu_net` runs it as WGSL compute shaders through wgpu
-//! (Vulkan, Metal or DX12), and `effects` disturb it in dreamlike ways.
+//! (Vulkan, Metal or DX12) on the GPU `gpu` finds, and `effects` disturb it in
+//! dreamlike ways.
 
 pub mod dream;
 pub mod dream_net;
 pub mod effects;
 pub mod features;
+pub mod gpu;
 pub mod gpu_net;
 pub mod tokens;
 

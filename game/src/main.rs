@@ -18,12 +18,14 @@
 //!     `--affliction 0.7` starts the player that afflicted, to try how it looks.
 //!     `--level-file levels/x.ron` plays a hand-built level (see `engine::world::level`) from its
 //!     player start, or from `--start x,y,z,yaw` (world units, yaw in radians); N reloads it.
-//!     E (or circle) opens and closes the door in front, or pulls the lever; walking over a
-//!     key picks it up, and locked doors open for their key.
-//!     Mouse: look   Right click: attack   WASD: walk and strafe   Arrows: walk and turn   Space: jump
+//!     E (or circle) opens and closes the door in front, pulls the lever, or opens the chest
+//!     (what it holds goes into the inventory); walking over a key or an item picks it up,
+//!     and locked doors and chests open for their key.
+//!     Mouse: look   Left / right click: the left / right hand's weapon swings, or shield goes
+//!     up while held   WASD: walk and strafe   Arrows: walk and turn   Space: jump
 //!     Shift: sprint   1-4: use the hotbar   Esc: the pause menu (`menu`), which frees the mouse
 //!     Gamepad: left stick walk and strafe, right stick look, cross jump, L3 sprint,
-//!     R2 attack, circle use, d-pad use the hotbar, start the pause menu
+//!     R2 / L2 the right / left hand (as the clicks), circle use, d-pad use the hotbar, start the pause menu
 //!     In the menus: arrows or WASD (d-pad) move, Enter, Space or E (cross) choose, Esc or
 //!     Backspace (circle) go back; the mouse points and clicks, right click goes back. In the
 //!     inventory, 1-4 (square + d-pad) put the item picked on that hotbar slot.
@@ -73,13 +75,20 @@ use engine::neural::{effects, Level, Network, TICK};
 
 mod hud;
 mod drops;
+mod foes;
 mod menu;
 mod player;
-mod sword;
+mod hands;
+use hands::Hands;
 use hud::HudState;
 use menu::{Menu, Outcome, Press};
-use player::Player;
-use sword::Sword;
+use player::{Player, Side, SIDES};
+
+/// Stamina a swing uses, and holding up a shield uses a second.
+const SWING_TIRE: f32 = 7.0;
+const GUARD_TIRE: f32 = 4.0;
+/// A laboured swing, with no stamina left, does this share of the attack (at least 1).
+const LABOURED: i32 = 5;
 
 /// Mouse sensitivity: yaw units (4096 per turn) per pixel of mouse movement.
 const LOOK: f32 = 1.2;
@@ -159,7 +168,15 @@ struct Sim {
     /// What last happened (a door, a key), and seconds left to show it.
     said: Option<(String, f32)>,
     player: Player,
-    sword: Sword,
+    hands: Hands,
+    /// Each hand's button held (right, left), on the mouse and on the pad.
+    mouse_arms: [bool; 2],
+    pad_arms: [bool; 2],
+    /// The creatures as foes, the strikes and spells their animators said went off since the
+    /// last tick, and the attack of the blades that swept through since then.
+    foes: foes::Foes,
+    cues: Vec<(usize, engine::world::animate::Cue)>,
+    struck: Option<i32>,
     /// Whether the controller was the last thing used, for the shape of the hotbar.
     on_pad: bool,
     /// The pause menu, while it's open; the game stands still under it.
@@ -223,13 +240,33 @@ impl Sim {
         self.mode = if self.mode == Mode::Network { Mode::Raster } else { Mode::Network };
     }
 
-    /// Use whatever is in front: a door or a lever.
+    /// Use whatever is in front: a door, a lever or a chest. What a chest holds goes into
+    /// the inventory, or on the floor before it when there's no room.
     fn use_thing(&mut self) {
         let (feet, yaw) = self.feet();
         let held = self.held.clone();
-        if let Some(what) = self.level.scene.use_thing(feet, yaw, &held) {
-            self.say(what);
+        let Some(used) = self.level.scene.use_thing(feet, yaw, &held) else { return };
+        let mut said = used.said;
+        let mut found = Vec::new();
+        let mut spilled = false;
+        for name in &used.items {
+            let Some(item) = player::Item::named(name) else {
+                eprintln!("a chest holds {name:?}, which isn't an item");
+                continue;
+            };
+            found.push(item.name());
+            if self.player.add(item, 1) > 0 {
+                self.drops.push(drops::lying(&self.level.scene, item, used.spill.unwrap_or(feet)));
+                spilled = true;
+            }
         }
+        if !found.is_empty() {
+            said = format!("{said}: {}", found.join(", "));
+            if spilled {
+                said += " (no room for some; they're on the floor)";
+            }
+        }
+        self.say(said);
     }
 
     /// A new level, or the file again (it may have been edited), its own strangeness
@@ -240,7 +277,10 @@ impl Sim {
         self.drops.clear();
         match &self.file {
             Some(f) => match load_level(f, self.start, &mut self.rng) {
-                Ok(level) => self.level = level,
+                Ok((level, lying)) => {
+                    self.level = level;
+                    self.drops = lying;
+                }
                 Err(e) => eprintln!("{e}"),
             },
             None => {
@@ -313,6 +353,9 @@ impl Sim {
     }
 
     fn jump(&mut self) {
+        if self.hands.stunned() {
+            return;
+        }
         let level = &mut self.level;
         level.walker.jump(&level.scene);
     }
@@ -330,6 +373,50 @@ impl Sim {
         self.player.afflict(0.1);
     }
 
+    /// Hand `side`'s button went down: a weapon there swings, laboured with no stamina
+    /// left. A shield goes up while the button is held (`update_hud`).
+    fn press_arm(&mut self, side: Side) {
+        if !self.in_control() {
+            return;
+        }
+        let tired = self.player.stamina <= 0.0;
+        if self.hands.swing(side, tired) {
+            self.player.tire(if tired { 0.0 } else { SWING_TIRE });
+        }
+    }
+
+    /// The creatures come for the player, and the sword finds them. Holding up a shield
+    /// tires the player, and it comes down when they're spent.
+    fn fight(&mut self) {
+        let cues = std::mem::take(&mut self.cues);
+        let struck = std::mem::take(&mut self.struck);
+        if self.auto_walk {
+            return;
+        }
+        let dt = 1.0 / TICK as f32;
+        if self.hands.guarding() {
+            self.player.tire(GUARD_TIRE * dt);
+            if self.player.stamina <= 0.0 {
+                self.hands.give_out();
+            }
+        }
+        let (feet, yaw) = self.feet();
+        let stats = self.player.stats();
+        let target = foes::Target { feet, yaw, guarding: self.hands.guarding(), stamina: self.player.stamina, struck, defence: stats.defence };
+        let out = self.foes.tick(self.version, self.herd.animators(), &self.level.scene.creatures, &cues, &target, dt, &mut self.rng);
+        self.player.hurt(out.hurt);
+        self.player.afflict(out.afflict);
+        self.player.tire(out.tired);
+        if out.broken {
+            self.hands.break_guard();
+        } else if out.blocked {
+            self.hands.knock();
+        }
+        if let Some(what) = out.said {
+            self.say(what);
+        }
+    }
+
     /// The walker's feet, and which way it faces in radians.
     fn feet(&self) -> ([f32; 3], f32) {
         let w = &self.level.walker;
@@ -337,9 +424,12 @@ impl Sim {
     }
 }
 
-fn load_level(file: &std::path::Path, start: Option<([f32; 3], f32)>, rng: &mut Rng) -> Result<Level, String> {
+/// A hand-built level, and the items lying about in it.
+fn load_level(file: &std::path::Path, start: Option<([f32; 3], f32)>, rng: &mut Rng) -> Result<(Level, Vec<drops::Dropped>), String> {
     let level = engine::world::level::Level::load(file)?;
-    Level::from_file(&level, start, rng).map_err(|e| format!("{}: {e}", file.display()))
+    let built = Level::from_file(&level, start, rng).map_err(|e| format!("{}: {e}", file.display()))?;
+    let lying = drops::of_level(&built.scene, &level);
+    Ok((built, lying))
 }
 
 /// The network's 320x240 frame.
@@ -407,6 +497,10 @@ struct Report {
     airborne: bool,
     sprinting: bool,
     attacking: bool,
+    /// A shield is up; a broken guard has the player stunned; and the stamina left.
+    guarding: bool,
+    stunned: bool,
+    stamina: f32,
     /// The walking bob's offset of the camera, in world units.
     bob: f32,
     affliction: f32,
@@ -485,12 +579,11 @@ fn main() {
         ([v[0], v[1], v[2]], v[3])
     });
     let file = opts.get("level-file").map(PathBuf::from);
-    let level = match &file {
+    let (mut level, lying) = match &file {
         Some(f) => load_level(f, start, &mut rng).unwrap_or_else(|e| panic!("{e}")),
-        None => Level::new(&mut rng),
+        None => (Level::new(&mut rng), Vec::new()),
     };
     let eyes = opts.get("sculpt").map(PathBuf::from);
-    let mut level = level;
     let sculpted = eyes.as_deref().map(|dir| engine::world::dreamed::sculpt(&mut level.scene, seed, Some(dir)));
     let strangeness = level.scene.strange.base;
     let growths = dream.is_some().then(|| Growths::new(&level.scene));
@@ -561,6 +654,9 @@ fn main() {
             panel: false,
             net_ms: 0.0,
             herd: Default::default(),
+            foes: Default::default(),
+            cues: Vec::new(),
+            struck: None,
             tris: 0,
             width: W,
             strangeness,
@@ -580,10 +676,12 @@ fn main() {
             held: Vec::new(),
             said: None,
             player,
-            sword: Sword::default(),
+            hands: Hands::default(),
+            mouse_arms: [false; 2],
+            pad_arms: [false; 2],
             on_pad: false,
             menu: None,
-            drops: Vec::new(),
+            drops: lying,
             quit: false,
         })
         .insert_non_send(net)
@@ -710,8 +808,12 @@ fn keys(
     }
     if let Ok(mut cursor) = cursor.single_mut() {
         let captured = cursor.grab_mode != CursorGrabMode::None;
-        if captured && button.just_pressed(MouseButton::Right) && sim.in_control() && sim.player.weapon().is_some() {
-            sim.sword.attack();
+        // Each button is the hand on its side of the screen: right click the right hand.
+        for (i, b) in [MouseButton::Right, MouseButton::Left].into_iter().enumerate() {
+            sim.mouse_arms[i] = captured && button.pressed(b);
+            if captured && button.just_pressed(b) {
+                sim.press_arm(SIDES[i]);
+            }
         }
         if button.just_pressed(MouseButton::Left) && !captured && !egui.is_pointer_over_area() {
             set_captured(&mut cursor, true);
@@ -819,6 +921,7 @@ fn menu_pad(pad: &ControllerState, sim: &mut Sim) {
 /// Pad buttons, sampled once per tick by psx-bevy's shell (where the developer
 /// MCP's buttons arrive too).
 fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
+    sim.pad_arms = [pad.held(Button::R2), pad.held(Button::L2)];
     if pad.left_stick != Vec2::ZERO || pad.right_stick != Vec2::ZERO || !pad.buttons().is_empty() {
         sim.on_pad = true;
     }
@@ -843,8 +946,10 @@ fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
     if pad.pressed(Button::Circle) {
         sim.use_thing();
     }
-    if pad.pressed(Button::R2) && sim.player.weapon().is_some() {
-        sim.sword.attack();
+    for (i, b) in [Button::R2, Button::L2].into_iter().enumerate() {
+        if pad.pressed(b) {
+            sim.press_arm(SIDES[i]);
+        }
     }
     // Holding triangle will give the d-pad to the quick-change list.
     if !pad.held(Button::Triangle) {
@@ -1015,7 +1120,10 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         hotbar: sim.player.hotbar.iter().map(|s| s.map_or(String::new(), |i| i.name().to_string())).collect(),
         airborne: sim.level.walker.airborne(),
         sprinting: sim.level.walker.sprinting(),
-        attacking: sim.sword.swinging(),
+        attacking: sim.hands.swinging(),
+        guarding: sim.hands.guarding(),
+        stunned: sim.hands.stunned(),
+        stamina: sim.player.stamina,
         bob: sim.level.walker.bob(),
         affliction: sim.player.affliction,
         felt: sim.felt,
@@ -1034,7 +1142,8 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         return;
     }
     let clear = sim.player.clarity > 0.0;
-    sim.player.update(1.0 / TICK as f32);
+    let guarding = sim.hands.guarding();
+    sim.player.update(1.0 / TICK as f32, guarding);
     if clear && sim.player.clarity == 0.0 {
         sim.say("the dream returns".to_string());
     }
@@ -1050,6 +1159,7 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
             sim.said = Some(("something lashes you".to_string(), 3.0));
         }
     }
+    sim.fight();
     if sim.level.scene.tick_things(1.0 / TICK as f32) {
         sim.level.things_moved();
     }
@@ -1066,6 +1176,7 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
             sim.said = None;
         }
     }
+    let stunned = sim.hands.stunned();
     let level = &mut sim.level;
     if sim.auto_walk {
         level.walker.step(&level.scene, &mut sim.rng);
@@ -1085,6 +1196,8 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         turn += held(Button::Left) - held(Button::Right);
     }
     let turn = turn.clamp(-1.0, 1.0);
+    // Stunned, the player can only look about.
+    let (forward, strafe, turn) = if stunned { (0.0, 0.0, 0.0) } else { (forward, strafe, turn) };
     let len = (forward * forward + strafe * strafe).sqrt().max(1.0);
     // The pitch is the mouse's: passing it as the target leaves it where it is.
     let look = level.walker.pitch;
@@ -1123,7 +1236,9 @@ fn draw(
         sim.dream_time += dt;
         if dream.is_some() {
             let sim = &mut *sim;
-            sim.herd.update(&mut sim.level.scene, sim.version, dt);
+            sim.herd.player = (!sim.auto_walk).then(|| sim.feet().0);
+            let cues = sim.herd.update(&mut sim.level.scene, sim.version, dt);
+            sim.cues.extend(cues);
         }
     }
     if sim.shown() != Mode::Raster {
@@ -1400,11 +1515,19 @@ fn layout(
 fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut images: ResMut<Assets<Image>>) {
     let sim = &mut *sim;
     if !sim.frozen() {
-        sim.sword.update(time.delta_secs(), sim.level.walker.yaw);
+        sim.hands.hold(sim.player.hand(Side::Right), sim.player.hand(Side::Left));
+        let control = sim.in_control();
+        let held = [0, 1].map(|i| control && (sim.mouse_arms[i] || sim.pad_arms[i]));
+        for (side, full) in sim.hands.update(time.delta_secs(), sim.level.walker.yaw, held) {
+            let attack = sim.player.attack_with(side);
+            let blow = if full { attack } else { (attack / LABOURED).max(1) };
+            *sim.struck.get_or_insert(0) += blow;
+        }
+        sim.level.walker.kick = sim.hands.kick();
     }
     let width = if sim.shown() == Mode::Raster { W } else { sim.width };
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
-    let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.sword.pose(sim.level.walker.bob()));
+    let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.hands.shown(sim.level.walker.bob()));
     if !sim.drops.is_empty() {
         state.drops = drops::triangles(&sim.drops, &sim.level.scene, &sim.level.walker.camera(), width);
     }
@@ -1464,7 +1587,7 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
     let dial = if sim.sculpted.is_some() { format!("flesh {:.0}% | ", sim.dial * 100.0) } else { String::new() };
     text.0 = format!(
         "{mode} | {on} effects | {fps:.0} fps | net {:.1} ms, {} tris | affliction {:.0}% | {dial}{walk}{pause}{keys}\n\
-         mouse: look  rmb: attack  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  esc: menu  f1: switch  f2: both  f3: hurt  f4: free mouse  h: panel{said}",
+         mouse: look  lmb / rmb: left / right hand  wasd: move  space: jump  shift: sprint  e: use  1-4: hotbar  esc: menu  f1: switch  f2: both  f3: hurt  f4: free mouse  h: panel{said}",
         sim.net_ms, sim.tris, sim.player.affliction * 100.0
     );
 }

@@ -1,5 +1,5 @@
 //! What moves in a hand-built level: doors that open and close, keys lying
-//! about to pick up, and levers that work doors. Each has its own share of
+//! about to pick up, levers that work doors, and chests that open. Each has its own share of
 //! triangles (a `Part`) apart from `Scene::tris`, so it can be rebuilt on its
 //! own as it moves; the renderers and the network draw the parts with the rest.
 
@@ -20,6 +20,13 @@ pub const REACH: f32 = 1.6 * TF;
 /// How near (world units) the feet must come to a key to pick it up.
 const PICK_UP: f32 = 0.5 * TF;
 const KEY_TINT: [f32; 3] = [1.0, 0.85, 0.4];
+/// A chest's half width and half depth, the height of its body, and half its lid's thickness.
+pub(crate) const CHEST: [f32; 2] = [0.3 * TF, 0.2 * TF];
+pub(crate) const CHEST_BODY: f32 = 0.25 * TF;
+const LID: f32 = 0.05 * TF;
+const CHEST_TINT: [f32; 3] = [0.7, 0.55, 0.4];
+/// How far the lid swings back when open, radians.
+const LID_OPEN: f32 = 1.9;
 
 /// Triangles that move or vanish apart from the rest of the level.
 #[derive(Clone, Debug, Default)]
@@ -71,6 +78,38 @@ pub struct Lever {
     pub pulled: bool,
 }
 
+/// A chest, from a `Chest` entity: its body is part of the level and its lid swings open.
+#[derive(Clone, Debug)]
+pub struct Chest {
+    pub entity: u32,
+    part: usize,
+    /// The middle of its bottom, on the floor.
+    pos: [f32; 3],
+    yaw: f32,
+    pub locked: bool,
+    pub key: Option<u32>,
+    /// Item names, until it is opened.
+    pub contents: Vec<String>,
+    /// 0 shut to 1 open; once opened it stays open.
+    pub open: f32,
+    pub opened: bool,
+}
+
+/// What using a thing did: what to say, and the items taken out of a chest, with where to
+/// put down those there's no room for (on the floor before it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Used {
+    pub said: String,
+    pub items: Vec<String>,
+    pub spill: Option<[f32; 3]>,
+}
+
+impl Used {
+    fn said(s: impl Into<String>) -> Used {
+        Used { said: s.into(), ..Default::default() }
+    }
+}
+
 /// The moving things of a scene.
 #[derive(Clone, Debug, Default)]
 pub struct Things {
@@ -78,6 +117,7 @@ pub struct Things {
     pub doors: Vec<Door>,
     pub pickups: Vec<Pickup>,
     pub levers: Vec<Lever>,
+    pub chests: Vec<Chest>,
 }
 
 impl Door {
@@ -109,7 +149,7 @@ impl Scene {
         self.things.parts.iter().flat_map(|p| p.tris.iter())
     }
 
-    /// Doors, keys and levers from the level's entities, each starting as the level says.
+    /// Doors, keys, levers and chests from the level's entities, each starting as the level says.
     pub(crate) fn build_things(&mut self, entities: &[Entity]) {
         for e in entities {
             let [x, y, z] = e.pos;
@@ -131,6 +171,15 @@ impl Scene {
                     self.things.levers.push(lever);
                     let i = self.things.levers.len() - 1;
                     self.shape_lever(i);
+                }
+                EntityKind::Chest { locked, key, contents } => {
+                    let Some(floor) = self.floor_y(x, y, z) else { continue };
+                    let part = self.new_part();
+                    let (locked, key, contents) = (*locked, *key, contents.clone());
+                    let chest = Chest { entity: e.id, part, pos: [x, floor, z], yaw: e.yaw, locked, key, contents, open: 0.0, opened: false };
+                    self.things.chests.push(chest);
+                    let i = self.things.chests.len() - 1;
+                    self.shape_chest(i);
                 }
                 _ => {}
             }
@@ -287,9 +336,36 @@ impl Scene {
         });
     }
 
-    /// Move the doors on by `dt` seconds. True when any part changed.
+    /// Chest `i`'s lid as it is now, hinged along the top of the body's back.
+    fn shape_chest(&mut self, i: usize) {
+        let c = self.things.chests[i].clone();
+        let a = smoothstep(0.0, 1.0, c.open) * LID_OPEN;
+        let m = mul(rot_y(c.yaw), rot_x(a));
+        let back = crate::world::scene::apply(rot_y(c.yaw), [0.0, 0.0, -CHEST[1]]);
+        let hinge = [c.pos[0] + back[0], c.pos[1] - CHEST_BODY, c.pos[2] + back[2]];
+        // From the hinge to the middle of the lid, which shut lies along the top.
+        let to = crate::world::scene::apply(m, [0.0, -LID, CHEST[1]]);
+        let centre = [hinge[0] + to[0], hinge[1] + to[1], hinge[2] + to[2]];
+        self.set_part(c.part, |s| {
+            s.add_obox(centre, m, [CHEST[0] + 3.0, LID, CHEST[1] + 3.0], 2, CHEST_TINT);
+            // The clasp on the front of the lid.
+            let clasp = crate::world::scene::apply(m, [0.0, 0.0, CHEST[1] + 4.0]);
+            s.add_obox([centre[0] + clasp[0], centre[1] + clasp[1] + LID, centre[2] + clasp[2]], m, [8.0, 8.0, 2.0], 5, KEY_TINT);
+        });
+    }
+
+    /// Move the doors and chest lids on by `dt` seconds. True when any part changed.
     pub fn tick_things(&mut self, dt: f32) -> bool {
         let mut changed = false;
+        for i in 0..self.things.chests.len() {
+            let c = &mut self.things.chests[i];
+            if !c.opened || c.open >= 1.0 {
+                continue;
+            }
+            c.open = (c.open + dt / SWING).min(1.0);
+            self.shape_chest(i);
+            changed = true;
+        }
         for i in 0..self.things.doors.len() {
             let d = &mut self.things.doors[i];
             if !d.moving() {
@@ -332,9 +408,9 @@ impl Scene {
     }
 
     /// Use whatever is in front of someone with their feet at `pos`, facing
-    /// `yaw` (radians), holding the keys `held`: the nearest door or lever in
-    /// reach. Says what happened, or `None` when nothing is there.
-    pub fn use_thing(&mut self, pos: [f32; 3], yaw: f32, held: &[(u32, String)]) -> Option<String> {
+    /// `yaw` (radians), holding the keys `held`: the nearest door, lever or chest
+    /// in reach. What happened, or `None` when nothing is there.
+    pub fn use_thing(&mut self, pos: [f32; 3], yaw: f32, held: &[(u32, String)]) -> Option<Used> {
         let (s, c) = yaw.sin_cos();
         let fwd = [-s, c];
         // How far ahead a point is, if it is ahead, near and on this floor.
@@ -347,14 +423,39 @@ impl Scene {
         let door = (0..self.things.doors.len())
             .filter_map(|i| ahead(self.things.doors[i].centre).map(|d| (d, i)))
             .min_by(|a, b| a.0.total_cmp(&b.0));
-        let lever = (0..self.things.levers.len())
-            .filter_map(|i| ahead(self.things.levers[i].pos).map(|d| (d, i)))
-            .min_by(|a, b| a.0.total_cmp(&b.0));
-        match (door, lever) {
-            (Some((dd, i)), l) if l.is_none_or(|(ld, _)| dd <= ld) => Some(self.use_door(i, held)),
-            (_, Some((_, i))) => Some(self.pull_lever(i)),
-            _ => None,
+        let lever = (0..self.things.levers.len()).filter_map(|i| ahead(self.things.levers[i].pos).map(|d| (d, 1, i)));
+        let chest = (0..self.things.chests.len()).filter_map(|i| ahead(self.things.chests[i].pos).map(|d| (d, 2, i)));
+        let nearest = door.map(|(d, i)| (d, 0, i)).into_iter().chain(lever).chain(chest).min_by(|a, b| a.0.total_cmp(&b.0))?;
+        Some(match nearest {
+            (_, 0, i) => Used::said(self.use_door(i, held)),
+            (_, 1, i) => Used::said(self.pull_lever(i)),
+            (_, _, i) => self.open_chest(i, held),
+        })
+    }
+
+    fn open_chest(&mut self, i: usize, held: &[(u32, String)]) -> Used {
+        let c = &mut self.things.chests[i];
+        if c.opened {
+            return Used::said("the chest is empty");
         }
+        let mut said = "the chest opens".to_string();
+        if c.locked {
+            match held.iter().find(|k| Some(k.0) == c.key) {
+                Some(k) => {
+                    c.locked = false;
+                    said = format!("unlocked with the {}", k.1);
+                }
+                None => return Used::said("locked"),
+            }
+        }
+        c.opened = true;
+        let items = std::mem::take(&mut c.contents);
+        if items.is_empty() {
+            said = format!("{said}: it is empty");
+        }
+        let f = crate::world::scene::apply(rot_y(c.yaw), [0.0, 0.0, CHEST[1] + 0.3 * TF]);
+        let spill = Some([c.pos[0] + f[0], c.pos[1], c.pos[2] + f[2]]);
+        Used { said, items, spill }
     }
 
     fn use_door(&mut self, i: usize, held: &[(u32, String)]) -> String {
@@ -420,7 +521,7 @@ mod tests {
         assert!(s.door_blocks(0.5 * TF, 0.9 * TF, feet, 30.0));
         assert!(!s.door_blocks(0.5 * TF, 0.5 * TF, feet, 30.0));
         let before = s.things.parts[s.things.doors[0].part].tris[0].v[0].p;
-        assert_eq!(s.use_thing([0.5 * TF, 0.0, 0.6 * TF], 0.0, &[]).as_deref(), Some("opens"));
+        assert_eq!(s.use_thing([0.5 * TF, 0.0, 0.6 * TF], 0.0, &[]).map(|u| u.said).as_deref(), Some("opens"));
         // Moving still blocks; open doesn't.
         assert!(s.tick_things(0.1));
         assert!(s.door_blocks(0.5 * TF, 0.9 * TF, feet, 30.0));
@@ -436,7 +537,7 @@ mod tests {
     fn locked_doors_need_their_key() {
         let mut s = corridor(true).to_scene();
         let at = [0.5 * TF, 0.0, 0.6 * TF];
-        assert_eq!(s.use_thing(at, 0.0, &[]).as_deref(), Some("locked"));
+        assert_eq!(s.use_thing(at, 0.0, &[]).map(|u| u.said).as_deref(), Some("locked"));
         assert!(!s.tick_things(0.1));
         // Facing away, nothing is in reach.
         assert_eq!(s.use_thing(at, std::f32::consts::PI, &[]), None);
@@ -444,8 +545,39 @@ mod tests {
         assert_eq!(keys, vec![(3, "iron key".to_string())]);
         assert!(s.things.parts[s.things.pickups[0].part].tris.is_empty());
         assert!(s.take_pickups([0.5 * TF, 0.0, 0.4 * TF]).is_empty());
-        assert_eq!(s.use_thing(at, 0.0, &keys).as_deref(), Some("unlocked with the iron key"));
+        assert_eq!(s.use_thing(at, 0.0, &keys).map(|u| u.said).as_deref(), Some("unlocked with the iron key"));
         assert!(s.tick_things(0.1));
+    }
+
+    #[test]
+    fn chests_open_once_for_their_key_and_give_up_what_is_in_them() {
+        let mut l = corridor(false);
+        // At the far end, facing back down the corridor (-z) at the player.
+        let chest = EntityKind::Chest { locked: true, key: Some(3), contents: vec!["sword".into(), "sword".into()] };
+        l.entities.push(Entity { id: 5, kind: chest, pos: [0.5 * TF, 0.0, 1.5 * TF], yaw: std::f32::consts::PI });
+        l.entities.retain(|e| !matches!(e.kind, EntityKind::Door { .. }));
+        let mut s = l.to_scene();
+        let at = [0.5 * TF, 0.0, 0.6 * TF];
+        assert_eq!(s.use_thing(at, 0.0, &[]).unwrap().said, "locked");
+        let keys = s.take_pickups([0.5 * TF, 0.0, 0.4 * TF]);
+        let part = s.things.chests[0].part;
+        let shut: Vec<f32> = s.things.parts[part].tris.iter().flat_map(|t| t.v.map(|v| v.p[1] as f32)).collect();
+        let used = s.use_thing(at, 0.0, &keys).unwrap();
+        assert_eq!(used.said, "unlocked with the iron key");
+        assert_eq!(used.items, ["sword", "sword"]);
+        // Spilled things land between the chest and the player.
+        let spill = used.spill.unwrap();
+        assert!(spill[2] < 1.5 * TF && spill[2] > 0.6 * TF, "{spill:?}");
+        for _ in 0..10 {
+            s.tick_things(0.1);
+        }
+        assert!(!s.tick_things(0.1));
+        // The lid has swung up: its highest point is well above where it was (y is down).
+        let top = |ys: &[f32]| ys.iter().copied().fold(f32::INFINITY, f32::min);
+        let open: Vec<f32> = s.things.parts[part].tris.iter().flat_map(|t| t.v.map(|v| v.p[1] as f32)).collect();
+        assert!(top(&open) < top(&shut) - 0.25 * TF, "{} {}", top(&open), top(&shut));
+        let again = s.use_thing(at, 0.0, &keys).unwrap();
+        assert_eq!((again.said.as_str(), again.items.len()), ("the chest is empty", 0));
     }
 
     #[test]
@@ -455,7 +587,7 @@ mod tests {
         let mut s = l.to_scene();
         let v = s.things.parts[s.things.levers[0].part].version;
         // Standing beside the lever, facing it (toward -z), with the door behind.
-        let msg = s.use_thing([0.5 * TF, 0.0, 0.6 * TF], std::f32::consts::PI, &[]).unwrap();
+        let msg = s.use_thing([0.5 * TF, 0.0, 0.6 * TF], std::f32::consts::PI, &[]).unwrap().said;
         assert!(msg.contains("lever"), "{msg}");
         assert_ne!(s.things.parts[s.things.levers[0].part].version, v);
         assert!(s.things.doors[0].opening);

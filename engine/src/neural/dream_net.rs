@@ -177,21 +177,7 @@ impl DreamNet {
         let planes = FIELD_PLANES + 6 + 144 + 96 + 48 + (224 + 192 + 96) / 4 + (128 + 256) / 16 + (PHRASE_DIM + 192) / 4 + (PHRASE_DIM + 256) / 16 + 96 + LAYER;
         let bytes = (scratch as u64 + (planes * plane) as u64 + 64 * 32) * 4;
 
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no GPU adapter: {e}"))?;
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(bytes);
-        limits.max_buffer_size = limits.max_buffer_size.max(bytes);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("dream"),
-            required_limits: limits,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("GPU device: {e}"))?;
+        let (device, queue, adapter) = crate::neural::gpu::device("dream", bytes)?;
         let mem = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dream mem"),
             size: bytes,
@@ -298,7 +284,7 @@ impl DreamNet {
             kind_start,
             dream_ids,
             palettes,
-            adapter: adapter.get_info().name,
+            adapter,
         })
     }
 
@@ -784,7 +770,9 @@ fn tile_lists(drawn: &[bool], full: (usize, usize)) -> [(Vec<(usize, usize)>, Ve
 }
 
 /// Each pixel's camera-space depth (in tiles) of the nearest of the level triangles `tris`
-/// (`features::tri_features`), [H][width].
+/// (`features::tri_features`), [H][width]. Back faces are left out, as the rasteriser leaves
+/// them: the level's face into its open space, so from outside it (the editor's camera can
+/// be) its walls hide nothing.
 pub fn level_depth(tris: &[f32], cam: &Camera, width: u32) -> Vec<f32> {
     const NEAR: f32 = 0.05;
     let (wi, hi) = (width as usize, H as usize);
@@ -815,6 +803,10 @@ pub fn level_depth(tris: &[f32], cam: &Camera, width: u32) -> Vec<f32> {
         }
         let project = |v: [f32; 3]| [v[0] / v[2] * vh + width as f32 / 2.0, v[1] / v[2] * vh + H as f32 / 2.0, 1.0 / v[2]];
         let a = project(poly[0]);
+        let (b, c) = (project(poly[1]), project(poly[2]));
+        if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0.0 {
+            continue;
+        }
         for pair in poly[1..].windows(2) {
             let (b, c) = (project(pair[0]), project(pair[1]));
             let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
@@ -1035,6 +1027,25 @@ fn warp_parts(rows: &mut [f32], warp: &impl Fn([f32; 3]) -> [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_level_hides_from_inside_it_and_not_from_outside() {
+        let level = crate::world::level::Level::demo();
+        let scene = level.to_scene();
+        let mut tris = Vec::new();
+        crate::neural::features::tri_features(&scene, &mut tris);
+        let (pos, yaw) = level.player_start().unwrap();
+        let inside = crate::world::walker::Walker::at(&scene, pos, yaw, &mut crate::world::rng::Rng::new(1)).unwrap().camera();
+        let covered = |cam: &Camera| level_depth(&tris, cam, 320).iter().filter(|d| **d < f32::MAX).count() as f32 / (320 * H) as f32;
+        assert!(covered(&inside) > 0.95, "{}", covered(&inside));
+        // Far outside the level, looking back at it: only faces turned toward the camera,
+        // which from outside are none of the walls'.
+        let mut outside = inside.clone();
+        let (s, c) = (yaw.sin(), yaw.cos());
+        outside.pos = [pos[0] + s * 40.0 * T as f32, pos[1] - 256.0, pos[2] - c * 40.0 * T as f32].map(|v| v as i32);
+        outside.fog_far = 100 * T;
+        assert!(covered(&outside) < 0.05, "{}", covered(&outside));
+    }
 
     #[test]
     fn creatures_alone_laid_over_a_picture_give_what_composite_does() {

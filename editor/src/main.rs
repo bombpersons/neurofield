@@ -15,7 +15,7 @@
 
 mod checks;
 mod doc;
-mod flesh;
+mod dream;
 mod mcp;
 mod neural;
 mod pick;
@@ -61,14 +61,19 @@ fn main() {
     }
     let config = Config::load();
     config.load_textures(&opts);
-    // Scenes get creatures through the PS1 pipeline, which is quick to build; the
-    // full-colour ones are sculpted in the background (see `flesh`).
+    // Scenes get creatures through the PS1 pipeline, which is quick to build; the dream
+    // net draws them as the game does (see `dream`).
     engine::world::flesh::set_psx(true);
     let textures = engine::world::tex::make_all();
 
     // Agents that start the editor themselves get the defaults and leave the
     // person's settings alone.
     let settings = if mcp { settings::Settings { persist: false, ..default() } } else { settings::Settings::load() };
+    let dream_path = config.dream.clone();
+    // The networks' GPU, found before Bevy starts drawing (see `engine::neural::gpu`).
+    if let Err(e) = engine::neural::gpu::adapter() {
+        eprintln!("{e}: the Neural view and the dream net won't run");
+    }
     let mut ui = ui::Ui::new(settings, config);
     // The agent server's address and token from the command line, for this run.
     if let Some(addr) = opts.get("mcp-listen") {
@@ -139,16 +144,16 @@ fn main() {
         show_grid: true,
         show_entities: true,
         full_colour: true,
+        dreamed: false,
         shapes: Vec::new(),
-        changed_at: 0.0,
         parts: Vec::new(),
-        hidden: Vec::new(),
+        hidden: false,
         lines: Vec::new(),
         overlay: false,
         brushing: false,
         tinted: false,
     })
-    .insert_resource(flesh::Sculpts::default())
+    .insert_resource(dream::DreamView::new(dream_path))
     .add_systems(Startup, setup)
     .add_systems(Update, egui_on_display)
     .add_systems(EguiPrimaryContextPass, ui::draw)
@@ -157,12 +162,12 @@ fn main() {
         (
             auto_screenshot,
             close_requested,
-            flesh::sculpt,
             view3d::rebuild,
             view3d::camera_control,
             view3d::apply_camera,
             view3d::screen_mode,
             view3d::gizmos,
+            dream::update,
         )
             .chain(),
     );
@@ -226,8 +231,19 @@ fn close_requested(mut requests: MessageReader<WindowCloseRequested>, mut ui: Re
     }
 }
 
-/// Start the game on the level as it is now, from its player start or from `start`.
-pub fn play(level: &Level, start: Option<([f32; 3], f32)>) -> Result<(), String> {
+/// Start the game on the level as it is now, from its player start or from `start`, with
+/// its walls turned to flesh if `flesh` (the filmed eyes are `neurofield.ron`'s `eyes`).
+pub fn play(level: &Level, start: Option<([f32; 3], f32)>, flesh: bool) -> Result<(), String> {
+    let eyes = match flesh {
+        true => match engine::world::config::Config::load().eyes {
+            Some(d) if d.is_dir() => Some(d),
+            d => {
+                let at = d.map_or("(none set)".into(), |d| d.display().to_string());
+                return Err(format!("no filmed eyes at {at}: set `eyes` in neurofield.ron"));
+            }
+        },
+        false => None,
+    };
     let tmp = std::env::temp_dir().join("neurofield-play.ron");
     level.save(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -248,6 +264,9 @@ pub fn play(level: &Level, start: Option<([f32; 3], f32)>) -> Result<(), String>
     cmd.arg("--level-file").arg(&tmp);
     if let Some((p, yaw)) = start {
         cmd.arg("--start").arg(format!("{},{},{},{}", p[0], p[1], p[2], yaw));
+    }
+    if let Some(d) = eyes {
+        cmd.arg("--sculpt").arg(d);
     }
     cmd.spawn().map(|_| ()).map_err(|e| format!("starting the game: {e}"))
 }

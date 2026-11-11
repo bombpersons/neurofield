@@ -250,6 +250,9 @@ pub struct Creature {
     pub parts: Vec<Part>,
     /// Texture id of each skin in its scene.
     pub slots: Vec<u8>,
+    /// How near its base the player's body can come, in x/z: none for what can be walked
+    /// through (the dead, and what isn't grown in a scene).
+    pub girth: f32,
 }
 
 /// A part's place in the world after posing.
@@ -289,21 +292,35 @@ impl Creature {
 
     /// Every part placed in the world: forward kinematics down the tree.
     pub fn pose(&self) -> Vec<Placed> {
-        let frame = rot_y(self.yaw);
         let mut out: Vec<Placed> = Vec::with_capacity(self.parts.len());
-        for p in &self.parts {
-            let (joint, f) = match p.parent {
-                None => (add(self.base, apply(frame, p.anchor)), frame),
-                Some(i) => {
-                    let [t, around, o] = p.anchor;
-                    (out[i].world(self.parts[i].local(t, around * TAU, o)), out[i].axes)
-                }
-            };
-            let axes = mul(f, p.rot);
-            let pivot = [0, 1, 2].map(|c| p.pivot[c] * p.half[c]);
-            out.push(Placed { joint, centre: sub(joint, apply(axes, pivot)), axes });
+        for i in 0..self.parts.len() {
+            out.push(self.place(&out, i));
         }
         out
+    }
+
+    /// Part `i` placed, its ancestors already placed in `out`; also the frame it hangs from.
+    pub(crate) fn place(&self, out: &[Placed], i: usize) -> Placed {
+        let p = &self.parts[i];
+        let (joint, f) = self.socket(out, i);
+        let axes = mul(f, p.rot);
+        let pivot = [0, 1, 2].map(|c| p.pivot[c] * p.half[c]);
+        Placed { joint, centre: sub(joint, apply(axes, pivot)), axes }
+    }
+
+    /// Where part `i`'s joint is and the frame its `rot` is relative to.
+    pub(crate) fn socket(&self, out: &[Placed], i: usize) -> ([f32; 3], M3) {
+        let p = &self.parts[i];
+        match p.parent {
+            None => {
+                let frame = rot_y(self.yaw);
+                (add(self.base, apply(frame, p.anchor)), frame)
+            }
+            Some(a) => {
+                let [t, around, o] = p.anchor;
+                (out[a].world(self.parts[a].local(t, around * TAU, o)), out[a].axes)
+            }
+        }
     }
 
     /// Points spread over every part's surface.
@@ -725,6 +742,10 @@ impl Grow {
     }
 }
 
+/// A creature's girth as a share of its reach from its base, and the least it can be.
+const GIRTH: f32 = 0.75;
+const MIN_GIRTH: f32 = 0.2 * TF;
+
 /// A creature grown for the level (not a sculpted wall's mouth): which of `Scene::creatures`,
 /// and its triangles in `Scene::flesh` (none through the PS1 pipeline).
 #[derive(Clone, Debug)]
@@ -766,7 +787,7 @@ impl Scene {
             Some(y) => y,
             None => rng.fr(0.0, TAU),
         };
-        let c = Creature { base, yaw, skins: Vec::new(), parts: Vec::new(), slots: Vec::new() };
+        let c = Creature { base, yaw, skins: Vec::new(), parts: Vec::new(), slots: Vec::new(), girth: 0.0 };
         let mut g = Grow { c, rng: RefCell::new(rng.clone()) };
         let kind = match kind {
             Some(k) => k as i32,
@@ -812,6 +833,8 @@ impl Scene {
             c.rescale(scale);
         }
         c.fit(floor, floor - clearance, 0.95 * TF * scale.max(1.0), grounded);
+        // Most of its reach: an outflung limb's tip can be brushed past.
+        c.girth = (GIRTH * c.extent().0).max(MIN_GIRTH);
         // The full-colour pass has skins of its own; PS1 ones are only for the PS1 pass.
         c.slots = if crate::world::flesh::enabled() { vec![0; c.skins.len()] } else { c.skins.iter().map(|s| self.skin_slot(s)).collect() };
         let start = self.creature_tris.len();
@@ -852,12 +875,18 @@ impl Scene {
     /// Say whether something (the game's herd) moves the grown creatures. When it does the
     /// renderer leaves their full-colour meshes out, and they are drawn instead as
     /// `low_poly_creatures` through the PS1 pipeline, with PS1 skins made for them here.
+    /// Moving, a creature no longer holds the cell it was put in (which kept generated walks
+    /// out of it): bodies collide by their `girth` wherever they are.
     pub fn set_creatures_move(&mut self, on: bool) {
         self.creatures_move = on;
         if !on {
             return;
         }
         for g in self.grown.clone() {
+            let [x, y, z] = self.creatures[g.creature].base;
+            if let Some(n) = self.node_at(x, y - 16.0, z) {
+                self.span_mut(n).blocked = false;
+            }
             let skins = self.creatures[g.creature].skins.clone();
             self.creatures[g.creature].slots = skins.iter().map(|s| self.skin_slot(s)).collect();
         }

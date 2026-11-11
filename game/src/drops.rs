@@ -1,10 +1,10 @@
 //! Things the player has dropped: where they lie, picking them up again, and how they look.
 //! Until the world can have plain PS1 models composited into the network's picture, a dropped
-//! thing is a little flat-lit cube drawn by `hud`'s software rasteriser, as the sword is,
+//! thing is a little flat-lit cube drawn by `hud`'s software rasteriser, as the hands are,
 //! hidden when the level stands between it and the eye and fading into the fog. No Bevy here.
 
+use crate::hands::ScreenTri;
 use crate::player::Item;
-use crate::sword::ScreenTri;
 use engine::world::scene::{Camera, Scene, T};
 
 const TF: f32 = T as f32;
@@ -39,6 +39,27 @@ pub fn drop(scene: &Scene, item: Item, feet: [f32; 3], yaw: f32) -> Dropped {
         _ => [feet[0], scene.floor_y(feet[0], feet[1], feet[2]).unwrap_or(feet[1]), feet[2]],
     };
     Dropped { item, at, armed: false }
+}
+
+/// A thing the level put on the floor at `at` (an `Item` entity, or out of a chest): on
+/// the floor there, to be picked up as soon as the feet reach it.
+pub fn lying(scene: &Scene, item: Item, at: [f32; 3]) -> Dropped {
+    let y = scene.floor_y(at[0], at[1], at[2]).unwrap_or(at[1]);
+    Dropped { item, at: [at[0], y, at[2]], armed: true }
+}
+
+/// The items a hand-built level has lying about, `count` of each a thing; names the game
+/// doesn't know are left out and said on stderr.
+pub fn of_level(scene: &Scene, level: &engine::world::level::Level) -> Vec<Dropped> {
+    let mut out = Vec::new();
+    for e in &level.entities {
+        let engine::world::level::EntityKind::Item { name, count } = &e.kind else { continue };
+        match Item::named(name) {
+            Some(item) => out.extend((0..*count).map(|_| lying(scene, item, e.pos))),
+            None => eprintln!("item #{}: no item called {name:?}", e.id),
+        }
+    }
+    out
 }
 
 /// The dropped things the feet at `feet` can pick up now, by index, and arm those they've

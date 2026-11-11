@@ -2,8 +2,8 @@
 //! it is as chunky as the picture under it and stays solid whichever renderer is on.
 
 use crate::menu::{self, Choice, GearWindow, ItemWindow, Menu, Screen, Window, PAUSE_ROWS};
-use crate::player::{Item, Player, Stats, CLARITY_SECS, EQUIPMENT, SLOTS};
-use crate::sword::{self, Pose, ScreenTri};
+use crate::hands::{self, Kind, Pose, ScreenTri};
+use crate::player::{Item, Player, Stats, CLARITY_SECS, EQUIPMENT, SLOTS, STAMINA};
 use psx_bevy::psx::font;
 
 const MARGIN: i32 = 8;
@@ -24,6 +24,7 @@ const DIM: Rgba = [205, 190, 150, 90];
 const HP: Rgba = [205, 35, 30, 255];
 const MP: Rgba = [50, 85, 225, 255];
 const CLARITY: Rgba = [205, 235, 230, 255];
+const STAMINA_BAR: Rgba = [110, 190, 60, 255];
 const CALMING: Rgba = [165, 115, 225, 255];
 const WHITE: Rgba = [240, 235, 220, 255];
 /// Health and mana as text, lighter than their bars so they read on a dark panel.
@@ -55,6 +56,7 @@ pub struct HudState {
     pub width: u32,
     pub hp: (i32, i32),
     pub mp: (i32, i32),
+    pub stamina: (i32, i32),
     /// Points of clarity left, out of `CLARITY_POINTS`; none and the bar is gone.
     pub clarity: i32,
     pub slots: [Option<(Item, u32)>; SLOTS],
@@ -62,10 +64,9 @@ pub struct HudState {
     pub pad: bool,
     /// Which way the view faces, 0..HEADINGS, growing as it turns left.
     pub heading: i32,
-    /// Whether there's a weapon in hand to draw.
-    pub armed: bool,
-    pub sword: Pose,
-    /// Dropped things in view (`drops::triangles`), under the sword and the HUD.
+    /// What the hands hold, and their poses.
+    pub hands: Vec<(Kind, Pose)>,
+    /// Dropped things in view (`drops::triangles`), under the hands and the HUD.
     pub drops: Vec<ScreenTri>,
     pub menu: Option<MenuShown>,
 }
@@ -90,17 +91,17 @@ pub struct MenuShown {
 pub type Hit = ([i32; 4], usize);
 
 impl HudState {
-    pub fn of(p: &Player, menu: Option<&Menu>, width: u32, pad: bool, yaw: f32, sword: Pose) -> HudState {
+    pub fn of(p: &Player, menu: Option<&Menu>, width: u32, pad: bool, yaw: f32, hands: Vec<(Kind, Pose)>) -> HudState {
         HudState {
             width,
             hp: (p.hp, p.max_hp),
             mp: (p.mp, p.max_mp),
+            stamina: (p.stamina.ceil() as i32, STAMINA as i32),
             clarity: (p.clarity / CLARITY_SECS * CLARITY_POINTS as f32).ceil() as i32,
             slots: p.hotbar.map(|s| s.map(|i| (i, p.count(i)))),
             pad,
             heading: (yaw / std::f32::consts::TAU * HEADINGS as f32).round().rem_euclid(HEADINGS as f32) as i32,
-            armed: p.weapon().is_some(),
-            sword,
+            hands,
             drops: Vec::new(),
             menu: menu.map(|m| MenuShown {
                 menu: m.clone(),
@@ -502,7 +503,7 @@ impl Canvas<'_> {
         let rows = shown.wears.len().max(1) as i32;
         let h = 18 + rows * ITEM_ROW + 4;
         let (x, y) = ((self.w - WINDOW_W) / 2, (self.h - h) / 2);
-        self.panel(x, y, WINDOW_W, h, EQUIPMENT[win.at].name());
+        self.panel(x, y, WINDOW_W, h, EQUIPMENT[win.at].title());
         if shown.wears.is_empty() {
             self.text(x + 10, y + 18 + 5, "Nothing to wear", DIM);
         }
@@ -565,19 +566,18 @@ impl Canvas<'_> {
 pub fn draw(data: &mut [u8], stride: u32, h: u32, state: &HudState) -> Vec<Hit> {
     data.fill(0);
     let mut c = Canvas { data, stride: stride as i32, w: state.width as i32, h: h as i32, hits: Vec::new() };
-    // What lies in the world, then the sword, so the HUD stays readable over them.
+    // What lies in the world, then the hands, so the HUD stays readable over them.
     for t in &state.drops {
         c.triangle(t);
     }
-    if state.armed {
-        for t in sword::triangles(state.sword, state.width, h) {
-            c.triangle(&t);
-        }
+    for t in hands::triangles(&state.hands, state.width, h) {
+        c.triangle(&t);
     }
     c.bar(MARGIN + 1, MARGIN + 1, 5, state.hp, HP);
     c.bar(MARGIN + 1, MARGIN + 9, 3, state.mp, MP);
+    c.bar(MARGIN + 1, MARGIN + 15, 3, state.stamina, STAMINA_BAR);
     if state.clarity > 0 {
-        c.bar(MARGIN + 1, MARGIN + 15, 2, (state.clarity, CLARITY_POINTS), CLARITY);
+        c.bar(MARGIN + 1, MARGIN + 21, 2, (state.clarity, CLARITY_POINTS), CLARITY);
     }
     c.compass(state.heading);
     c.hotbar(state);
@@ -609,12 +609,14 @@ mod tests {
         data
     }
 
-    fn pose() -> Pose {
-        crate::sword::Sword::default().pose(0.0)
+    fn held() -> Vec<(Kind, Pose)> {
+        let mut h = crate::hands::Hands::default();
+        h.hold(Some(Item::Sword), None);
+        h.shown(0.0)
     }
 
     fn state() -> HudState {
-        HudState::of(&Player::new(), None, W, false, 0.0, pose())
+        HudState::of(&Player::new(), None, W, false, 0.0, held())
     }
 
     #[test]
@@ -643,13 +645,23 @@ mod tests {
     }
 
     #[test]
+    fn the_stamina_bar_runs_down() {
+        let mut s = state();
+        assert_eq!(at(&drawn(&s), 9 + 70, 24), STAMINA_BAR);
+        s.stamina.0 = 10;
+        let low = drawn(&s);
+        assert_eq!(at(&low, 9 + 10, 24), STAMINA_BAR);
+        assert_ne!(at(&low, 9 + 30, 24), STAMINA_BAR);
+    }
+
+    #[test]
     fn the_clarity_bar_shows_only_while_it_lasts() {
         let mut s = state();
-        assert_ne!(at(&drawn(&s), 9 + 2, 24), CLARITY);
+        assert_ne!(at(&drawn(&s), 9 + 2, 30), CLARITY);
         s.clarity = CLARITY_POINTS / 2;
         let half = drawn(&s);
-        assert_eq!(at(&half, 9 + 2, 24), CLARITY);
-        assert_ne!(at(&half, 9 + CLARITY_POINTS as u32 + 4, 24), CLARITY);
+        assert_eq!(at(&half, 9 + 2, 30), CLARITY);
+        assert_ne!(at(&half, 9 + CLARITY_POINTS as u32 + 4, 30), CLARITY);
     }
 
     #[test]
@@ -685,7 +697,7 @@ mod tests {
     fn menu_state(screen: Screen, width: u32, pad: bool) -> HudState {
         let p = Player::new();
         let menu = Menu { screen, note: None };
-        HudState::of(&p, Some(&menu), width, pad, 0.0, pose())
+        HudState::of(&p, Some(&menu), width, pad, 0.0, held())
     }
 
     fn hits(state: &HudState) -> Vec<Hit> {
@@ -734,9 +746,9 @@ mod tests {
     fn a_stat_shows_how_it_would_change() {
         let p = Player::new();
         let menu = Menu { screen: Screen::Inventory { row: 0, gear: Some(0), window: Some(Window::Gear(GearWindow { at: 0, row: 0 })) }, note: None };
-        let s = HudState::of(&p, Some(&menu), W, false, 0.0, pose());
-        // The weapon slot offers only taking the sword off.
-        assert_eq!(s.menu.as_ref().unwrap().preview, Some(Stats::default()));
+        let s = HudState::of(&p, Some(&menu), W, false, 0.0, held());
+        // The right hand offers only taking the sword off.
+        assert_eq!(s.menu.as_ref().unwrap().preview, Some(Stats { attack: 0, ..p.stats() }));
         let d = drawn(&s);
         assert!((0..W).any(|x| (0..H).any(|y| at(&d, x, y) == WORSE)));
     }
@@ -750,7 +762,7 @@ mod tests {
     #[test]
     fn the_heading_wraps_round() {
         let p = Player::new();
-        let s = |yaw: f32| HudState::of(&p, None, W, false, yaw, pose()).heading;
+        let s = |yaw: f32| HudState::of(&p, None, W, false, yaw, held()).heading;
         assert_eq!(s(std::f32::consts::TAU), s(0.0));
         assert_eq!(s(-std::f32::consts::FRAC_PI_2), HEADINGS * 3 / 4);
     }
