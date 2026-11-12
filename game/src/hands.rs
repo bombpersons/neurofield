@@ -246,6 +246,11 @@ impl Hands {
         self.hands.iter().any(Hand::guarding)
     }
 
+    /// The hands whose shields are up.
+    pub fn guards(&self) -> Vec<Side> {
+        SIDES.into_iter().filter(|&s| self.hands[s as usize].guarding()).collect()
+    }
+
     /// Stamina ran out: any shield up comes down until its button is pressed again.
     pub fn give_out(&mut self) {
         for h in self.hands.iter_mut().filter(|h| h.held == Some(Kind::Shield) && h.raise > 0.0) {

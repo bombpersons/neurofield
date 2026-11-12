@@ -1,7 +1,7 @@
 //! The pause menu and the inventory screen it opens: what is selected and what a press
 //! does. No Bevy and no drawing here (`hud` draws it), so the rules can be tested alone.
 
-use crate::player::{Item, Player, EQUIPMENT, SLOTS};
+use crate::player::{Piece, Player, EQUIPMENT, SLOTS};
 
 /// One press, from the keyboard, the pad or the mouse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +49,13 @@ impl Choice {
     }
 }
 
-pub fn choices(player: &Player, item: Item) -> Vec<Choice> {
+/// What can be done with a carried piece: a broken one can only be dropped (the blacksmith
+/// mends them).
+pub fn choices(player: &Player, piece: Piece) -> Vec<Choice> {
+    if piece.broken() {
+        return vec![Choice::Drop];
+    }
+    let item = piece.item;
     if item.slot().is_some() {
         return vec![Choice::Equip, Choice::Drop];
     }
@@ -59,11 +65,11 @@ pub fn choices(player: &Player, item: Item) -> Vec<Choice> {
     }
 }
 
-/// What an equipment slot's window offers: each kind of carried thing that goes there, then
-/// taking off what is worn (`None`).
-pub fn gear_choices(player: &Player, at: usize) -> Vec<Option<Item>> {
-    let mut out: Vec<Option<Item>> =
-        player.items.iter().filter(|s| s.0.fits(EQUIPMENT[at])).map(|s| Some(s.0)).collect();
+/// What an equipment slot's window offers: each kind of carried thing that goes there (as
+/// worn as it is; none broken), then taking off what is worn (`None`).
+pub fn gear_choices(player: &Player, at: usize) -> Vec<Option<Piece>> {
+    let mut out: Vec<Option<Piece>> =
+        player.items.iter().filter(|s| s.0.item.fits(EQUIPMENT[at]) && !s.0.broken()).map(|s| Some(s.0)).collect();
     if player.equipped[at].is_some() {
         out.push(None);
     }
@@ -73,7 +79,7 @@ pub fn gear_choices(player: &Player, at: usize) -> Vec<Option<Item>> {
 /// The window an item in the list opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemWindow {
-    pub item: Item,
+    pub item: Piece,
     pub row: usize,
     /// The hotbar slot being picked, while putting the item on the hotbar.
     pub picking: Option<usize>,
@@ -107,7 +113,7 @@ pub enum Outcome {
     Close,
     Quit,
     /// One of this was dropped, and has to be put on the floor.
-    Drop(Item),
+    Drop(Piece),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,7 +187,8 @@ impl Menu {
                 }
                 (Press::Confirm, Some(g)) => *window = Some(Window::Gear(GearWindow { at: *g, row: 0 })),
                 (Press::Slot(s), None) if *row < items && s < SLOTS => {
-                    let item = player.items[*row].0;
+                    let piece = player.items[*row].0;
+                    let item = piece.item;
                     note = Some(match item.slot() {
                         Some(_) => "only what can be used goes on the hotbar".to_string(),
                         None => {
@@ -219,7 +226,7 @@ impl Menu {
                     Press::Back => *window = None,
                     Press::Confirm => {
                         note = wears.get(w.row).map(|&wear| match wear {
-                            Some(item) if player.equip(item, w.at) => format!("you put on the {}", item.name()),
+                            Some(piece) if player.equip(piece, w.at) => format!("you put on the {}", piece.name()),
                             None if player.unequip(w.at) => "you take it off".to_string(),
                             _ => "you have no room for what you'd take off".to_string(),
                         });
@@ -258,8 +265,9 @@ impl Menu {
 }
 
 /// A press in an item's window; once something was done, what to say and anything dropped.
-fn window_press(w: &mut ItemWindow, press: Press, player: &mut Player) -> Option<(String, Option<Item>)> {
+fn window_press(w: &mut ItemWindow, press: Press, player: &mut Player) -> Option<(String, Option<Piece>)> {
     let name = w.item.name();
+    let item = w.item.item;
     if let Some(slot) = &mut w.picking {
         let put = match press {
             Press::Up | Press::Left => {
@@ -275,7 +283,7 @@ fn window_press(w: &mut ItemWindow, press: Press, player: &mut Player) -> Option
             _ => None,
         };
         return put.map(|s| {
-            player.put_on_hotbar(w.item, s);
+            player.put_on_hotbar(item, s);
             (format!("the {name} goes on slot {}", s + 1), None)
         });
     }
@@ -284,17 +292,17 @@ fn window_press(w: &mut ItemWindow, press: Press, player: &mut Player) -> Option
         Press::Up => up(&mut w.row, choices.len()),
         Press::Down => down(&mut w.row, choices.len()),
         Press::Confirm => match choices[w.row.min(choices.len() - 1)] {
-            Choice::Use => return Some((player.use_item(w.item), None)),
+            Choice::Use => return Some((player.use_item(item), None)),
             Choice::PutOnHotbar | Choice::MoveOnHotbar => {
                 let free = player.hotbar.iter().position(Option::is_none);
-                w.picking = Some(player.slot_of(w.item).or(free).unwrap_or(0));
+                w.picking = Some(player.slot_of(item).or(free).unwrap_or(0));
             }
             Choice::TakeOffHotbar => {
-                player.take_off_hotbar(w.item);
+                player.take_off_hotbar(item);
                 return Some((format!("the {name} is off the hotbar"), None));
             }
             Choice::Equip => {
-                let worn = player.slot_for(w.item).is_some_and(|at| player.equip(w.item, at));
+                let worn = player.slot_for(item).is_some_and(|at| player.equip(w.item, at));
                 let said = if worn { format!("you put on the {name}") } else { "you have no room for what you'd take off".to_string() };
                 return Some((said, None));
             }
@@ -311,6 +319,7 @@ fn window_press(w: &mut ItemWindow, press: Press, player: &mut Player) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::Item;
 
     fn presses(menu: &mut Menu, player: &mut Player, presses: &[Press]) -> Outcome {
         let mut last = Outcome::Nothing;
@@ -392,7 +401,7 @@ mod tests {
         presses(&mut m, &mut p, &[Press::Confirm]);
         // The free slot is offered first.
         assert!(m.picking());
-        assert_eq!(item_window(&m), Some(ItemWindow { item: Item::ManaPotion, row: 1, picking: Some(1) }));
+        assert_eq!(item_window(&m), Some(ItemWindow { item: Item::ManaPotion.into(), row: 1, picking: Some(1) }));
         presses(&mut m, &mut p, &[Press::Slot(3)]);
         assert_eq!(p.hotbar[3], Some(Item::ManaPotion));
         assert_eq!(p.slot_of(Item::CalmingPotion), None);
@@ -407,7 +416,7 @@ mod tests {
         assert_eq!(p.hotbar[0], Some(Item::ClearSeeingPotion));
         assert_eq!(p.hotbar[2], None);
         p.unequip(1);
-        let buckler = p.items.iter().position(|s| s.0 == Item::Buckler).unwrap();
+        let buckler = p.items.iter().position(|s| s.0.item == Item::Buckler).unwrap();
         let mut m = at(buckler);
         presses(&mut m, &mut p, &[Press::Slot(1)]);
         assert_eq!(p.hotbar[1], Some(Item::ManaPotion));
@@ -419,7 +428,7 @@ mod tests {
         let mut p = Player::new();
         let mut m = Menu::inventory();
         presses(&mut m, &mut p, &[Press::Confirm, Press::Down, Press::Confirm, Press::Back]);
-        assert_eq!(item_window(&m), Some(ItemWindow { item: Item::HealingPotion, row: 1, picking: None }));
+        assert_eq!(item_window(&m), Some(ItemWindow { item: Item::HealingPotion.into(), row: 1, picking: None }));
         presses(&mut m, &mut p, &[Press::Back]);
         assert_eq!(m, Menu::inventory());
         assert_eq!(p.hotbar[0], Some(Item::HealingPotion));
@@ -431,7 +440,7 @@ mod tests {
         let mut m = Menu::inventory();
         presses(&mut m, &mut p, &[Press::Confirm, Press::Down, Press::Down, Press::Confirm]);
         assert_eq!(p.hotbar[0], None);
-        assert_eq!(choices(&p, Item::HealingPotion), [Choice::Use, Choice::PutOnHotbar, Choice::Drop]);
+        assert_eq!(choices(&p, Item::HealingPotion.into()), [Choice::Use, Choice::PutOnHotbar, Choice::Drop]);
     }
 
     #[test]
@@ -439,17 +448,17 @@ mod tests {
         let mut p = Player::new();
         let mut m = Menu::inventory();
         let out = presses(&mut m, &mut p, &[Press::Confirm, Press::Up, Press::Confirm]);
-        assert_eq!(out, Outcome::Drop(Item::HealingPotion));
+        assert_eq!(out, Outcome::Drop(Item::HealingPotion.into()));
         assert_eq!(p.count(Item::HealingPotion), 2);
     }
 
     #[test]
     fn gear_from_the_list_is_equipped_where_it_goes() {
         let mut p = Player::new();
-        let ring = p.items.iter().position(|s| s.0 == Item::CopperRing).unwrap();
+        let ring = p.items.iter().position(|s| s.0.item == Item::CopperRing).unwrap();
         let mut m = at(ring);
         presses(&mut m, &mut p, &[Press::Confirm, Press::Confirm, Press::Confirm, Press::Confirm]);
-        assert_eq!(p.equipped[5..], [Some(Item::CopperRing); 2]);
+        assert_eq!(p.equipped[5..], [Some(Item::CopperRing.into()); 2]);
         assert_eq!(p.stats().magic, 2);
     }
 
@@ -461,9 +470,9 @@ mod tests {
         assert_eq!(m.screen, Screen::Inventory { row: 0, gear: Some(1), window: None });
         // With the buckler taken off, the left hand offers it and nothing to take off.
         p.unequip(1);
-        assert_eq!(gear_choices(&p, 1), [Some(Item::Buckler)]);
+        assert_eq!(gear_choices(&p, 1), [Some(Item::Buckler.into())]);
         presses(&mut m, &mut p, &[Press::Confirm, Press::Confirm]);
-        assert_eq!(p.equipped[1], Some(Item::Buckler));
+        assert_eq!(p.equipped[1], Some(Item::Buckler.into()));
         assert_eq!(gear_choices(&p, 1), [None]);
         presses(&mut m, &mut p, &[Press::Confirm, Press::Confirm]);
         assert_eq!(p.equipped[1], None);
@@ -475,7 +484,7 @@ mod tests {
     #[test]
     fn an_empty_equipment_slot_with_nothing_to_wear_opens_an_empty_window() {
         let mut p = Player::new();
-        p.items.retain(|s| s.0 != Item::LeatherVest);
+        p.items.retain(|s| s.0.item != Item::LeatherVest);
         let mut m = Menu::inventory();
         presses(&mut m, &mut p, &[Press::Right, Press::Down, Press::Down, Press::Down, Press::Confirm]);
         assert_eq!(gear_choices(&p, 3), []);
@@ -506,5 +515,16 @@ mod tests {
         let mut m = Menu::inventory();
         presses(&mut m, &mut p, &[Press::Up, Press::Down, Press::Confirm, Press::Slot(0)]);
         assert_eq!(m, Menu::inventory());
+    }
+
+    #[test]
+    fn broken_gear_can_only_be_dropped_and_isnt_offered_to_wear() {
+        let mut p = Player::new();
+        let broken = Piece { item: Item::Sword, left: 0 };
+        p.add(broken, 1);
+        assert_eq!(choices(&p, broken), [Choice::Drop]);
+        assert_eq!(gear_choices(&p, 0), [None], "only taking off what's worn");
+        p.add(Item::Sword, 1);
+        assert_eq!(gear_choices(&p, 0), [Some(Item::Sword.into()), None]);
     }
 }

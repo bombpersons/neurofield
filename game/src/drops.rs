@@ -4,7 +4,7 @@
 //! hidden when the level stands between it and the eye and fading into the fog. No Bevy here.
 
 use crate::hands::ScreenTri;
-use crate::player::Item;
+use crate::player::{Item, Piece};
 use engine::world::scene::{Camera, Scene, T};
 
 const TF: f32 = T as f32;
@@ -19,7 +19,8 @@ const NEAR: f32 = 8.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dropped {
-    pub item: Item,
+    /// What it is, as worn as it was.
+    pub item: Piece,
     /// The middle of its bottom face, on the floor.
     pub at: [f32; 3],
     /// Whether the feet have been out of reach since it was dropped.
@@ -28,7 +29,7 @@ pub struct Dropped {
 
 /// Put `item` down ahead of feet at `feet` facing `yaw` (radians, as `Sim::feet`), on the
 /// floor there, or at the feet if a wall or a drop is in the way.
-pub fn drop(scene: &Scene, item: Item, feet: [f32; 3], yaw: f32) -> Dropped {
+pub fn drop(scene: &Scene, item: Piece, feet: [f32; 3], yaw: f32) -> Dropped {
     let (s, c) = yaw.sin_cos();
     let ahead = [feet[0] - s * AHEAD, feet[2] + c * AHEAD];
     let knee = |x: f32, z: f32| [x, feet[1] - 0.3 * TF, z];
@@ -43,7 +44,8 @@ pub fn drop(scene: &Scene, item: Item, feet: [f32; 3], yaw: f32) -> Dropped {
 
 /// A thing the level put on the floor at `at` (an `Item` entity, or out of a chest): on
 /// the floor there, to be picked up as soon as the feet reach it.
-pub fn lying(scene: &Scene, item: Item, at: [f32; 3]) -> Dropped {
+pub fn lying(scene: &Scene, item: impl Into<Piece>, at: [f32; 3]) -> Dropped {
+    let item = item.into();
     let y = scene.floor_y(at[0], at[1], at[2]).unwrap_or(at[1]);
     Dropped { item, at: [at[0], y, at[2]], armed: true }
 }
@@ -128,7 +130,7 @@ pub fn triangles(drops: &[Dropped], scene: &Scene, cam: &Camera, width: u32) -> 
             continue;
         }
         let fog = ((v[2] - cam.fog_near as f32) / (far - cam.fog_near as f32).max(1.0)).clamp(0.0, 1.0);
-        let base = colour(d.item);
+        let base = colour(d.item.item);
         // Each face: its outward normal (world) and the two axes across it.
         for axis in 0..3 {
             for sign in [-1.0f32, 1.0] {
@@ -166,7 +168,7 @@ mod tests {
     use super::*;
 
     fn dropped(at: [f32; 3]) -> Dropped {
-        Dropped { item: Item::HealingPotion, at, armed: false }
+        Dropped { item: Item::HealingPotion.into(), at, armed: false }
     }
 
     #[test]
@@ -176,7 +178,7 @@ mod tests {
         let w = &level.walker;
         let yaw = w.yaw / 4096.0 * std::f32::consts::TAU;
         let feet = [w.x, w.y + engine::world::walker::EYE, w.z];
-        let d = drop(&level.scene, Item::HealingPotion, feet, yaw);
+        let d = drop(&level.scene, Item::HealingPotion.into(), feet, yaw);
         let mut cam = w.camera();
         cam.pitch = 400;
         let tris = triangles(&[d.clone()], &level.scene, &cam, 320);

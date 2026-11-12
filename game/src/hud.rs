@@ -3,7 +3,7 @@
 
 use crate::menu::{self, Choice, GearWindow, ItemWindow, Menu, Screen, Window, PAUSE_ROWS};
 use crate::hands::{self, Kind, Pose, ScreenTri};
-use crate::player::{Item, Player, Stats, CLARITY_SECS, EQUIPMENT, SLOTS, STAMINA};
+use crate::player::{Item, Piece, Player, Stats, CLARITY_SECS, EQUIPMENT, SLOTS, STAMINA};
 use psx_bevy::psx::font;
 
 const MARGIN: i32 = 8;
@@ -33,6 +33,8 @@ const MP_TEXT: Rgba = [120, 150, 255, 255];
 /// A stat going up or down with what might be worn.
 const BETTER: Rgba = [130, 225, 120, 255];
 const WORSE: Rgba = [240, 95, 85, 255];
+/// What is broken: its name, and the crack across its icon.
+const BROKEN: Rgba = [200, 90, 70, 255];
 /// Gear's colours: steel, wood, leather and copper.
 const STEEL: Rgba = [200, 205, 215, 255];
 const WOOD: Rgba = [150, 105, 60, 255];
@@ -69,19 +71,21 @@ pub struct HudState {
     /// Dropped things in view (`drops::triangles`), under the hands and the HUD.
     pub drops: Vec<ScreenTri>,
     pub menu: Option<MenuShown>,
+    /// A notice that something happened (gear breaking), shown for a moment.
+    pub toast: Option<String>,
 }
 
 /// The menu as it is drawn, with what it shows of the player.
 #[derive(Clone, PartialEq)]
 pub struct MenuShown {
     pub menu: Menu,
-    pub items: Vec<(Item, u32)>,
+    pub items: Vec<(Piece, u32)>,
     pub hotbar: [Option<Item>; SLOTS],
-    pub equipped: [Option<Item>; EQUIPMENT.len()],
+    pub equipped: [Option<Piece>; EQUIPMENT.len()],
     pub stats: Stats,
     /// The open item window's choices, or the equipment window's (`None` takes off).
     pub choices: Vec<Choice>,
-    pub wears: Vec<Option<Item>>,
+    pub wears: Vec<Option<Piece>>,
     /// The stats with what the equipment window has picked worn.
     pub preview: Option<Stats>,
 }
@@ -103,6 +107,7 @@ impl HudState {
             heading: (yaw / std::f32::consts::TAU * HEADINGS as f32).round().rem_euclid(HEADINGS as f32) as i32,
             hands,
             drops: Vec::new(),
+            toast: None,
             menu: menu.map(|m| MenuShown {
                 menu: m.clone(),
                 items: p.items.clone(),
@@ -119,13 +124,29 @@ impl HudState {
                 },
                 preview: match m.screen {
                     Screen::Inventory { window: Some(Window::Gear(w)), .. } => {
-                        menu::gear_choices(p, w.at).get(w.row).map(|&wear| p.stats_with(w.at, wear))
+                        menu::gear_choices(p, w.at).get(w.row).map(|&wear| p.stats_with(w.at, wear.map(|w| w.item)))
                     }
                     _ => None,
                 },
             }),
         }
     }
+}
+
+/// How many of a piece are carried, and for what wears how much wear it has left:
+/// "x3", "31/45", "x2 45/45"; a broken one's name says so.
+fn amount(piece: Piece, n: u32) -> String {
+    match piece.wear() {
+        Some(_) if piece.broken() => if n > 1 { format!("x{n}") } else { String::new() },
+        Some((left, of)) if n > 1 => format!("x{n} {left}/{of}"),
+        Some((left, of)) => format!("{left}/{of}"),
+        None => format!("x{n}"),
+    }
+}
+
+/// The colour a piece's name is written in.
+fn named(piece: Piece) -> Rgba {
+    if piece.broken() { BROKEN } else { WHITE }
 }
 
 /// An item's name as a title: "Healing potion".
@@ -256,6 +277,15 @@ impl Canvas<'_> {
         self.fill(x + 5, y + 7, 2, 4, [255, 255, 255, 170]); // the shine
     }
 
+    /// A piece's icon, cracked across if it's broken.
+    fn piece_icon(&mut self, x: i32, y: i32, piece: Piece) {
+        self.icon(x, y, piece.item);
+        if piece.broken() {
+            self.line((x as f32 + 2.0, y as f32 + 4.0), (x as f32 + 14.0, y as f32 + 12.0), BROKEN);
+            self.line((x as f32 + 2.0, y as f32 + 5.0), (x as f32 + 13.0, y as f32 + 13.0), BROKEN);
+        }
+    }
+
     fn icon(&mut self, x: i32, y: i32, item: Item) {
         match item {
             Item::HealingPotion => self.flask(x, y, HP),
@@ -325,6 +355,16 @@ impl Canvas<'_> {
         if let Some(k) = key {
             self.text(x + 2, y + 1, &k.to_string(), FRAME);
         }
+    }
+
+    /// A short notice, in a panel across the top middle of the screen.
+    fn toast(&mut self, text: &str) {
+        let w = font::text_width(text) as i32 + 12;
+        let x = (self.w - w) / 2;
+        let y = MARGIN + 30;
+        self.fill(x, y, w, 15, PANEL);
+        self.outline(x, y, w, 15, FRAME);
+        self.text(x + 6, y + 4, text, WHITE);
     }
 
     fn compass(&mut self, heading: i32) {
@@ -422,16 +462,16 @@ impl Canvas<'_> {
         if shown.items.is_empty() {
             self.text(lx + 6, top + 4, "Nothing carried", DIM);
         }
-        for (i, &(item, n)) in shown.items.iter().enumerate().skip(first).take(fits) {
+        for (i, &(piece, n)) in shown.items.iter().enumerate().skip(first).take(fits) {
             let ry = top + (i - first) as i32 * ITEM_ROW;
             // The mouse counts the items on from the equipment slots.
             self.row([lx, ry, lw, ITEM_ROW], i == row && gear.is_none(), window.is_none(), EQUIPMENT.len() + i);
-            self.icon(lx + 1, ry + 1, item);
-            if let Some(s) = shown.hotbar.iter().position(|s| *s == Some(item)) {
+            self.piece_icon(lx + 1, ry + 1, piece);
+            if let Some(s) = shown.hotbar.iter().position(|s| *s == Some(piece.item)) {
                 self.text(lx + 1, ry, &(s + 1).to_string(), FRAME);
             }
-            self.text(lx + 20, ry + 5, &title(item.name()), WHITE);
-            let count = format!("x{n}");
+            self.text(lx + 20, ry + 5, &title(&piece.name()), named(piece));
+            let count = amount(piece, n);
             self.text(lx + lw - 2 - font::text_width(&count) as i32, ry + 5, &count, WHITE);
         }
 
@@ -444,8 +484,12 @@ impl Canvas<'_> {
         for (i, slot) in EQUIPMENT.iter().enumerate() {
             self.row([rx, ry, rw, GEAR_ROW], gear == Some(i), window.is_none(), i);
             self.text(rx + 2, ry + 2, slot.name(), DIM);
-            let on = shown.equipped[i].map_or("-".to_string(), |item| title(item.name()));
+            let on = shown.equipped[i].map_or("-".to_string(), |p| title(p.item.name()));
             self.text(rx + 44, ry + 2, &on, WHITE);
+            if let Some((left, of)) = shown.equipped[i].and_then(Piece::wear) {
+                let wear = format!("{left}/{of}");
+                self.text(rx + rw - 2 - font::text_width(&wear) as i32, ry + 2, &wear, DIM);
+            }
             ry += GEAR_ROW;
         }
         ry += 3;
@@ -466,10 +510,13 @@ impl Canvas<'_> {
         }
 
         // What the item does, or what was last done.
-        let picked = match (window, gear) {
+        let picked: Option<Piece> = match (window, gear) {
             (Some(Window::Gear(w)), _) => shown.wears.get(w.row).copied().flatten(),
             (_, Some(g)) => shown.equipped[g],
             _ => shown.items.get(row).map(|s| s.0),
+        };
+        let about = |p: Piece| {
+            if p.broken() { format!("{} Broken: the blacksmith can mend it.", p.item.about()) } else { p.item.about().to_string() }
         };
         let note = match (&shown.menu.note, window) {
             (_, Some(Window::Item(ItemWindow { picking: Some(_), .. }))) => Some(if pad {
@@ -477,14 +524,14 @@ impl Canvas<'_> {
             } else {
                 "Press 1-4, or pick a slot.".to_string()
             }),
-            (_, Some(Window::Gear(_))) => picked.map(|i| i.about().to_string()),
+            (_, Some(Window::Gear(_))) => picked.map(about),
             (Some(note), _) => Some(title(note)),
             // How to put something usable on the hotbar.
-            (None, None) if gear.is_none() && picked.is_some_and(|i| i.slot().is_none()) => {
+            (None, None) if gear.is_none() && picked.is_some_and(|p| p.item.slot().is_none()) => {
                 let how = if pad { "Square + d-pad" } else { "1-4" };
-                picked.map(|i| format!("{} {how} puts it on the hotbar.", i.about()))
+                picked.map(|p| format!("{} {how} puts it on the hotbar.", about(p)))
             }
-            (None, _) => picked.map(|i| i.about().to_string()),
+            (None, _) => picked.map(about),
         };
         if let Some(note) = note {
             for (i, line) in wrap(&note, w - 12).iter().take(2).enumerate() {
@@ -511,11 +558,11 @@ impl Canvas<'_> {
             let ry = y + 18 + i as i32 * ITEM_ROW;
             self.row([x + 3, ry, WINDOW_W - 6, ITEM_ROW], i == win.row, true, i);
             match wear {
-                Some(item) => {
-                    self.icon(x + 4, ry + 1, *item);
-                    self.text(x + 23, ry + 5, &title(item.name()), WHITE);
-                    let n = shown.items.iter().find(|s| s.0 == *item).map_or(0, |s| s.1);
-                    let count = format!("x{n}");
+                Some(piece) => {
+                    self.piece_icon(x + 4, ry + 1, *piece);
+                    self.text(x + 23, ry + 5, &title(&piece.name()), WHITE);
+                    let n = shown.items.iter().find(|s| s.0 == *piece).map_or(0, |s| s.1);
+                    let count = amount(*piece, n);
                     self.text(x + WINDOW_W - 6 - font::text_width(&count) as i32, ry + 5, &count, WHITE);
                 }
                 None => self.text(x + 23, ry + 5, "Take off", WHITE),
@@ -531,8 +578,8 @@ impl Canvas<'_> {
             Some(_) => 18 + SLOT + 6,
         };
         let (x, y) = ((self.w - WINDOW_W) / 2, (self.h - h) / 2);
-        self.panel(x, y, WINDOW_W, h, &title(win.item.name()));
-        let count = |item: Item| shown.items.iter().find(|s| s.0 == item).map_or(0, |s| s.1);
+        self.panel(x, y, WINDOW_W, h, &title(&win.item.name()));
+        let count = |item: Item| shown.items.iter().filter(|s| s.0.item == item).map(|s| s.1).sum::<u32>();
         let content = |s: usize| shown.hotbar[s].map(|i| (i, count(i)));
         match win.picking {
             None => {
@@ -582,6 +629,9 @@ pub fn draw(data: &mut [u8], stride: u32, h: u32, state: &HudState) -> Vec<Hit> 
     c.compass(state.heading);
     c.hotbar(state);
     c.spell();
+    if let (Some(toast), None) = (&state.toast, &state.menu) {
+        c.toast(toast);
+    }
     if let Some(shown) = &state.menu {
         match shown.menu.screen {
             Screen::Pause { row } => c.pause(row),
@@ -720,10 +770,10 @@ mod tests {
         let list = hits(&menu_state(Screen::Inventory { row: 0, gear: None, window: None }, W, false));
         assert_eq!(list.len(), EQUIPMENT.len() + items);
         assert!(list.iter().any(|h| h.1 == EQUIPMENT.len() + items - 1));
-        let window = Some(Window::Item(ItemWindow { item: Item::HealingPotion, row: 0, picking: None }));
+        let window = Some(Window::Item(ItemWindow { item: Item::HealingPotion.into(), row: 0, picking: None }));
         assert_eq!(hits(&menu_state(Screen::Inventory { row: 0, gear: None, window }, W, false)).len(), 4);
         for pad in [false, true] {
-            let picking = Some(Window::Item(ItemWindow { item: Item::HealingPotion, row: 1, picking: Some(0) }));
+            let picking = Some(Window::Item(ItemWindow { item: Item::HealingPotion.into(), row: 1, picking: Some(0) }));
             assert_eq!(hits(&menu_state(Screen::Inventory { row: 0, gear: None, window: picking }, W, pad)).len(), SLOTS);
         }
         let gear = Some(Window::Gear(GearWindow { at: 5, row: 0 }));
@@ -765,5 +815,14 @@ mod tests {
         let s = |yaw: f32| HudState::of(&p, None, W, false, yaw, held()).heading;
         assert_eq!(s(std::f32::consts::TAU), s(0.0));
         assert_eq!(s(-std::f32::consts::FRAC_PI_2), HEADINGS * 3 / 4);
+    }
+
+    #[test]
+    fn amounts_say_how_many_and_how_worn() {
+        assert_eq!(amount(Item::HealingPotion.into(), 3), "x3");
+        assert_eq!(amount(Piece { item: Item::Sword, left: 31 }, 1), "31/45");
+        assert_eq!(amount(Item::Sword.into(), 2), "x2 45/45");
+        assert_eq!(amount(Piece { item: Item::Sword, left: 0 }, 1), "");
+        assert_eq!(amount(Piece { item: Item::Sword, left: 0 }, 2), "x2");
     }
 }

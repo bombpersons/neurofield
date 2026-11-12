@@ -109,6 +109,8 @@ const LASH_AFFLICTION: f32 = 0.01;
 const LASH_BLOCK: f32 = 7.0;
 /// Stamina sprinting uses a second (none comes back meanwhile).
 const SPRINT_TIRE: f32 = 3.0;
+/// Seconds a notice (gear breaking) stays on the HUD.
+const TOAST_SECS: f32 = 2.5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -183,7 +185,10 @@ struct Sim {
     cues: Vec<(usize, engine::world::animate::Cue)>,
     /// `--peaceful`: the creatures do no harm.
     peaceful: bool,
-    struck: Option<i32>,
+    /// The blows that swept through since the last tick: the hand and its attack.
+    struck: Vec<(Side, i32)>,
+    /// A notice on the HUD, and the seconds it has left.
+    toast: Option<(String, f32)>,
     /// Whether the controller was the last thing used, for the shape of the hotbar.
     on_pad: bool,
     /// The pause menu, while it's open; the game stands still under it.
@@ -354,7 +359,7 @@ impl Sim {
                 self.say(format!("picked up the {}", item.name()));
             } else {
                 drops::disarm(&mut self.drops[i]);
-                self.say(format!("you can't carry more of the {}", item.name()));
+                self.say(format!("you can't carry more of the {}", item.item.name()));
             }
         }
     }
@@ -400,6 +405,7 @@ impl Sim {
             cues.clear();
         }
         let struck = std::mem::take(&mut self.struck);
+        let struck_sides: Vec<Side> = struck.iter().map(|b| b.0).collect();
         if self.auto_walk {
             return;
         }
@@ -412,20 +418,28 @@ impl Sim {
         }
         let (feet, yaw) = self.feet();
         // A blow finds a tentacle in its way before any creature.
-        let mut struck = struck;
-        if let (Some(attack), Some(g)) = (struck, &mut self.growths) {
+        let mut attack = (!struck.is_empty()).then(|| struck.iter().map(|b| b.1).sum::<i32>());
+        if let (Some(a), Some(g)) = (attack, &mut self.growths) {
             let chest = [feet[0], feet[1] - 0.6 * walker::EYE, feet[2]];
-            if let Some(killed) = g.strike(chest, [-yaw.sin(), yaw.cos()], foes::SWORD_REACH, foes::SWORD_ARC, attack) {
+            if let Some(killed) = g.strike(chest, [-yaw.sin(), yaw.cos()], foes::SWORD_REACH, foes::SWORD_ARC, a) {
                 self.say(if killed { "the tentacle falls limp" } else { "you cut the tentacle" }.to_string());
-                struck = None;
+                attack = None;
+                self.wear(struck.iter().map(|b| b.0).collect());
             }
         }
+        let struck = attack;
         let stats = self.player.stats();
         let target = foes::Target { feet, yaw, guarding: self.hands.guarding(), stamina: self.player.stamina, struck, defence: stats.defence };
         let out = self.foes.tick(self.version, self.herd.animators(), &self.level.scene.creatures, &cues, &target, dt, &mut self.rng);
         self.player.hurt(out.hurt);
         self.player.afflict(out.afflict);
         self.player.tire(out.tired);
+        if out.hit {
+            self.wear(struck_sides);
+        }
+        if out.blocked {
+            self.wear(self.hands.guards());
+        }
         if out.broken {
             self.hands.break_guard();
         } else if out.blocked {
@@ -433,6 +447,19 @@ impl Sim {
         }
         if let Some(what) = out.said {
             self.say(what);
+        }
+    }
+
+    /// The things in hands `sides` take a use each: a blow landed, or a shield took one. One
+    /// that breaks leaves its hand empty, with a notice.
+    fn wear(&mut self, sides: Vec<Side>) {
+        for side in sides {
+            let Some(item) = self.player.hand(side) else { continue };
+            if let player::Worn::Broke { kept } = self.player.wear(side as usize) {
+                let what = format!("your {} breaks", item.name());
+                self.say(if kept { what.clone() } else { format!("{what}, and you have no room to keep it") });
+                self.toast = Some((title_case(&what), TOAST_SECS));
+            }
         }
     }
 
@@ -449,6 +476,7 @@ impl Sim {
         let (feet, yaw) = self.feet();
         if self.hands.guarding() && foes::off_ahead(feet, yaw, lash.root) < foes::SHIELD_ARC {
             self.player.tire(LASH_BLOCK);
+            self.wear(self.hands.guards());
             if let Some(g) = &mut self.growths {
                 g.recoil(lash.which);
             }
@@ -472,6 +500,12 @@ impl Sim {
         let w = &self.level.walker;
         ([w.x, w.y + walker::EYE, w.z], w.yaw / 4096.0 * std::f32::consts::TAU)
     }
+}
+
+/// `text` with a capital first letter, for a notice.
+fn title_case(text: &str) -> String {
+    let mut c = text.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
 /// A hand-built level, and the items lying about in it.
@@ -708,7 +742,8 @@ fn main() {
             foes: Default::default(),
             cues: Vec::new(),
             peaceful,
-            struck: None,
+            struck: Vec::new(),
+            toast: None,
             tris: 0,
             width: W,
             strangeness,
@@ -1168,7 +1203,7 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         doors: sim.level.scene.things.doors.iter().map(|d| (d.entity, d.open)).collect(),
         hp: sim.player.hp,
         mp: sim.player.mp,
-        items: sim.player.items.iter().map(|(i, n)| (i.name().to_string(), *n)).collect(),
+        items: sim.player.items.iter().map(|(p, n)| (p.name(), *n)).collect(),
         hotbar: sim.player.hotbar.iter().map(|s| s.map_or(String::new(), |i| i.name().to_string())).collect(),
         airborne: sim.level.walker.airborne(),
         sprinting: sim.level.walker.sprinting(),
@@ -1186,9 +1221,9 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         veil: sim.veil,
         growths: sim.growths.as_ref().map_or(0, Growths::count),
         menu: sim.menu.as_ref().map_or(String::new(), |m| format!("{:?}", m.screen)),
-        equipped: sim.player.equipped.iter().map(|s| s.map_or(String::new(), |i| i.name().to_string())).collect(),
+        equipped: sim.player.equipped.iter().map(|s| s.map_or(String::new(), |p| p.wear().map_or(p.name(), |(l, of)| format!("{} {l}/{of}", p.name())))).collect(),
         stats: { let s = sim.player.stats(); [s.attack, s.defence, s.magic] },
-        drops: sim.drops.iter().map(|d| (d.item.name().to_string(), Vec3::from(d.at))).collect(),
+        drops: sim.drops.iter().map(|d| (d.item.name(), Vec3::from(d.at))).collect(),
     };
     if sim.frozen() {
         return;
@@ -1221,6 +1256,12 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         sim.said = Some((format!("picked up the {name}"), 3.0));
         sim.held.push((id, name));
         sim.level.things_moved();
+    }
+    if let Some((_, t)) = &mut sim.toast {
+        *t -= 1.0 / TICK as f32;
+        if *t <= 0.0 {
+            sim.toast = None;
+        }
     }
     if let Some((_, t)) = &mut sim.said {
         *t -= 1.0 / TICK as f32;
@@ -1579,13 +1620,14 @@ fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut i
         for (side, full) in sim.hands.update(time.delta_secs(), sim.level.walker.yaw, held) {
             let attack = sim.player.attack_with(side);
             let blow = if full { attack } else { (attack / LABOURED).max(1) };
-            *sim.struck.get_or_insert(0) += blow;
+            sim.struck.push((side, blow));
         }
         sim.level.walker.kick = sim.hands.kick();
     }
     let width = if sim.shown() == Mode::Raster { W } else { sim.width };
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
     let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.hands.shown(sim.level.walker.bob()));
+    state.toast = sim.toast.as_ref().map(|t| t.0.clone());
     if !sim.drops.is_empty() {
         state.drops = drops::triangles(&sim.drops, &sim.level.scene, &sim.level.walker.camera(), width);
     }

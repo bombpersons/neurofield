@@ -153,6 +153,16 @@ impl Item {
         self == Item::Buckler
     }
 
+    /// How many uses a new one has before it breaks: a weapon's blows that land, a shield's
+    /// blocks. None (0) for what doesn't wear.
+    pub fn durability(self) -> u16 {
+        match self {
+            Item::Sword => 45,
+            Item::Buckler => 25,
+            _ => 0,
+        }
+    }
+
     /// What wearing it adds.
     pub fn stats(self) -> Stats {
         let s = |attack, defence, magic| Stats { attack, defence, magic };
@@ -166,6 +176,52 @@ impl Item {
             _ => Stats::default(),
         }
     }
+}
+
+/// One carried or worn thing as it is: what it is, and for what wears (weapons and shields)
+/// the uses it has left; at none it's broken. Pieces alike stack, so a worn sword is carried
+/// apart from new ones. An `Item` alone means a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Piece {
+    pub item: Item,
+    pub left: u16,
+}
+
+impl Piece {
+    pub fn new(item: Item) -> Piece {
+        Piece { item, left: item.durability() }
+    }
+
+    pub fn broken(self) -> bool {
+        self.item.durability() > 0 && self.left == 0
+    }
+
+    /// Its name, saying if it's broken.
+    pub fn name(self) -> String {
+        if self.broken() { format!("broken {}", self.item.name()) } else { self.item.name().to_string() }
+    }
+
+    /// How much wear it has left, for what wears: (left, of).
+    pub fn wear(self) -> Option<(u16, u16)> {
+        let most = self.item.durability();
+        (most > 0).then_some((self.left, most))
+    }
+}
+
+impl From<Item> for Piece {
+    fn from(item: Item) -> Piece {
+        Piece::new(item)
+    }
+}
+
+/// What wearing down the piece in an equipment slot came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Worn {
+    /// Nothing there wears.
+    Nothing,
+    Still,
+    /// It broke and is off: in the bag, or gone with no room there.
+    Broke { kept: bool },
 }
 
 pub const SLOTS: usize = 4;
@@ -193,11 +249,11 @@ pub struct Player {
     pub clarity: f32,
     /// What holding up a shield, being hit and attacking use up, 0..`STAMINA`.
     pub stamina: f32,
-    /// What is carried and how many, in the order first picked up.
-    pub items: Vec<(Item, u32)>,
+    /// What is carried and how many alike, in the order first picked up.
+    pub items: Vec<(Piece, u32)>,
     pub hotbar: [Option<Item>; SLOTS],
     /// What is worn, by `EQUIPMENT` slot; worn things aren't in `items`.
-    pub equipped: [Option<Item>; EQUIPMENT.len()],
+    pub equipped: [Option<Piece>; EQUIPMENT.len()],
 }
 
 impl Player {
@@ -214,8 +270,8 @@ impl Player {
             hotbar: [None; SLOTS],
             equipped: [None; EQUIPMENT.len()],
         };
-        p.equipped[0] = Some(Item::Sword);
-        p.equipped[1] = Some(Item::Buckler);
+        p.equipped[0] = Some(Item::Sword.into());
+        p.equipped[1] = Some(Item::Buckler.into());
         p.add(Item::HealingPotion, 3);
         p.add(Item::ManaPotion, 2);
         p.add(Item::ClearSeeingPotion, 2);
@@ -229,29 +285,31 @@ impl Player {
 
     /// The player's own stats, with all they wear.
     pub fn stats(&self) -> Stats {
-        self.equipped.iter().flatten().fold(Stats::default(), |s, i| s + i.stats())
+        self.equipped.iter().flatten().fold(Stats::default(), |s, p| s + p.item.stats())
     }
 
     /// The stats with `item` worn in equipment slot `at` instead of what is there.
     pub fn stats_with(&self, at: usize, item: Option<Item>) -> Stats {
-        let mut p = self.equipped;
-        p[at] = item;
-        p.iter().flatten().fold(Stats::default(), |s, i| s + i.stats())
+        let mut worn = self.equipped.map(|s| s.map(|p| p.item));
+        worn[at] = item;
+        worn.iter().flatten().fold(Stats::default(), |s, i| s + i.stats())
     }
 
-    /// Wear one of `item` in equipment slot `at`, the one there going back into the bag.
-    /// False if it doesn't go there, none is carried, or there's no room for the old one.
-    pub fn equip(&mut self, item: Item, at: usize) -> bool {
-        if !item.fits(EQUIPMENT[at]) || self.count(item) == 0 {
+    /// Wear one carried `piece` in equipment slot `at`, the one there going back into the bag.
+    /// False if it doesn't go there, it's broken, none is carried, or there's no room for the
+    /// old one.
+    pub fn equip(&mut self, piece: impl Into<Piece>, at: usize) -> bool {
+        let piece = piece.into();
+        if !piece.item.fits(EQUIPMENT[at]) || piece.broken() || self.carried(piece) == 0 {
             return false;
         }
         if let Some(old) = self.equipped[at] {
-            if old != item && self.count(old) >= MOST {
+            if old.item != piece.item && self.count(old.item) >= MOST {
                 return false;
             }
         }
-        self.remove_one(item);
-        if let Some(old) = self.equipped[at].replace(item) {
+        self.remove_one(piece);
+        if let Some(old) = self.equipped[at].replace(piece) {
             self.add(old, 1);
         }
         true
@@ -268,25 +326,43 @@ impl Player {
     /// Take off what is in equipment slot `at`; false if there's nothing, or no room for it.
     pub fn unequip(&mut self, at: usize) -> bool {
         match self.equipped[at] {
-            Some(item) if self.count(item) < MOST => {
+            Some(piece) if self.count(piece.item) < MOST => {
                 self.equipped[at] = None;
-                self.add(item, 1);
+                self.add(piece, 1);
                 true
             }
             _ => false,
         }
     }
 
-    /// Drop one of `item`: false if none is carried.
-    pub fn drop_one(&mut self, item: Item) -> bool {
-        let had = self.count(item) > 0;
-        self.remove_one(item);
+    /// One use wears down what is in equipment slot `at`: a blow landed with the weapon there,
+    /// or the shield there took one. The last use breaks it, and it comes off into the bag
+    /// (or is lost, with no room there).
+    pub fn wear(&mut self, at: usize) -> Worn {
+        let Some(piece) = &mut self.equipped[at] else { return Worn::Nothing };
+        if piece.wear().is_none() {
+            return Worn::Nothing;
+        }
+        piece.left = piece.left.saturating_sub(1);
+        if piece.left > 0 {
+            return Worn::Still;
+        }
+        let broken = *piece;
+        self.equipped[at] = None;
+        Worn::Broke { kept: self.add(broken, 1) == 0 }
+    }
+
+    /// Drop one `piece`: false if none is carried.
+    pub fn drop_one(&mut self, piece: impl Into<Piece>) -> bool {
+        let piece = piece.into();
+        let had = self.carried(piece) > 0;
+        self.remove_one(piece);
         had
     }
 
     /// What is held in a hand.
     pub fn hand(&self, side: Side) -> Option<Item> {
-        self.equipped[side as usize]
+        self.equipped[side as usize].map(|p| p.item)
     }
 
     /// The attack of a blow from the weapon in hand `side`: the other hand's weapon doesn't
@@ -301,21 +377,29 @@ impl Player {
         self.stamina = (self.stamina - n).max(0.0);
     }
 
+    /// How many of `item` are carried, whatever their wear.
     pub fn count(&self, item: Item) -> u32 {
-        self.items.iter().find(|s| s.0 == item).map_or(0, |s| s.1)
+        self.items.iter().filter(|s| s.0.item == item).map(|s| s.1).sum()
     }
 
-    /// Carry up to `n` more of `item`, as many as there's room for up to `MOST`, and put
-    /// what can be used on the first free hotbar slot if it isn't on one. Gives how many
-    /// there was no room for.
-    pub fn add(&mut self, item: Item, n: u32) -> u32 {
+    /// How many carried are just like `piece`.
+    pub fn carried(&self, piece: Piece) -> u32 {
+        self.items.iter().find(|s| s.0 == piece).map_or(0, |s| s.1)
+    }
+
+    /// Carry up to `n` more of `piece` (an `Item`: new ones), as many as there's room for up
+    /// to `MOST` of its kind, and put what can be used on the first free hotbar slot if it
+    /// isn't on one. Gives how many there was no room for.
+    pub fn add(&mut self, piece: impl Into<Piece>, n: u32) -> u32 {
+        let piece = piece.into();
+        let item = piece.item;
         let took = n.min(MOST - self.count(item));
         if took == 0 {
             return n;
         }
-        match self.items.iter_mut().find(|s| s.0 == item) {
+        match self.items.iter_mut().find(|s| s.0 == piece) {
             Some(s) => s.1 += took,
-            None => self.items.push((item, took)),
+            None => self.items.push((piece, took)),
         }
         if item.slot().is_none() && !self.hotbar.contains(&Some(item)) {
             if let Some(free) = self.hotbar.iter_mut().find(|s| s.is_none()) {
@@ -325,13 +409,15 @@ impl Player {
         n - took
     }
 
-    /// Lose one of `item`, and its hotbar slot with the last of them.
-    fn remove_one(&mut self, item: Item) {
-        if let Some(i) = self.items.iter().position(|s| s.0 == item) {
+    /// Lose one `piece`, and its hotbar slot with the last of its kind.
+    fn remove_one(&mut self, piece: Piece) {
+        if let Some(i) = self.items.iter().position(|s| s.0 == piece) {
             self.items[i].1 -= 1;
             if self.items[i].1 == 0 {
                 self.items.remove(i);
-                self.hotbar.iter_mut().filter(|s| **s == Some(item)).for_each(|s| *s = None);
+            }
+            if self.count(piece.item) == 0 {
+                self.hotbar.iter_mut().filter(|s| **s == Some(piece.item)).for_each(|s| *s = None);
             }
         }
     }
@@ -386,25 +472,25 @@ impl Player {
             Item::HealingPotion if self.hp >= self.max_hp => "you are not hurt".into(),
             Item::HealingPotion => {
                 self.hp = (self.hp + HEAL).min(self.max_hp);
-                self.remove_one(item);
+                self.remove_one(item.into());
                 "you drink the healing potion".into()
             }
             Item::ManaPotion if self.mp >= self.max_mp => "your mind is already clear".into(),
             Item::ManaPotion => {
                 self.mp = (self.mp + RESTORE).min(self.max_mp);
-                self.remove_one(item);
+                self.remove_one(item.into());
                 "you drink the mana potion".into()
             }
             Item::ClearSeeingPotion if self.clarity > 0.0 => "you already see clearly".into(),
             Item::ClearSeeingPotion => {
                 self.clarity = CLARITY_SECS;
-                self.remove_one(item);
+                self.remove_one(item.into());
                 "the dream lifts".into()
             }
             Item::CalmingPotion if self.affliction <= 0.0 => "nothing troubles you".into(),
             Item::CalmingPotion => {
                 self.affliction = 0.0;
-                self.remove_one(item);
+                self.remove_one(item.into());
                 "your head clears".into()
             }
             _ => format!("the {} can't be used", item.name()),
@@ -498,7 +584,7 @@ mod tests {
         assert!(p.unequip(1));
         assert_eq!(p.stats().defence, 0);
         assert!(!p.equip(Item::Buckler, 2));
-        p.items.retain(|s| s.0 != Item::LeatherVest);
+        p.items.retain(|s| s.0.item != Item::LeatherVest);
         assert!(!p.equip(Item::LeatherVest, 3));
         assert!(p.equip(Item::Buckler, 1));
         assert_eq!(p.count(Item::Buckler), 0);
@@ -554,7 +640,7 @@ mod tests {
         assert!(p.equip(Item::CopperRing, second));
         assert_eq!(p.count(Item::CopperRing), 0);
         assert_eq!(p.stats().magic, 2);
-        assert!(!p.items.iter().any(|s| s.0 == Item::CopperRing));
+        assert!(!p.items.iter().any(|s| s.0.item == Item::CopperRing));
     }
 
     #[test]
@@ -623,5 +709,61 @@ mod tests {
         p.hurt(1000);
         p.spend_mp(1000);
         assert_eq!((p.hp, p.mp), (0, 0));
+    }
+
+    #[test]
+    fn a_weapon_wears_down_and_breaks_into_the_bag() {
+        let mut p = Player::new();
+        let uses = Item::Sword.durability();
+        for _ in 1..uses {
+            assert_eq!(p.wear(0), Worn::Still);
+        }
+        assert_eq!(p.equipped[0], Some(Piece { item: Item::Sword, left: 1 }));
+        assert_eq!(p.wear(0), Worn::Broke { kept: true });
+        assert_eq!(p.hand(Side::Right), None, "the hand is left empty");
+        assert_eq!(p.stats().attack, 0);
+        let broken = Piece { item: Item::Sword, left: 0 };
+        assert!(broken.broken());
+        assert_eq!(broken.name(), "broken sword");
+        assert_eq!(p.carried(broken), 1);
+        assert!(!p.equip(broken, 0), "a broken piece can't be worn");
+        assert_eq!(p.wear(0), Worn::Nothing);
+    }
+
+    #[test]
+    fn what_doesnt_wear_doesnt_and_shields_wear_too() {
+        let mut p = Player::new();
+        assert!(p.equip(Item::LeatherCap, 2));
+        assert_eq!(p.wear(2), Worn::Nothing);
+        assert_eq!(p.equipped[2], Some(Item::LeatherCap.into()));
+        assert_eq!(p.wear(1), Worn::Still);
+        assert_eq!(p.equipped[1].unwrap().left, Item::Buckler.durability() - 1);
+    }
+
+    #[test]
+    fn a_worn_piece_is_carried_apart_and_keeps_its_wear() {
+        let mut p = Player::new();
+        p.wear(0);
+        let worn = p.equipped[0].unwrap();
+        assert!(p.unequip(0));
+        p.add(Item::Sword, 2);
+        assert_eq!(p.carried(worn), 1);
+        assert_eq!(p.carried(Item::Sword.into()), 2);
+        assert_eq!(p.count(Item::Sword), 3);
+        assert!(p.equip(worn, 0));
+        assert_eq!(p.equipped[0], Some(worn));
+        assert_eq!(p.count(Item::Sword), 2);
+        assert!(p.drop_one(Item::Sword));
+        assert!(!p.drop_one(worn), "the worn one is in hand, not carried");
+    }
+
+    #[test]
+    fn a_break_with_no_room_loses_it() {
+        let mut p = Player::new();
+        p.add(Item::Sword, MOST);
+        p.equipped[0] = Some(Piece { item: Item::Sword, left: 1 });
+        assert_eq!(p.wear(0), Worn::Broke { kept: false });
+        assert_eq!(p.count(Item::Sword), MOST);
+        assert_eq!(p.hand(Side::Right), None);
     }
 }

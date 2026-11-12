@@ -78,6 +78,8 @@ pub struct Outcome {
     /// Something was blocked, and the last of it broke the guard.
     pub blocked: bool,
     pub broken: bool,
+    /// The sword found a creature.
+    pub hit: bool,
     pub said: Option<String>,
 }
 
@@ -157,6 +159,7 @@ impl Foes {
                 })
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((i, _)) = hit {
+                out.hit = true;
                 let foe = &mut self.all[i];
                 foe.hp -= attack;
                 foe.hunting = true;
