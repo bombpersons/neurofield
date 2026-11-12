@@ -17,7 +17,7 @@ const AHEAD: f32 = 1.0 * TF;
 const REACH: f32 = 0.45 * TF;
 const NEAR: f32 = 8.0;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dropped {
     /// What it is, as worn as it was.
     pub item: Piece,

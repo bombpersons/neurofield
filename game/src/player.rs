@@ -1,9 +1,11 @@
 //! The player's state: health, mana, what they carry and wear, and what is on the hotbar.
 //! No Bevy here, so the rules can be tested alone.
 
+use serde::{Deserialize, Serialize};
+
 /// Every kind of item. Its use is in `Player::use_item`; what can be worn has a `Slot`.
 /// The gear is a stand-in until the real items are designed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Item {
     HealingPotion,
     ManaPotion,
@@ -181,7 +183,7 @@ impl Item {
 /// One carried or worn thing as it is: what it is, and for what wears (weapons and shields)
 /// the uses it has left; at none it's broken. Pieces alike stack, so a worn sword is carried
 /// apart from new ones. An `Item` alone means a new one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Piece {
     pub item: Item,
     pub left: u16,
@@ -238,6 +240,7 @@ const RECOVER: f32 = 10.0;
 /// of them, the rest being the fades.
 pub const CLARITY_SECS: f32 = 12.0;
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Player {
     pub hp: i32,
     pub max_hp: i32,

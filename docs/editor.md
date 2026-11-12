@@ -170,12 +170,13 @@ default but stored as floats), a yaw, and properties that depend on its kind:
 | Kind | Properties |
 |---|---|
 | `PlayerStart` | (exactly one) |
+| `Respawn` | (one at most) Where the player comes round after dying, in a town; without one, the player start |
 | `Door` | Sits on a cell face between two open cells. Width in tiles, height in layers, `hinge` (left, right, or slides up), `open` (starting state), `locked`, `key` (an entity id) |
 | `Key` | `name` (shown in the UI) |
 | `Chest` | `contents` (item names, one a thing: a name twice is two of it), `locked`, `key` |
 | `Item` | `name` (an item name), `count` (1–99) |
 | `Creature` | `kind` (humanoid, beast, blob, floater, mass), `size`, `seed`, an optional skin motif, `extra_parts` |
-| `Person` | `seed`, an optional `look` of their own (height, build, skin, face features, hair), `role` (wander, stand at a stall, guard). Always drawn as a PS1 model; never fought. |
+| `Person` | `seed`, an optional `look` of their own (height, build, skin, face features, hair), `role` (wander, stand at a stall, guard), `name` and `lines` (what they say, a speech bubble each), `wear` (armour over their clothes), and `saves` (after their lines they ask whether to save the game). Always drawn as a PS1 model; never fought. |
 | `Prop` | `shape` (box, pillar, pyramid, floating cube, …), size, texture, tint |
 | `Light` | as in Lights above |
 | `Lever` | `targets` (entity ids) |

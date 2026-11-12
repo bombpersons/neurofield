@@ -1023,7 +1023,7 @@ impl Viewer<'_> {
         let filter = self.s.filter.to_lowercase();
         let shown = |label: &str| filter.is_empty() || label.to_lowercase().contains(&filter);
         ui.separator();
-        let kinds = ["PlayerStart", "Creature", "Door", "Key", "Chest", "Item", "Prop", "Lever"];
+        let kinds = ["PlayerStart", "Respawn", "Person", "Creature", "Door", "Key", "Chest", "Item", "Prop", "Lever"];
         for k in kinds {
             let items: Vec<(u32, String, Color32)> = self
                 .doc
@@ -1390,6 +1390,7 @@ pub(crate) fn kind_name(k: &EntityKind) -> &'static str {
         EntityKind::Prop { .. } => "Prop",
         EntityKind::Lever { .. } => "Lever",
         EntityKind::Item { .. } => "Item",
+        EntityKind::Respawn => "Respawn",
     }
 }
 
@@ -1540,7 +1541,7 @@ fn entity_properties(
         }
         ui.end_row();
         match &mut e.kind {
-            EntityKind::PlayerStart => {}
+            EntityKind::PlayerStart | EntityKind::Respawn => {}
             EntityKind::Creature { kind, size, seed } => {
                 ui.label("kind");
                 egui::ComboBox::from_id_salt("kind").selected_text(format!("{kind:?}")).show_ui(ui, |ui| {
@@ -1561,7 +1562,7 @@ fn entity_properties(
                 });
                 ui.end_row();
             }
-            EntityKind::Person { look, seed, role, wear, name, lines } => {
+            EntityKind::Person { look, seed, role, wear, name, lines, saves } => {
                 use engine::world::person::Role;
                 ui.label("role");
                 ui.horizontal(|ui| {
@@ -1598,6 +1599,9 @@ fn entity_properties(
                 if ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3)).changed() {
                     *lines = text.split("\n\n").map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
                 }
+                ui.end_row();
+                ui.label("saves");
+                ui.checkbox(saves, "asks after their lines whether to save the game");
                 ui.end_row();
                 ui.label("wears");
                 ui.horizontal_wrapped(|ui| {

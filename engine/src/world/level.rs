@@ -324,10 +324,15 @@ pub enum EntityKind {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         lines: Vec<String>,
+        /// They keep the player's progress: after their lines they ask whether to save.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        saves: bool,
     },
     /// `size` is (width, height, depth) in world units.
     Prop { shape: PropShape, size: [f32; 3], tex: u8, tint: [f32; 3] },
     Lever { targets: Vec<u32> },
+    /// Where the player comes round after dying, in a town (else at the player start).
+    Respawn,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -509,6 +514,11 @@ impl Level {
 
     pub fn player_start(&self) -> Option<([f32; 3], f32)> {
         self.entities.iter().find(|e| e.kind == EntityKind::PlayerStart).map(|e| (e.pos, e.yaw))
+    }
+
+    /// Where the player comes round after dying: the `Respawn` point, or the player start.
+    pub fn respawn(&self) -> Option<([f32; 3], f32)> {
+        self.entities.iter().find(|e| e.kind == EntityKind::Respawn).map(|e| (e.pos, e.yaw)).or_else(|| self.player_start())
     }
 
     pub fn next_id(&self) -> u32 {
@@ -735,16 +745,18 @@ impl Level {
                     scene.add_box([x, floor, z], crate::world::things::CHEST, crate::world::things::CHEST_BODY, e.yaw, 2, [0.7, 0.55, 0.4]);
                     scene.span_mut(n).blocked = true;
                 }
-                EntityKind::Person { look, seed, role, wear, name, lines } => {
+                EntityKind::Person { look, seed, role, wear, name, lines, saves } => {
                     let mut look = look.clone().unwrap_or_else(|| crate::world::person::Look::random(*seed));
                     look.clothes.extend(wear.iter().copied());
                     scene.add_person(look, *role, [x, floor, z], e.yaw, *seed);
                     let p = scene.people.last_mut().expect("just added");
                     p.name = name.clone();
                     p.lines = lines.clone();
+                    p.saves = *saves;
                 }
                 // Items are the game's to draw and pick up.
                 EntityKind::PlayerStart
+                | EntityKind::Respawn
                 | EntityKind::Door { .. }
                 | EntityKind::Key { .. }
                 | EntityKind::Lever { .. }

@@ -120,6 +120,20 @@ pub struct Things {
     pub chests: Vec<Chest>,
 }
 
+/// How the moving things of a level stand, for a save: by entity id, what has been opened,
+/// unlocked, pulled or taken.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThingsState {
+    /// Doors: (id, open, opening, locked).
+    pub doors: Vec<(u32, f32, bool, bool)>,
+    /// Levers pulled.
+    pub pulled: Vec<u32>,
+    /// Chests: (id, opened, locked, what's left in them).
+    pub chests: Vec<(u32, bool, bool, Vec<String>)>,
+    /// Keys taken.
+    pub taken: Vec<u32>,
+}
+
 impl Door {
     /// Unit vectors along the doorway (local x) and across it (local z, the way it opens).
     fn axes(&self) -> ([f32; 2], [f32; 2]) {
@@ -354,6 +368,51 @@ impl Scene {
         });
     }
 
+    /// How the moving things stand now.
+    pub fn things_state(&self) -> ThingsState {
+        let t = &self.things;
+        ThingsState {
+            doors: t.doors.iter().map(|d| (d.entity, d.open, d.opening, d.locked)).collect(),
+            pulled: t.levers.iter().filter(|l| l.pulled).map(|l| l.entity).collect(),
+            chests: t.chests.iter().map(|c| (c.entity, c.opened, c.locked, c.contents.clone())).collect(),
+            taken: t.pickups.iter().filter(|k| k.taken).map(|k| k.entity).collect(),
+        }
+    }
+
+    /// Set the moving things as `state` has them (things it doesn't know stay as they are),
+    /// doors and lids already where they were heading.
+    pub fn restore_things(&mut self, state: &ThingsState) {
+        for i in 0..self.things.doors.len() {
+            let d = &mut self.things.doors[i];
+            if let Some(&(_, _, opening, locked)) = state.doors.iter().find(|s| s.0 == d.entity) {
+                (d.opening, d.locked) = (opening, locked);
+                d.open = if opening { 1.0 } else { 0.0 };
+                self.shape_door(i);
+            }
+        }
+        for i in 0..self.things.levers.len() {
+            let pulled = state.pulled.contains(&self.things.levers[i].entity);
+            if self.things.levers[i].pulled != pulled {
+                self.things.levers[i].pulled = pulled;
+                self.shape_lever(i);
+            }
+        }
+        for i in 0..self.things.chests.len() {
+            let c = &mut self.things.chests[i];
+            if let Some((_, opened, locked, contents)) = state.chests.iter().find(|s| s.0 == c.entity) {
+                (c.opened, c.locked, c.contents) = (*opened, *locked, contents.clone());
+                c.open = if c.opened { 1.0 } else { 0.0 };
+                self.shape_chest(i);
+            }
+        }
+        for i in 0..self.things.pickups.len() {
+            if state.taken.contains(&self.things.pickups[i].entity) {
+                self.things.pickups[i].taken = true;
+                self.shape_pickup(i);
+            }
+        }
+    }
+
     /// Move the doors and chest lids on by `dt` seconds. True when any part changed.
     pub fn tick_things(&mut self, dt: f32) -> bool {
         let mut changed = false;
@@ -531,6 +590,26 @@ mod tests {
         }
         assert!(!s.tick_things(0.1));
         assert!(!s.door_blocks(0.5 * TF, 0.9 * TF, feet, 30.0));
+    }
+
+    #[test]
+    fn a_saved_state_puts_doors_and_keys_back_as_they_were() {
+        let l = corridor(true);
+        let mut s = l.to_scene();
+        let at = [0.5 * TF, 0.0, 0.6 * TF];
+        let keys = s.take_pickups([0.5 * TF, 0.0, 0.4 * TF]);
+        s.use_thing(at, 0.0, &keys);
+        let state = s.things_state();
+        assert_eq!(state.taken, [3]);
+        assert_eq!(state.doors, [(2, 0.0, true, false)]);
+        // A fresh copy of the level, as a save is loaded into.
+        let mut again = l.to_scene();
+        assert!(again.door_blocks(0.5 * TF, 0.9 * TF, 0.0, 30.0));
+        again.restore_things(&state);
+        assert!(!again.door_blocks(0.5 * TF, 0.9 * TF, 0.0, 30.0), "the door is open, not still opening");
+        assert!(again.things.parts[again.things.pickups[0].part].tris.is_empty(), "the key is gone");
+        assert!(again.take_pickups([0.5 * TF, 0.0, 0.4 * TF]).is_empty());
+        assert!(!again.tick_things(0.1));
     }
 
     #[test]

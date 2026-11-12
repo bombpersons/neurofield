@@ -54,6 +54,11 @@ pub const STUN: f32 = 1.1;
 /// How fast the hands are put away out of sight and brought back, in whole moves a second.
 const STOW: f32 = 1.8;
 
+/// Let go of (dying), what was held falls this fast (sword lengths a second squared),
+/// spinning away, and is gone after this many seconds.
+const FALL: f32 = 7.0;
+const FALLEN: f32 = 0.9;
+
 /// How far the walking bob moves the hands per world unit it moves the camera.
 const BOB: f32 = 0.005;
 /// Sideways lag per yaw unit a second of turning, its limit, and how fast it follows.
@@ -211,9 +216,22 @@ pub struct Hands {
     /// Weapons put away (somewhere friendly), and how far: 0 in hand, 1 out of sight.
     stow: bool,
     away: f32,
+    /// Let go of, and seconds since.
+    dropped: Option<f32>,
 }
 
 impl Hands {
+    /// Let go of everything (dying): it falls away out of sight, and nothing more is done
+    /// with it.
+    pub fn drop_all(&mut self) {
+        if self.dropped.is_none() {
+            self.dropped = Some(0.0);
+            for h in &mut self.hands {
+                h.act = None;
+            }
+        }
+    }
+
     /// What each hand holds now; a hand given something else starts afresh.
     pub fn hold(&mut self, right: Option<Item>, left: Option<Item>) {
         for (hand, item) in self.hands.iter_mut().zip([right, left]) {
@@ -227,7 +245,7 @@ impl Hands {
     /// Start a swing of the sword in hand `side`, laboured if `tired`: false if there's no
     /// sword there, it's still swinging, or the player is stunned.
     pub fn swing(&mut self, side: Side, tired: bool) -> bool {
-        if self.stunned() || self.put_away() {
+        if self.stunned() || self.put_away() || self.dropped.is_some() {
             return false;
         }
         let hand = &mut self.hands[side as usize];
@@ -327,7 +345,10 @@ impl Hands {
         let mut swept = Vec::new();
         let stunned = self.stunned();
         self.away = if self.stow { (self.away + STOW * dt).min(1.0) } else { (self.away - STOW * dt).max(0.0) };
-        let held = if self.put_away() { [false; 2] } else { held };
+        if let Some(t) = &mut self.dropped {
+            *t += dt;
+        }
+        let held = if self.put_away() || self.dropped.is_some() { [false; 2] } else { held };
         for ((hand, held), side) in self.hands.iter_mut().zip(held).zip(SIDES) {
             if !held {
                 hand.spent = false;
@@ -370,9 +391,10 @@ impl Hands {
     /// What each hand holds and its pose now, with the camera's walking bob `bob` (world
     /// units).
     pub fn shown(&self, bob: f32) -> Vec<(Kind, Pose)> {
-        if self.away >= 1.0 {
+        if self.away >= 1.0 || self.dropped.is_some_and(|t| t >= FALLEN) {
             return Vec::new();
         }
+        let fallen = self.dropped.unwrap_or(0.0);
         // Put away, they drop down out of the bottom of the view, tipping forward.
         let down = smooth(self.away);
         self.hands
@@ -384,6 +406,12 @@ impl Hands {
                 pose.pos[0] += self.sway;
                 pose.pos[1] += bob * BOB + 0.9 * down;
                 pose.rot[0] += 0.9 * down;
+                // Let go of, each drops away down its own side, turning over as it goes.
+                let out = if side == Side::Left { -1.0 } else { 1.0 };
+                pose.pos[0] += out * 0.35 * fallen;
+                pose.pos[1] += 0.5 * FALL * fallen * fallen;
+                pose.rot[0] += 2.2 * fallen;
+                pose.rot[2] += out * 2.8 * fallen;
                 Some((h.held?, pose))
             })
             .collect()
@@ -575,6 +603,20 @@ mod tests {
         assert!(!h.shown(0.0).is_empty() && !h.swing(Side::Right, false), "still coming back");
         step(&mut h, 1.0, [false, false]);
         assert!(h.swing(Side::Right, false));
+    }
+
+    #[test]
+    fn let_go_of_they_fall_away_out_of_sight() {
+        let mut h = armed(Some(Item::Sword), Some(Item::Buckler));
+        let rest = right(&h);
+        h.drop_all();
+        assert!(!h.swing(Side::Right, false), "nothing more is done with them");
+        step(&mut h, 0.2, [true, true]);
+        assert!(!h.guarding());
+        let falling = right(&h);
+        assert!(falling.pos[1] > rest.pos[1] + 0.1 && falling.pos[0] > rest.pos[0], "{falling:?}");
+        step(&mut h, 1.0, [false; 2]);
+        assert!(h.shown(0.0).is_empty());
     }
 
     #[test]

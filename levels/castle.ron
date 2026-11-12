@@ -1033,5 +1033,7 @@ Level(
         Entity(id: 55, kind: Person(seed: 8, role: Wander), pos: (4608.0, 0.0, 4352.0), yaw: 2.500),
         Entity(id: 56, kind: Person(seed: 19, role: Wander), pos: (3072.0, 0.0, 4864.0), yaw: -1.000),
         Entity(id: 57, kind: Person(seed: 3, role: Wander), pos: (5120.0, 0.0, 2816.0), yaw: 0.500),
+        Entity(id: 58, kind: Person(seed: 61, role: Stand, name: Some("Wenna"), lines: ["Back in one piece, I see. Good.", "I keep the town's ledger: who goes below, and who comes back."], saves: true), pos: (6707.2, 0.0, 5120.0), yaw: 1.571),
+        Entity(id: 59, kind: Respawn, pos: (4096.0, 0.0, 4352.0), yaw: 3.142),
     ],
 )

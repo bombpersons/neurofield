@@ -51,12 +51,13 @@ struct Body {
     bob_amount: f32,
 }
 
-/// A knock to the view, on top of where the walker is and looks: pushed `back` (world
-/// units) and turned by `yaw`, `pitch` and `roll` (4096 units a turn). The game's own; the
-/// generated walks' cameras have none.
+/// A knock to the view, on top of where the walker is and looks: pushed `back` and `down`
+/// (world units) and turned by `yaw`, `pitch` and `roll` (4096 units a turn). The game's own;
+/// the generated walks' cameras have none.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Kick {
     pub back: f32,
+    pub down: f32,
     pub yaw: f32,
     pub pitch: f32,
     pub roll: f32,
@@ -262,7 +263,7 @@ impl Walker {
         // Forward is (-sin, cos).
         let (x, z) = (self.x + s * k.back, self.z - c * k.back);
         Camera {
-            pos: [x as i32, (self.y + self.bob()) as i32, z as i32],
+            pos: [x as i32, (self.y + self.bob() + k.down) as i32, z as i32],
             yaw: (self.yaw + k.yaw).round() as i32,
             pitch: (self.pitch + k.pitch).round() as i32,
             roll: k.roll.round() as i32,

@@ -809,6 +809,14 @@ impl Animator {
         self.wait = self.wait.max(length);
     }
 
+    /// Lie dead already, as having died some time ago (a level coming back from a save).
+    pub fn lie_dead(&mut self, death: Death) {
+        self.die(death);
+        if let Some((d, t, _)) = &mut self.death {
+            *t = d.length();
+        }
+    }
+
     /// Die, falling to the floor and lying there for good.
     pub fn die(&mut self, death: Death) {
         if self.death.is_none() {
@@ -1394,6 +1402,27 @@ impl Herd {
         &mut self.all
     }
 
+    /// Have the creatures `dead` (by index) lying dead already, for level `version` before
+    /// its first update: a level coming back from a save.
+    pub fn lay_dead(&mut self, scene: &Scene, version: u64, dead: &[usize]) {
+        if self.version != Some(version) {
+            self.all = scene.creatures.iter().map(Animator::new).collect();
+            self.version = Some(version);
+        }
+        for &i in dead {
+            if let Some(a) = self.all.get_mut(i) {
+                if let Some(&death) = a.deaths().first() {
+                    a.lie_dead(death);
+                }
+            }
+        }
+    }
+
+    /// Which of the scene's creatures are dead.
+    pub fn dead(&self) -> Vec<usize> {
+        self.all.iter().enumerate().filter(|(_, a)| a.dead()).map(|(i, _)| i).collect()
+    }
+
     pub fn plans(&self) -> Vec<Plan> {
         self.all.iter().map(|a| a.plan).collect()
     }
@@ -1407,6 +1436,19 @@ mod tests {
     fn finite(c: &Creature) -> bool {
         c.pose().iter().all(|p| p.centre.iter().chain(p.axes.iter().flatten()).all(|v| v.is_finite()))
             && c.parts.iter().all(|p| p.half.iter().all(|&h| h.is_finite() && h > 0.0))
+    }
+
+    #[test]
+    fn the_saved_dead_lie_dead_at_once() {
+        let (mut scene, _) = walkable_scene(&mut Rng::new(3), 30);
+        assert!(scene.creatures.len() >= 2);
+        let mut herd = Herd::default();
+        herd.lay_dead(&scene, 1, &[0]);
+        assert_eq!(herd.dead(), [0]);
+        herd.update(&mut scene, 1, 1.0 / 30.0);
+        assert_eq!(herd.dead(), [0], "the herd isn't rebuilt for the same level");
+        assert_eq!(scene.creatures[0].girth, 0.0);
+        assert!(scene.creatures[1].girth > 0.0);
     }
 
     #[test]

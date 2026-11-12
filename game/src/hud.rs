@@ -44,6 +44,7 @@ const COPPER: Rgba = [215, 130, 70, 255];
 const BUBBLE_W: i32 = 210;
 const BUBBLE: Rgba = [250, 246, 236, 245];
 const INK: Rgba = [40, 30, 34, 255];
+const DIM_INK: Rgba = [150, 140, 135, 255];
 /// Height of an equipment slot's row.
 const GEAR_ROW: i32 = 12;
 /// The menus' panels, darker than the HUD's so text reads over a bright frame.
@@ -79,11 +80,13 @@ pub struct HudState {
     pub toast: Option<String>,
     /// What someone is saying.
     pub talk: Option<Bubble>,
+    /// How dark the screen has gone, 0..1 (dying, and coming round after).
+    pub dark: f32,
 }
 
 /// A speech bubble: who's speaking, their line and how much of it is typed out, where
-/// their head is on the screen (the bubble's tail points there), and whether they've more
-/// to say after it.
+/// their head is on the screen (the bubble's tail points there), whether they've more
+/// to say after it, and when it's a question the answers to pick from and which is picked.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bubble {
     pub name: Option<String>,
@@ -91,6 +94,8 @@ pub struct Bubble {
     pub typed: usize,
     pub at: Option<(i32, i32)>,
     pub more: bool,
+    pub answers: Vec<String>,
+    pub picked: usize,
 }
 
 /// The menu as it is drawn, with what it shows of the player.
@@ -127,6 +132,7 @@ impl HudState {
             drops: Vec::new(),
             toast: None,
             talk: None,
+            dark: 0.0,
             menu: menu.map(|m| MenuShown {
                 menu: m.clone(),
                 items: p.items.clone(),
@@ -205,6 +211,25 @@ impl Canvas<'_> {
         if (0..self.w).contains(&x) && (0..self.h).contains(&y) {
             let i = ((y * self.stride + x) * 4) as usize;
             self.data[i..i + 4].copy_from_slice(&c);
+        }
+    }
+
+    /// Black laid over the whole frame, `dark` of the way to opaque, over whatever is drawn.
+    fn darken(&mut self, dark: f32) {
+        let d = dark.clamp(0.0, 1.0);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let i = ((y * self.stride + x) * 4) as usize;
+                let px = &mut self.data[i..i + 4];
+                let a = px[3] as f32 / 255.0;
+                let out = a + d * (1.0 - a);
+                // Straight alpha: what was there keeps its share of the light.
+                let keep = if out > 0.0 { a * (1.0 - d) / out } else { 0.0 };
+                for c in &mut px[..3] {
+                    *c = (*c as f32 * keep).round() as u8;
+                }
+                px[3] = (out * 255.0).round() as u8;
+            }
         }
     }
 
@@ -397,7 +422,9 @@ impl Canvas<'_> {
         let w = (BUBBLE_W).min(self.w - 2 * MARGIN);
         let lines = wrap(&b.line, w - 12);
         let line_h = font::GLYPH_H as i32 + 2;
-        let h = lines.len() as i32 * line_h + 9;
+        // The answers on a row of their own under the question.
+        let answers_h = if b.answers.is_empty() { 0 } else { line_h + 4 };
+        let h = lines.len() as i32 * line_h + 9 + answers_h;
         let top_most = MARGIN + 32;
         let (x, y) = match b.at {
             Some((ax, ay)) => ((ax - w / 2).clamp(4, self.w - w - 4), (ay - 16 - h).clamp(top_most, self.h - h - 40)),
@@ -436,6 +463,20 @@ impl Canvas<'_> {
             self.plain_text(x + 6, y + 5 + i as i32 * line_h, &shown, INK);
             // The space the wrap took away counts as typed too.
             left = left.saturating_sub(n + 1);
+        }
+        // Each answer after a pointer, the picked one's filled in.
+        let mut ax = x + 14;
+        let ay = y + 5 + lines.len() as i32 * line_h + 3;
+        for (i, answer) in b.answers.iter().enumerate() {
+            let c = [INK[0], INK[1], INK[2]];
+            let tip = [(ax - 7, ay), (ax - 7, ay + 6), (ax - 3, ay + 3)];
+            if i == b.picked {
+                self.triangle(&ScreenTri { p: tip, colour: [c; 3] });
+            } else {
+                self.line(((ax - 7) as f32, ay as f32), ((ax - 7) as f32, (ay + 6) as f32), DIM_INK);
+            }
+            self.plain_text(ax, ay, answer, if i == b.picked { INK } else { DIM_INK });
+            ax += font::text_width(answer) as i32 + 22;
         }
         if let Some(name) = &b.name {
             let nw = font::text_width(name) as i32 + 8;
@@ -733,6 +774,9 @@ pub fn draw(data: &mut [u8], stride: u32, h: u32, state: &HudState) -> Vec<Hit> 
             Screen::Inventory { .. } => c.inventory(shown, state.pad, state.hp, state.mp),
         }
     }
+    if state.dark > 0.0 {
+        c.darken(state.dark);
+    }
     c.hits
 }
 
@@ -768,7 +812,7 @@ mod tests {
     fn a_bubble_types_out_over_the_speaker_and_points_at_them() {
         let bubble = |typed: usize, at| {
             let mut s = state();
-            s.talk = Some(Bubble { name: Some("Guard".into()), line: "Halt! The keep is closed to visitors today.".into(), typed, at, more: true });
+            s.talk = Some(Bubble { name: Some("Guard".into()), line: "Halt! The keep is closed to visitors today.".into(), typed, at, more: true, answers: Vec::new(), picked: 0 });
             drawn(&s)
         };
         let ink = |d: &[u8], x0: u32, x1: u32, y0: u32, y1: u32| {
@@ -784,6 +828,35 @@ mod tests {
         // Out of view, it sits at the top with no tail.
         let top = bubble(100, None);
         assert_eq!(ink(&top, 0, W, 130, H), 0);
+    }
+
+    #[test]
+    fn a_question_shows_its_answers_with_the_picked_one_marked() {
+        let ask = |answers: &[&str], picked| {
+            let mut s = state();
+            let line = "Do you want to save?".to_string();
+            s.talk = Some(Bubble { name: None, typed: line.len(), line, at: None, more: false, answers: answers.iter().map(|a| a.to_string()).collect(), picked });
+            drawn(&s)
+        };
+        let ink = |d: &[u8], c: Rgba| (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| at(d, x, y)[..3] == c[..3]).count();
+        let (plain, yes, no) = (ask(&[], 0), ask(&["Yes", "No"], 0), ask(&["Yes", "No"], 1));
+        assert!(ink(&yes, DIM_INK) > 0 && ink(&yes, INK) > ink(&plain, INK), "the answers are drawn under the question");
+        assert_ne!(yes, no, "the mark moves with the pick");
+    }
+
+    #[test]
+    fn the_screen_fades_to_black() {
+        let mut s = state();
+        let lit = drawn(&s);
+        s.dark = 0.5;
+        let half = drawn(&s);
+        s.dark = 1.0;
+        let black = drawn(&s);
+        // Clear pixels go half black, then wholly; the bars darken.
+        assert_eq!(at(&half, W / 2, 20), [0, 0, 0, 128]);
+        assert!((0..H).all(|y| (0..W).all(|x| at(&black, x, y) == [0, 0, 0, 255])));
+        let hp = at(&lit, MARGIN as u32 + 3, MARGIN as u32 + 3);
+        assert!(at(&half, MARGIN as u32 + 3, MARGIN as u32 + 3)[0] < hp[0]);
     }
 
     #[test]

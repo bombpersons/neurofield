@@ -2889,6 +2889,8 @@ dependencies = [
  "bevy_egui",
  "engine",
  "psx-bevy",
+ "ron",
+ "serde",
 ]
 
 [[package]]

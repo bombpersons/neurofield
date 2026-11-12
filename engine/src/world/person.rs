@@ -138,6 +138,8 @@ pub struct Person {
     /// What they're called, if the player is to know, and what they say when spoken to.
     pub name: Option<String>,
     pub lines: Vec<String>,
+    /// They keep the player's progress (`level::EntityKind::Person`).
+    pub saves: bool,
     /// What made them up.
     pub seed: u64,
     pub body: Creature,
@@ -181,6 +183,7 @@ impl Person {
             role,
             name: None,
             lines: Vec::new(),
+            saves: false,
             seed,
             body,
             bones,
@@ -619,7 +622,15 @@ mod tests {
     fn the_castle_is_peopled_and_safe() {
         let l = crate::world::level::Level::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../levels/castle.ron"))).unwrap();
         let scene = l.to_scene();
-        assert_eq!(scene.people.len(), 8);
+        assert_eq!(scene.people.len(), 9);
+        // Someone keeps the player's progress, and after dying the player comes round on open
+        // ground well away from them.
+        let keeper = scene.people.iter().find(|p| p.saves).expect("someone saves");
+        let (at, _) = l.respawn().unwrap();
+        assert_ne!(Some(at), l.player_start().map(|s| s.0));
+        assert!(scene.walkable_y(at[0], at[1] - 16.0, at[2]).is_some());
+        let apart = (keeper.body.base[0] - at[0]).hypot(keeper.body.base[2] - at[2]);
+        assert!(apart > 4.0 * TF, "{apart}");
         let guard = scene.people.iter().find(|p| p.role == Role::Guard).unwrap();
         assert_eq!(guard.name.as_deref(), Some("Gate guard"));
         assert!(guard.lines.len() >= 2 && guard.look.clothes.iter().any(|w| w.kind == clothes::Kind::LeatherCap));

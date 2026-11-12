@@ -389,5 +389,6 @@ pub fn entity_colour(k: &EntityKind) -> Color {
         EntityKind::Prop { .. } => Color::srgb(0.6, 0.6, 0.7),
         EntityKind::Lever { .. } => Color::srgb(0.4, 0.8, 1.0),
         EntityKind::Item { .. } => Color::srgb(0.85, 0.4, 1.0),
+        EntityKind::Respawn => Color::srgb(0.3, 0.8, 1.0),
     }
 }

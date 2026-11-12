@@ -151,6 +151,7 @@ pub fn entity_icon(kind: &EntityKind) -> &'static str {
         EntityKind::Prop { .. } => i::PACKAGE,
         EntityKind::Lever { .. } => i::JOYSTICK,
         EntityKind::Item { .. } => i::FLASK,
+        EntityKind::Respawn => i::BED,
     }
 }
 
@@ -165,7 +166,8 @@ pub fn entity_kinds() -> Vec<(&'static str, EntityKind)> {
         ("Prop", EntityKind::Prop { shape: PropShape::Box, size: [80.0, 120.0, 80.0], tex: 2, tint: [0.8, 0.75, 0.7] }),
         ("Lever", EntityKind::Lever { targets: Vec::new() }),
         ("Item", EntityKind::Item { name: engine::world::level::ITEMS[0].into(), count: 1 }),
-        ("Person", EntityKind::Person { look: None, seed: 1, role: engine::world::person::Role::Wander, wear: Vec::new(), name: None, lines: Vec::new() }),
+        ("Person", EntityKind::Person { look: None, seed: 1, role: engine::world::person::Role::Wander, wear: Vec::new(), name: None, lines: Vec::new(), saves: false }),
+        ("Respawn", EntityKind::Respawn),
     ]
 }
 
@@ -1326,11 +1328,11 @@ pub fn place_at(scene: &Scene, kind: &EntityKind, p: [f32; 3], yaw: f32, free: b
     Some(([px, floor(px, pz)?, pz], yaw))
 }
 
-/// Add an entity, or move the player start if there is one already (there's
-/// only ever one). Returns its id.
+/// Add an entity, or move the player start or respawn point if there is one already
+/// (there's only ever one of each). Returns its id.
 pub fn add_entity(l: &mut Level, kind: EntityKind, pos: [f32; 3], yaw: f32) -> u32 {
-    if kind == EntityKind::PlayerStart {
-        if let Some(e) = l.entities.iter_mut().find(|e| e.kind == EntityKind::PlayerStart) {
+    if matches!(kind, EntityKind::PlayerStart | EntityKind::Respawn) {
+        if let Some(e) = l.entities.iter_mut().find(|e| e.kind == kind) {
             e.pos = pos;
             e.yaw = yaw;
             return e.id;

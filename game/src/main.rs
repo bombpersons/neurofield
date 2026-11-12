@@ -20,8 +20,16 @@
 //!     `--level-file levels/x.ron` plays a hand-built level (see `engine::world::level`) from its
 //!     player start, or from `--start x,y,z,yaw` (world units, yaw in radians); N reloads it.
 //!     E (or circle) opens and closes the door in front, pulls the lever, or opens the chest
-//!     (what it holds goes into the inventory); walking over a key or an item picks it up,
-//!     and locked doors and chests open for their key.
+//!     (what it holds goes into the inventory), or talks to whoever is in front; walking over
+//!     a key or an item picks it up, and locked doors and chests open for their key.
+//!     Saving (`save`): whoever keeps the ledger in town asks after their lines whether to save
+//!     (left / right or the d-pad pick the answer). Dying, the player comes round in the middle
+//!     of the town as they last saved there (or new, in levels/castle.ron, with no save).
+//!     Quitting in a dungeon (a level file) saves where the player is, and the game starts
+//!     there again next time; with no `--level-file` or `--seed` the game starts from the
+//!     saves (that one, else the town's), else as before. `--save DIR` keeps the saves there
+//!     instead of the user's data directory; with `--mcp` or `GAME_SHOT` nothing is saved
+//!     without it.
 //!     Mouse: look   Left / right click: the left / right hand's weapon swings, or shield goes
 //!     up while held   WASD: walk and strafe   Arrows: walk and turn   Space: jump
 //!     Shift: sprint   1-4: use the hotbar   Esc: the pause menu (`menu`), which frees the mouse
@@ -81,8 +89,9 @@ mod menu;
 mod player;
 mod hands;
 mod talk;
+mod save;
 use hands::Hands;
-use talk::Talk;
+use talk::{Said, Talk};
 use hud::HudState;
 use menu::{Menu, Outcome, Press};
 use player::{Player, Side, SIDES};
@@ -113,6 +122,18 @@ const LASH_BLOCK: f32 = 7.0;
 const SPRINT_TIRE: f32 = 3.0;
 /// Seconds a notice (gear breaking) stays on the HUD.
 const TOAST_SECS: f32 = 2.5;
+/// Dying: seconds until the knees hit the ground, while the head sinks to look at it, while
+/// the screen goes black, until the player comes round in town, and for the dark to lift.
+const KNEES: f32 = 0.22;
+const SLUMP: (f32, f32) = (0.45, 1.9);
+const BLACK: (f32, f32) = (0.7, 2.1);
+const COME_ROUND: f32 = 2.6;
+const WAKE: f32 = 1.2;
+/// How far the eye drops on to the knees (world units), and the pitch it ends at, looking
+/// almost straight down (1024 is).
+const KNEEL: f32 = 0.45 * walker::EYE;
+const GROUND_PITCH: f32 = 990.0;
+const TF: f32 = engine::world::scene::T as f32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -203,6 +224,14 @@ struct Sim {
     drops: Vec<drops::Dropped>,
     /// Quit game was chosen.
     quit: bool,
+    /// Where the saves are kept (`save`), or None for not saving.
+    saves: Option<PathBuf>,
+    /// Seconds since the player died, until they come round.
+    dying: Option<f32>,
+    /// How dark it still is from dying, lifting as they come round, 0..1.
+    waking: f32,
+    /// Creatures to lay dead as the level comes back from a save, once its herd is made.
+    dead: Vec<usize>,
 }
 
 impl Sim {
@@ -267,9 +296,19 @@ impl Sim {
     /// Use whatever is in front: a door, a lever or a chest. What a chest holds goes into
     /// the inventory, or on the floor before it when there's no room.
     fn use_thing(&mut self) {
+        if self.dying.is_some() {
+            return;
+        }
         if let Some(talk) = &mut self.talk {
-            if !talk.press() {
-                self.end_talk();
+            match talk.press() {
+                Said::More => {}
+                Said::Over => self.end_talk(),
+                Said::Answered(a) => {
+                    let reply = if a == 0 { self.save_town() } else { "Another time, then.".to_string() };
+                    if let Some(talk) = &mut self.talk {
+                        talk.reply(&reply);
+                    }
+                }
             }
             return;
         }
@@ -314,12 +353,10 @@ impl Sim {
     /// A new level, or the file again (it may have been edited), its own strangeness
     /// (a file keeps the slider's).
     fn reload(&mut self) {
-        self.version += 1;
-        self.talk = None;
         self.held.clear();
         self.drops.clear();
         match &self.file {
-            Some(f) => match load_level(f, self.start, &mut self.rng) {
+            Some(f) => match load_level(f, self.start, false, &mut self.rng) {
                 Ok((level, lying)) => {
                     self.level = level;
                     self.drops = lying;
@@ -331,6 +368,14 @@ impl Sim {
                 self.strangeness = self.level.scene.strange.base;
             }
         }
+        self.settle();
+    }
+
+    /// A level just loaded made ready to play: the walk starts afresh in it.
+    fn settle(&mut self) {
+        self.version += 1;
+        self.end_talk();
+        self.talk = None;
         if let Some(dir) = &self.eyes {
             self.sculpted = Some(engine::world::dreamed::sculpt(&mut self.level.scene, self.rng.next() as u64, Some(dir)));
             self.strangeness = self.level.scene.strange.base;
@@ -361,7 +406,129 @@ impl Sim {
     /// Whether the player's own actions count: not standing still, not on auto-walk, not
     /// listening to someone.
     fn in_control(&self) -> bool {
-        !self.frozen() && !self.auto_walk && self.talk.is_none()
+        !self.frozen() && !self.auto_walk && self.talk.is_none() && self.dying.is_none()
+    }
+
+    /// The level file being played, whole, for a save.
+    fn level_file(&self) -> Option<PathBuf> {
+        let f = self.file.as_ref()?;
+        Some(f.canonicalize().unwrap_or_else(|_| f.clone()))
+    }
+
+    /// Save in town (the keeper of the ledger was told yes): the player as they are, to come
+    /// round at the town's respawn point. What the keeper says to it.
+    fn save_town(&mut self) -> String {
+        let (Some(dir), Some(level)) = (self.saves.clone(), self.level_file()) else {
+            return "Hm. The ink's dry today. (Saving is off.)".to_string();
+        };
+        let mut s = save::Save::fresh(level);
+        s.player = self.player.clone();
+        match save::write(&dir, save::TOWN, &s) {
+            Ok(()) => {
+                save::remove(&dir, save::RESUME);
+                "There. It's all written down. Take care out there.".to_string()
+            }
+            Err(e) => {
+                eprintln!("saving: {e}");
+                "Hm. The ink's run. (The game couldn't be saved.)".to_string()
+            }
+        }
+    }
+
+    /// The game is closing: in a dungeon (a level file, alive), save where the player is to
+    /// carry on from next time; anywhere else there's nothing to carry on from but the town.
+    fn quitting(&mut self) {
+        let Some(dir) = self.saves.clone() else { return };
+        let level = self.level_file().filter(|_| !self.plain() && self.dying.is_none() && self.player.hp > 0);
+        let Some(level) = level else {
+            save::remove(&dir, save::RESUME);
+            return;
+        };
+        let (feet, yaw) = self.feet();
+        let s = save::Save {
+            level,
+            at: Some((feet, yaw)),
+            player: self.player.clone(),
+            keys: self.held.clone(),
+            things: Some(self.level.scene.things_state()),
+            drops: self.drops.clone(),
+            dead: self.herd.dead(),
+        };
+        if let Err(e) = save::write(&dir, save::RESUME, &s) {
+            eprintln!("saving: {e}");
+        }
+    }
+
+    /// Go to the save's level as it says, the player as they were.
+    fn enter(&mut self, s: save::Save) -> Result<(), String> {
+        let (level, lying) = load_level(&s.level, s.at, true, &mut self.rng)?;
+        self.level = level;
+        self.drops = if s.at.is_some() { s.drops } else { lying };
+        self.held = s.keys;
+        self.file = Some(s.level);
+        self.start = None;
+        self.player = s.player;
+        self.felt = self.player.affliction;
+        (self.calm, self.veil) = (0.0, 0.0);
+        if let Some(things) = &s.things {
+            self.level.scene.restore_things(things);
+        }
+        self.dead = s.dead;
+        self.hands = Hands::default();
+        (self.menu, self.said, self.toast) = (None, None, None);
+        self.settle();
+        self.level.things_moved();
+        Ok(())
+    }
+
+    /// The player's health ran out: they let go of what they hold and fall to their knees,
+    /// and it goes dark (`dying`).
+    fn die(&mut self) {
+        if self.dying.is_some() {
+            return;
+        }
+        self.dying = Some(0.0);
+        self.end_talk();
+        (self.menu, self.said, self.toast) = (None, None, None);
+        self.auto_walk = false;
+        self.hands.drop_all();
+        self.level.walker.stop_sprint();
+        // Quitting from here on comes back in town.
+        if let Some(dir) = &self.saves {
+            save::remove(dir, save::RESUME);
+        }
+    }
+
+    /// After dying: back in town as last saved there (or new, with no save), in its middle,
+    /// as the dark lifts.
+    fn come_round(&mut self) {
+        let saved = self.saves.as_deref().and_then(|d| save::read(d, save::TOWN));
+        let town = saved.or_else(|| {
+            let t = PathBuf::from(save::TOWN_LEVEL);
+            t.is_file().then(|| save::Save::fresh(t))
+        });
+        self.dying = None;
+        self.waking = 1.0;
+        let failed = match town {
+            Some(s) => self.enter(s).err(),
+            None => Some(format!("no town to come round in ({} isn't there)", save::TOWN_LEVEL)),
+        };
+        if let Some(e) = failed {
+            // Nowhere to go back to: this level again, from its start.
+            eprintln!("{e}");
+            self.player = Player::new();
+            self.felt = 0.0;
+            self.hands = Hands::default();
+            self.reload();
+        }
+    }
+
+    /// How dark the screen is: going black as the player dies, lifting as they come round.
+    fn dark(&self) -> f32 {
+        match self.dying {
+            Some(t) => smoothstep(BLACK.0, BLACK.1, t),
+            None => self.waking,
+        }
     }
 
     fn toggle_menu(&mut self) {
@@ -534,15 +701,45 @@ impl Sim {
     }
 }
 
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let u = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// How the view goes `t` seconds after dying, the walker's own pitch being `pitch`: dropping
+/// to the knees, jolted as they hit the ground, then the head sinking to look down at it,
+/// tipping to one side.
+fn death_kick(t: f32, pitch: f32) -> walker::Kick {
+    let mut k = walker::Kick::default();
+    let fall = (t / KNEES).min(1.0);
+    k.down = KNEEL * fall * fall;
+    if t > KNEES {
+        let s = t - KNEES;
+        let jolt = (s * 30.0).sin() * (-s * 9.0).exp();
+        k.down += 0.06 * TF * jolt;
+        k.pitch += 70.0 * jolt;
+        k.roll += 35.0 * (s * 23.0).sin() * (-s * 6.0).exp();
+    }
+    let slump = smoothstep(SLUMP.0, SLUMP.1, t);
+    k.pitch += (GROUND_PITCH - pitch) * slump;
+    k.roll += 110.0 * slump;
+    // The head bows forward and lower as it goes.
+    k.back -= 0.12 * TF * slump;
+    k.down += 0.1 * TF * slump;
+    k
+}
+
 /// `text` with a capital first letter, for a notice.
 fn title_case(text: &str) -> String {
     let mut c = text.chars();
     c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
-/// A hand-built level, and the items lying about in it.
-fn load_level(file: &std::path::Path, start: Option<([f32; 3], f32)>, rng: &mut Rng) -> Result<(Level, Vec<drops::Dropped>), String> {
+/// A hand-built level, and the items lying about in it; the walker at `start`, else its
+/// respawn point if `respawn`, else its player start.
+fn load_level(file: &std::path::Path, start: Option<([f32; 3], f32)>, respawn: bool, rng: &mut Rng) -> Result<(Level, Vec<drops::Dropped>), String> {
     let level = engine::world::level::Level::load(file)?;
+    let start = start.or_else(|| if respawn { level.respawn() } else { None });
     let built = Level::from_file(&level, start, rng).map_err(|e| format!("{}: {e}", file.display()))?;
     let lying = drops::of_level(&built.scene, &level);
     Ok((built, lying))
@@ -641,6 +838,10 @@ struct Report {
     talk: String,
     /// The weapons are put away (somewhere friendly).
     stowed: bool,
+    /// Seconds since dying (-1 alive), how dark the screen is, and the level file played.
+    dying: f32,
+    dark: f32,
+    level: String,
 }
 
 fn main() {
@@ -699,9 +900,21 @@ fn main() {
         assert_eq!(v.len(), 4, "--start x,y,z,yaw");
         ([v[0], v[1], v[2]], v[3])
     });
-    let file = opts.get("level-file").map(PathBuf::from);
+    // Saves are kept, unless the game is being driven or photographed by a script.
+    let saves = match opts.get("save") {
+        Some(d) => Some(PathBuf::from(d)),
+        None if mcp || std::env::var_os("GAME_SHOT").is_some() => None,
+        None => save::dir(),
+    };
+    // Asked for no level in particular, carry on from the saves: where the player quit in a
+    // dungeon, else the town as they saved it.
+    let resume = saves
+        .as_deref()
+        .filter(|_| !opts.contains_key("level-file") && !opts.contains_key("seed"))
+        .and_then(|d| save::read(d, save::RESUME).or_else(|| save::read(d, save::TOWN)));
+    let file = opts.get("level-file").map(PathBuf::from).or_else(|| resume.as_ref().map(|r| r.level.clone()));
     let (mut level, lying) = match &file {
-        Some(f) => load_level(f, start, &mut rng).unwrap_or_else(|e| panic!("{e}")),
+        Some(f) => load_level(f, start, false, &mut rng).unwrap_or_else(|e| panic!("{e}")),
         None => (Level::new(&mut rng), Vec::new()),
     };
     let eyes = opts.get("sculpt").map(PathBuf::from);
@@ -720,6 +933,67 @@ fn main() {
         let (x, y) = w.split_once('x').expect("--window WIDTHxHEIGHT");
         (x.parse::<u32>().expect("--window WIDTHxHEIGHT"), y.parse::<u32>().expect("--window WIDTHxHEIGHT"))
     });
+
+    let mut sim = Sim {
+        level,
+        rng,
+        auto_walk: false,
+        paused: false,
+        mode: match opts.get("view").map(String::as_str) {
+            None if eyes.is_some() => Mode::Raster,
+            None | Some("network") => Mode::Network,
+            Some("raster") => Mode::Raster,
+            Some("both") => Mode::Both,
+            Some(v) => panic!("--view network|raster|both, not {v}"),
+        },
+        effects: [None; effects::EFFECTS.len()],
+        panel: false,
+        net_ms: 0.0,
+        herd: Default::default(),
+        people: Default::default(),
+        foes: Default::default(),
+        cues: Vec::new(),
+        peaceful,
+        struck: Vec::new(),
+        toast: None,
+        tris: 0,
+        width: W,
+        strangeness,
+        felt: player.affliction,
+        growths,
+        eyes,
+        sculpted,
+        dial: 1.0,
+        swollen: Vec::new(),
+        dream_time: 0.0,
+        calm: 0.0,
+        veil: 0.0,
+        file,
+        start,
+        version: 0,
+        look: 0,
+        held: Vec::new(),
+        said: None,
+        player,
+        hands: Hands::default(),
+        mouse_arms: [false; 2],
+        pad_arms: [false; 2],
+        on_pad: false,
+        menu: None,
+        talk: None,
+        drops: lying,
+        quit: false,
+        saves,
+        dying: None,
+        waking: 0.0,
+        dead: Vec::new(),
+    };
+    if let Some(r) = resume {
+        let from = r.level.display().to_string();
+        if let Err(e) = sim.enter(r) {
+            eprintln!("carrying on from the save in {from}: {e}");
+        }
+    }
 
     let mut app = App::new();
     let mut plugins = DefaultPlugins
@@ -759,56 +1033,7 @@ fn main() {
         .insert_resource(bindings)
         .init_resource::<Report>()
         .insert_resource(ClearColor(Color::BLACK))
-        .insert_resource(Sim {
-            level,
-            rng,
-            auto_walk: false,
-            paused: false,
-            mode: match opts.get("view").map(String::as_str) {
-                None if eyes.is_some() => Mode::Raster,
-                None | Some("network") => Mode::Network,
-                Some("raster") => Mode::Raster,
-                Some("both") => Mode::Both,
-                Some(v) => panic!("--view network|raster|both, not {v}"),
-            },
-            effects: [None; effects::EFFECTS.len()],
-            panel: false,
-            net_ms: 0.0,
-            herd: Default::default(),
-            people: Default::default(),
-            foes: Default::default(),
-            cues: Vec::new(),
-            peaceful,
-            struck: Vec::new(),
-            toast: None,
-            tris: 0,
-            width: W,
-            strangeness,
-            felt: player.affliction,
-            growths,
-            eyes,
-            sculpted,
-            dial: 1.0,
-            swollen: Vec::new(),
-            dream_time: 0.0,
-            calm: 0.0,
-            veil: 0.0,
-            file,
-            start,
-            version: 0,
-            look: 0,
-            held: Vec::new(),
-            said: None,
-            player,
-            hands: Hands::default(),
-            mouse_arms: [false; 2],
-            pad_arms: [false; 2],
-            on_pad: false,
-            menu: None,
-            talk: None,
-            drops: lying,
-            quit: false,
-        })
+        .insert_resource(sim)
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
@@ -817,7 +1042,8 @@ fn main() {
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
         .add_systems(FixedUpdate, walk.in_set(GameSystems::Game))
-        .add_systems(EguiPrimaryContextPass, panel);
+        .add_systems(EguiPrimaryContextPass, panel)
+        .add_systems(Last, save_on_quit);
     if let Some(layer) = dream {
         app.insert_non_send(layer);
     }
@@ -828,6 +1054,14 @@ fn main() {
     // egui draws on the window at full resolution, not into the PS1 screen.
     app.world_mut().resource_mut::<EguiGlobalSettings>().auto_create_primary_context = false;
     app.run();
+}
+
+/// The game is closing (quit from the menu, or the window closed): save if in a dungeon.
+fn save_on_quit(mut exits: MessageReader<AppExit>, mut sim: ResMut<Sim>, mut done: Local<bool>) {
+    if exits.read().next().is_some() && !*done {
+        *done = true;
+        sim.quitting();
+    }
 }
 
 /// As wide as the network can draw, whatever the window: the sprite shows the part in use
@@ -978,7 +1212,25 @@ fn keys(
     if key.just_pressed(KeyCode::KeyP) {
         sim.paused = !sim.paused;
     }
-    if key.just_pressed(KeyCode::KeyE) {
+    if let Some(t) = &mut sim.talk {
+        let picks = [
+            (KeyCode::ArrowLeft, -1),
+            (KeyCode::KeyA, -1),
+            (KeyCode::ArrowUp, -1),
+            (KeyCode::KeyW, -1),
+            (KeyCode::ArrowRight, 1),
+            (KeyCode::KeyD, 1),
+            (KeyCode::ArrowDown, 1),
+            (KeyCode::KeyS, 1),
+        ];
+        for (k, by) in picks {
+            if key.just_pressed(k) {
+                t.pick(by);
+            }
+        }
+    }
+    let answer = sim.talk.is_some() && key.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter, KeyCode::Space]);
+    if key.just_pressed(KeyCode::KeyE) || answer {
         sim.use_thing();
     }
     if key.just_pressed(KeyCode::KeyN) {
@@ -1063,8 +1315,13 @@ fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
         return;
     }
     // Talking, circle goes on with it and nothing else is done.
-    if sim.talk.is_some() {
-        if pad.pressed(Button::Circle) {
+    if let Some(t) = &mut sim.talk {
+        for (b, by) in [(Button::Left, -1), (Button::Up, -1), (Button::Right, 1), (Button::Down, 1)] {
+            if pad.pressed(b) {
+                t.pick(by);
+            }
+        }
+        if pad.pressed(Button::Circle) || pad.pressed(Button::Cross) {
             sim.use_thing();
         }
         return;
@@ -1218,7 +1475,7 @@ fn mouse(
     mut sim: ResMut<Sim>,
     cursor: Query<&CursorOptions, With<PrimaryWindow>>,
 ) {
-    if sim.auto_walk || sim.frozen() {
+    if sim.auto_walk || sim.frozen() || sim.dying.is_some() {
         return;
     }
     let captured = cursor.single().is_ok_and(|c| c.grab_mode != CursorGrabMode::None);
@@ -1274,10 +1531,23 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
             format!("{}: {}", b.name.unwrap_or_else(|| "someone".into()), b.line.chars().take(b.typed).collect::<String>())
         }),
         stowed: sim.hands.put_away(),
+        dying: sim.dying.unwrap_or(-1.0),
+        dark: sim.dark(),
+        level: sim.file.as_ref().map_or(String::new(), |f| f.display().to_string()),
     };
     if sim.frozen() {
         return;
     }
+    // Dying, nothing else happens until the player comes round.
+    let dt = 1.0 / TICK as f32;
+    if let Some(t) = &mut sim.dying {
+        *t += dt;
+        if *t >= COME_ROUND {
+            sim.come_round();
+        }
+        return;
+    }
+    sim.waking = (sim.waking - dt / WAKE).max(0.0);
     let clear = sim.player.clarity > 0.0;
     let straining = sim.hands.guarding() || sim.level.walker.sprinting();
     sim.player.update(1.0 / TICK as f32, straining);
@@ -1298,6 +1568,10 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         }
     }
     sim.fight();
+    if sim.player.hp <= 0 {
+        sim.die();
+        return;
+    }
     if sim.level.scene.tick_things(1.0 / TICK as f32) {
         sim.level.things_moved();
     }
@@ -1402,7 +1676,11 @@ fn draw(
         sim.dream_time += dt;
         if dream.is_some() || sim.plain() {
             let sim = &mut *sim;
-            sim.herd.player = (!sim.auto_walk).then(|| sim.feet().0);
+            sim.herd.player = (!sim.auto_walk && sim.dying.is_none()).then(|| sim.feet().0);
+            if !sim.dead.is_empty() {
+                sim.herd.lay_dead(&sim.level.scene, sim.version, &sim.dead);
+                sim.dead.clear();
+            }
             let cues = sim.herd.update(&mut sim.level.scene, sim.version, dt);
             sim.cues.extend(cues);
             let eye = sim.level.walker.camera().pos.map(|c| c as f32);
@@ -1729,12 +2007,17 @@ fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut i
             let blow = if full { attack } else { (attack / LABOURED).max(1) };
             sim.struck.push((side, blow));
         }
-        sim.level.walker.kick = sim.hands.kick();
+        sim.level.walker.kick = match sim.dying {
+            Some(t) => death_kick(t, sim.level.walker.pitch),
+            None => sim.hands.kick(),
+        };
     }
     let width = sim.width;
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
     let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.hands.shown(sim.level.walker.bob()));
     state.toast = sim.toast.as_ref().map(|t| t.0.clone());
+    // Quantised, so a fade redraws the HUD at most 64 times.
+    state.dark = (sim.dark() * 64.0).round() / 64.0;
     if let Some(t) = &sim.talk {
         // The tail points just over the speaker's head.
         let at = sim.level.scene.people.get(t.person).and_then(|p| {

@@ -37,7 +37,8 @@ The opening area is a castle with an outdoor market and houses around it.
   about why they have come here, which sets up the premise.
 - **The queen.** When the player speaks to her, she sends them down to the
   dungeon entrance and warns them that things are really weird down there.
-- **Save point.** The castle has one (see [Saving](#saving)).
+- **Save point.** The castle has one, a person who keeps the town's ledger
+  (see [Saving](#saving)).
 
 ## The dungeon
 
@@ -331,11 +332,18 @@ options:
 ## Saving
 
 - The player can only save at **save points**: in the castle, and at a few
-  chosen places in the levels.
-- **Quitting** saves where the player is, and starting the game again puts them
-  back there. This is a suspend, not a save the player can go back to later.
-- **Dying** makes the player load one of their saves. The suspend from quitting
-  is not one of them.
+  chosen places in the levels. In the castle the save point is a person: after
+  their lines they ask "Do you want to save?", with yes and no to pick from.
+- **Quitting** in a dungeon saves where the player is, and starting the game
+  again puts them back there. This is a suspend, not a save the player can go
+  back to later. Quitting in the castle leaves no suspend; the game starts from
+  the castle save.
+- **Dying** loads the castle save. The suspend from quitting is not one of the
+  saves, and dying throws it away. The player lets go of their weapons, which
+  fall away out of view, and drops to their knees with a jolt. Their head sinks
+  to look at the ground as the screen fades to black. Then it fades back in with
+  the player standing in the middle of the town (the level's respawn point), not
+  in front of the save point.
 
 ## Open questions
 
