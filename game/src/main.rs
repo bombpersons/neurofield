@@ -1443,8 +1443,12 @@ fn draw(
         let sim = &mut *sim;
         if let (Some(layer), Some(growths)) = (dream.as_mut(), &sim.growths) {
             let cam = sim.level.walker.camera();
+            // As wide as the rasteriser's picture.
+            let width = sim.width;
             let Creatures { rgba, near } = &mut *creatures;
-            match layer.draw_alone(&mut sim.level.scene, sim.version, &[], growths.creature(), |p| p, &cam, rgba, near, W) {
+            rgba.resize((width * H * 4) as usize, 0.0);
+            near.resize((width * H) as usize, f32::MAX);
+            match layer.draw_alone(&mut sim.level.scene, sim.version, &[], growths.creature(), |p| p, &cam, rgba, near, width) {
                 Ok(()) => on = true,
                 Err(e) => eprintln!("dream layer: {e}"),
             }
@@ -1452,6 +1456,9 @@ fn draw(
         if on {
             for (image, floats) in [(&shown.colour, &creatures.rgba), (&shown.near, &creatures.near)] {
                 if let Some(mut image) = images.get_mut(image) {
+                    if image.width() != sim.width {
+                        image.resize(Extent3d { width: sim.width, height: H, depth_or_array_layers: 1 });
+                    }
                     image.data = Some(floats.iter().flat_map(|f| f.to_ne_bytes()).collect());
                 }
             }
@@ -1664,7 +1671,7 @@ const NET_WIDTHS: (f32, f32) = (W as f32, MAX_W as f32);
 
 fn layout(
     mut sim: ResMut<Sim>,
-    screen: Res<PsxScreen>,
+    mut screen: ResMut<PsxScreen>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut network: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<NetworkSprite>>,
     mut hud: Query<(&mut Sprite, &mut Transform), (With<HudSprite>, Without<NetworkSprite>)>,
@@ -1675,22 +1682,24 @@ fn layout(
     let frames = if mode == Mode::Both { 2.0 } else { 1.0 };
     let room = window.size() / Vec2::new(frames, 1.0);
     let half = if mode == Mode::Both { room.x / 2.0 } else { 0.0 };
-    // The rasteriser stays 4:3; the network is as wide as the window asks, within what it knows.
-    let raster = fit_scale(room, Vec2::new(W as f32, H as f32));
-    for (sprite, mut t) in &mut display {
-        if sprite.image == screen.image {
-            t.scale = Vec3::splat(raster);
-            t.translation.x = -half;
-        }
-    }
+    // Both pictures are as wide as the window asks, within what the network knows: a
+    // multiple of 16 wide, stretched by at most 2.5% to fill the window.
     let wanted = (room.x / room.y.max(1.0) * H as f32).clamp(NET_WIDTHS.0, NET_WIDTHS.1);
-    // The frame is a multiple of 16 wide, and stretched by at most 2.5% to fill the window.
     let width = ((wanted / 16.0).round() as u32 * 16).clamp(W, MAX_W);
     if sim.width != width {
         sim.width = width;
     }
+    if screen.size() != UVec2::new(width, H) {
+        screen.set_size(UVec2::new(width, H));
+    }
     let size = Vec2::new(wanted, H as f32);
     let scale = fit_scale(room, size);
+    for (sprite, mut t) in &mut display {
+        if sprite.image == screen.image {
+            t.scale = Vec3::new(wanted * scale / width as f32, scale, 1.0);
+            t.translation.x = -half;
+        }
+    }
     let Ok((mut ns, mut nt, mut nv)) = network.single_mut() else { return };
     ns.custom_size = Some(size * scale);
     nt.translation.x = half;
@@ -1699,17 +1708,12 @@ fn layout(
     if ns.color.alpha() != opaque {
         ns.color = Color::WHITE.with_alpha(opaque);
     }
-    // The HUD sits on whichever picture is shown, at its resolution.
+    // The HUD sits on whichever picture is shown (the network's when both are), at its
+    // resolution.
     if let Ok((mut hs, mut ht)) = hud.single_mut() {
-        if mode == Mode::Raster {
-            hs.rect = Some(Rect::new(0.0, 0.0, W as f32, H as f32));
-            hs.custom_size = Some(Vec2::new(W as f32, H as f32) * raster);
-            ht.translation.x = 0.0;
-        } else {
-            hs.rect = Some(Rect::new(0.0, 0.0, width as f32, H as f32));
-            hs.custom_size = Some(size * scale);
-            ht.translation.x = half;
-        }
+        hs.rect = Some(Rect::new(0.0, 0.0, width as f32, H as f32));
+        hs.custom_size = Some(size * scale);
+        ht.translation.x = if mode == Mode::Raster { 0.0 } else { half };
     }
 }
 
@@ -1727,7 +1731,7 @@ fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut i
         }
         sim.level.walker.kick = sim.hands.kick();
     }
-    let width = if sim.shown() == Mode::Raster { W } else { sim.width };
+    let width = sim.width;
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
     let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.hands.shown(sim.level.walker.bob()));
     state.toast = sim.toast.as_ref().map(|t| t.0.clone());
@@ -1784,6 +1788,10 @@ fn status(sim: Res<Sim>, time: Res<Time>, mut text: Query<&mut Text, With<Status
     if *secs >= FPS_EVERY {
         *fps = *frames as f32 / *secs;
         (*secs, *frames) = (0.0, 0);
+        // `GAME_FPS=1` logs the rate, for timing the game from scripts.
+        if std::env::var_os("GAME_FPS").is_some() {
+            eprintln!("fps {:.1} ({:.1} ms a frame), net {:.1} ms", *fps, 1000.0 / *fps, sim.net_ms);
+        }
     }
     let fps = *fps;
     let mode = sim.shown().name();
