@@ -33,7 +33,7 @@ def split(pos):
     pos = np.asarray(pos, np.float64)
     parent = np.arange(len(pos))
     weights = np.broadcast_to(np.eye(3), (len(pos), 3, 3)).copy()
-    done_p, done_t, done_w = [], [], []
+    done_p, done_t, done_w = [pos[:0]], [parent[:0]], [weights[:0]]
     while len(pos):
         edges = np.linalg.norm(pos - np.roll(pos, -1, 1), axis=2).max(1)
         small = edges <= SPLIT
@@ -118,13 +118,17 @@ def project(tris, v):
     return screen, 1.0 / z, parent, weights, pv
 
 
-def rasterise(screen, inv_z, width, device="cpu", chunk=1 << 22):
+def rasterise(screen, inv_z, width, device="cpu", chunk=1 << 22, view=None, views=None):
     """Pieces (`project`'s screen corners [P, 3, 2] and 1/z [P, 3], arrays or tensors) to
     pixels: (the piece each shows [240, width], -1 for none; its screen weights on the
-    piece's corners [240, width, 3]; 1/z [240, width], 0 where nothing is)."""
+    piece's corners [240, width, 3]; 1/z [240, width], 0 where nothing is). With `view`
+    [P] (which of `views` frames each piece is in), all of them at once: [views, 240, width]."""
     dev = torch.device(device)
     S = torch.as_tensor(screen, dtype=torch.float32, device=dev)
     IZ = torch.as_tensor(inv_z, dtype=torch.float32, device=dev)
+    one = view is None
+    V = torch.zeros(len(S), dtype=torch.long, device=dev) if one else torch.as_tensor(view, dtype=torch.long, device=dev)
+    views = 1 if one else views
     a, b, c = S[:, 0], S[:, 1], S[:, 2]
     area = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
     live = area.abs() > 1e-6
@@ -133,7 +137,7 @@ def rasterise(screen, inv_z, width, device="cpu", chunk=1 << 22):
     hi = (S.max(1).values - 0.5).floor()
     hi = torch.stack([hi[:, 0].clamp(max=width - 1), hi[:, 1].clamp(max=H - 1)], 1)
     live &= (hi >= lo).all(1)
-    gw = width // TILE
+    gw, gh = width // TILE, H // TILE
     t_lo, t_hi = (lo // TILE).long(), (hi // TILE).long()
     pid = torch.nonzero(live).squeeze(1)
     nx = t_hi[pid, 0] - t_lo[pid, 0] + 1
@@ -144,35 +148,50 @@ def rasterise(screen, inv_z, width, device="cpu", chunk=1 << 22):
     nxr = nx.repeat_interleave(count)
     tx = t_lo[pair_piece, 0] + k % nxr
     ty = t_lo[pair_piece, 1] + k // nxr
-    tile = ty * gw + tx
+    tile = (V[pair_piece] * gh + ty) * gw + tx
 
-    best = torch.full((H * width,), -1.0, device=dev)
-    who = torch.full((H * width,), -1, dtype=torch.long, device=dev)
-    lam = torch.zeros(H * width, 3, device=dev)
+    plane = H * width
+    best = torch.full((views * plane,), -1.0, device=dev)
+    who = torch.full((views * plane,), -1, dtype=torch.long, device=dev)
     oy, ox = torch.meshgrid(torch.arange(TILE, device=dev), torch.arange(TILE, device=dev), indexing="ij")
     off = torch.stack([ox.flatten(), oy.flatten()], 1)  # [256, 2]
     step = max(1, chunk // (TILE * TILE))
-    for s in range(0, len(tile), step):
+
+    def pairs(s):
+        """The pixels of pairs s.. and the screen weights of their centres on the pieces."""
         pp, tt = pair_piece[s : s + step], tile[s : s + step]
         px = (tt % gw)[:, None] * TILE + off[None, :, 0]
-        py = (tt // gw)[:, None] * TILE + off[None, :, 1]
-        cx, cy = px + 0.5, py + 0.5
+        py = (tt // gw % gh)[:, None] * TILE + off[None, :, 1]
+        pv = (tt // (gw * gh))[:, None]
+        lam = weights_at(pp[:, None], px + 0.5, py + 0.5)
+        inside = (lam >= 0).all(-1) & (px < width)
+        iz = (lam * IZ[pp][:, None]).sum(-1)
+        flat = pv * plane + (py * width + px).clamp(max=plane - 1)
+        return pp, flat, torch.where(inside, iz, torch.full_like(iz, -1.0)), inside
+
+    def weights_at(pp, cx, cy):
         A, B, C = a[pp], b[pp], c[pp]
-        ar = area[pp][:, None]
-        # Screen weights of the pixel centre on the piece's corners.
-        l0 = ((B[:, None, 0] - cx) * (C[:, None, 1] - cy) - (B[:, None, 1] - cy) * (C[:, None, 0] - cx)) / ar
-        l1 = ((C[:, None, 0] - cx) * (A[:, None, 1] - cy) - (C[:, None, 1] - cy) * (A[:, None, 0] - cx)) / ar
-        l2 = 1 - l0 - l1
-        inside = (l0 >= 0) & (l1 >= 0) & (l2 >= 0) & (px < width)
-        iz = l0 * IZ[pp, 0, None] + l1 * IZ[pp, 1, None] + l2 * IZ[pp, 2, None]
-        flat = (py * width + px).clamp(max=H * width - 1)
-        iz = torch.where(inside, iz, torch.full_like(iz, -1.0))
+        ar = area[pp]
+        l0 = ((B[..., 0] - cx) * (C[..., 1] - cy) - (B[..., 1] - cy) * (C[..., 0] - cx)) / ar
+        l1 = ((C[..., 0] - cx) * (A[..., 1] - cy) - (C[..., 1] - cy) * (A[..., 0] - cx)) / ar
+        return torch.stack([l0, l1, 1 - l0 - l1], -1)
+
+    # Nearest first; then, of the pieces that are that near, the last, so that a pixel's piece
+    # doesn't depend on the order duplicate writes land in.
+    for s in range(0, len(tile), step):
+        _, flat, iz, _ = pairs(s)
         best.scatter_reduce_(0, flat.flatten(), iz.flatten(), "amax")
+    for s in range(0, len(tile), step):
+        pp, flat, iz, inside = pairs(s)
         win = inside & (iz == best[flat])
-        f = flat[win]
-        who[f] = pp[:, None].expand_as(flat)[win]
-        lam[f] = torch.stack([l0, l1, l2], -1)[win]
-    shape = (H, width)
+        who.scatter_reduce_(0, flat[win], pp[:, None].expand_as(flat)[win], "amax")
+    # The weights from the piece that won.
+    lam = torch.zeros(views * plane, 3, device=dev)
+    f = torch.nonzero(who >= 0).squeeze(1)
+    if len(f):
+        q = f % plane
+        lam[f] = weights_at(who[f], (q % width).float() + 0.5, (q // width).float() + 0.5)
+    shape = (H, width) if one else (views, H, width)
     return who.view(shape), lam.view(*shape, 3), best.clamp(min=0).view(shape)
 
 

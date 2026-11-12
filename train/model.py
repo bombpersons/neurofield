@@ -135,7 +135,7 @@ class Deferred(nn.Module):
     one draws what it did."""
 
     LEVEL, LEVEL_SIZE = 8, 128  # channels, texels a side: the 12 level textures, 4 x 3
-    FLESH, FLESH_SIZE = 8, 256  # the 8 painted flesh slots, 4 x 2
+    FLESH, FLESH_SIZE = 8, 256  # channels, texels a side: one for each painted flesh slot
     EYE, EYE_SIZE, BLINKS = 8, 64, 8
     IRIS = 4
 
@@ -144,7 +144,9 @@ class Deferred(nn.Module):
         from pixels import CHANNELS
 
         self.level = nn.Parameter(torch.randn(self.LEVEL, 3 * self.LEVEL_SIZE, 4 * self.LEVEL_SIZE) * 0.1)
-        self.flesh = nn.Parameter(torch.randn(self.FLESH, 2 * self.FLESH_SIZE, 4 * self.FLESH_SIZE) * 0.1)
+        from pixels import FLESH_SLOTS
+
+        self.flesh = nn.Parameter(torch.randn(FLESH_SLOTS, self.FLESH, self.FLESH_SIZE, self.FLESH_SIZE) * 0.1)
         self.eye = nn.Parameter(torch.randn(self.EYE, self.BLINKS, self.EYE_SIZE, self.EYE_SIZE) * 0.1)
         self.iris = nn.Parameter(torch.randn(self.IRIS, self.EYE_SIZE, self.EYE_SIZE) * 0.1)
         inp = UP[-1] + CHANNELS + self.LEVEL + self.FLESH + self.EYE + self.IRIS
@@ -163,10 +165,26 @@ class Deferred(nn.Module):
         grid = torch.stack([x, y], -1)
         return F.grid_sample(tex[None].expand(len(uv), -1, -1, -1), grid, align_corners=False)
 
+    @staticmethod
+    def _wrapped(tex, which, uv):
+        """Sample texture `which` [b, h, w] of `tex` [n, c, size, size] at uv [b, h, w, 2]
+        (in repeats), bilinearly and wrapping round, as the flesh repeats: [b, c, h, w]."""
+        n, c, size, _ = tex.shape
+        flat = tex.permute(0, 2, 3, 1).reshape(-1, c)
+        x, y = uv[..., 0] * size - 0.5, uv[..., 1] * size - 0.5
+        x0, y0 = x.floor(), y.floor()
+        fx, fy = (x - x0)[..., None], (y - y0)[..., None]
+        x0, y0 = x0.long(), y0.long()
+        base = which.long() * size * size
+        at = lambda i, j: flat[base + (j % size) * size + i % size]  # noqa: E731
+        top = at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx
+        bottom = at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx
+        return (top * (1 - fy) + bottom * fy).permute(0, 3, 1, 2)
+
     def forward(self, head, plain, at):
         """`head` [b, UP[-1], h, w]; `plain`, `at` as pixels.inputs gives them."""
         level = self._atlas(self.level, 4, 3, self.LEVEL_SIZE, at["tex"], at["uv"])
-        flesh = self._atlas(self.flesh, 4, 2, self.FLESH_SIZE, at["slot"], at["lay"]) * at["flesh"][:, None]
+        flesh = self._wrapped(self.flesh, at["slot"], at["lay"]).to(head.dtype) * at["flesh"][:, None]
         b = len(head)
         u, v = at["eye_uv"][..., 0], at["eye_uv"][..., 1]
         grid = torch.stack([u, v, at["blink"].clamp(0, 1) * 2 - 1], -1)[:, None]  # [b, 1, h, w, 3]

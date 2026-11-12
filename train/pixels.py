@@ -27,6 +27,8 @@ def prepare(tris, turning, organs, v, amount):
     """One view's G-buffer inputs, as numpy: the projected pieces and the rows of the
     triangles (and their turning) that they come from."""
     screen, inv_z, parent, weights, _ = project(tris, v)
+    if not len(parent):  # nothing in view: one piece of no area (covers nothing) on the first row
+        screen, inv_z, parent, weights = np.zeros((1, 3, 2)), np.ones((1, 3)), np.zeros(1, np.int64), np.eye(3)[None]
     used, local = np.unique(parent, return_inverse=True)
     rows = np.asarray(tris[used], np.float32)
     turn = np.asarray(turning[used], np.float32) if turning is not None else np.zeros((len(used), 15), np.float32)
@@ -61,11 +63,12 @@ def _on_plane(rays, at, n):
     return rays[:, None] * t[..., None], t
 
 
-def one_view(g, dev):
-    """Plain channels [CHANNELS, 240, width] and sampling coordinates for one prepared view."""
+def one_view(g, dev, raster=None):
+    """Plain channels [CHANNELS, 240, width] and sampling coordinates for one prepared view,
+    rasterised here or given its (piece, lam, inv_z) as gbuffer.rasterise makes them."""
     v = g["view"]
     width, h = int(v[26]), float(v[13])
-    piece, lam, iz = rasterise(g["screen"], g["inv_z"], width, dev)
+    piece, lam, iz = raster if raster is not None else rasterise(g["screen"], g["inv_z"], width, dev)
     covered = piece >= 0
     pc = piece.clamp(min=0)
     tri = torch.as_tensor(g["tri"], device=dev)[pc]  # [H, W]
@@ -157,7 +160,17 @@ def inputs(views, device):
     """A batch of prepared views (one width): (plain channels [b, CHANNELS, 240, width],
     sampling coordinates, each stacked [b, ...])."""
     dev = torch.device(device)
-    outs = [one_view(g, dev) for g in views]
-    plain = torch.stack([o[0] for o in outs])
+    # One rasterising pass for the whole batch.
+    width = int(views[0]["view"][26])
+    counts = [len(g["screen"]) for g in views]
+    first = np.cumsum([0] + counts[:-1])
+    which = np.repeat(np.arange(len(views)), counts)
+    piece, lam, iz = rasterise(np.concatenate([g["screen"] for g in views]), np.concatenate([g["inv_z"] for g in views]),
+                               width, dev, view=which, views=len(views))
+    local = lambda i: torch.where(piece[i] >= 0, piece[i] - int(first[i]), piece[i])  # noqa: E731
+    outs = [one_view(g, dev, (local(i), lam[i], iz[i])) for i, g in enumerate(views)]
+    # Organ states and the like are unbounded; a non-finite input would make even the stage's
+    # zero last layer give NaN.
+    plain = torch.nan_to_num(torch.stack([o[0] for o in outs]), nan=0.0, posinf=1e3, neginf=-1e3).clamp(-1e3, 1e3)
     coords = {k: torch.stack([o[1][k] for o in outs]) for k in outs[0][1]}
     return plain, coords

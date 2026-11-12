@@ -19,6 +19,8 @@ import copy
 import itertools
 import json
 import math
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -42,15 +44,30 @@ WARMUP_NEW_HEAD = 3000
 class Trainer:
     def __init__(
         self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1, ema_decay=0.999,
-        up="shuffle", deferred=False, freeze=10000, trunk_scale=0.1, organ_weight=0.0,
+        up=None, deferred=False, freeze=10000, trunk_scale=0.1, organ_weight=0.0, on_save=None,
     ):
         """With `deferred`, the model gets (or keeps) the per-pixel stage (model.Deferred):
         added to a model without one, everything else is frozen for `freeze` steps and then
         learns at `trunk_scale` of the rate. `organ_weight` is how much more L1 counts on
-        eyes, sphincters and veins (by the per-pixel stage's organ channels)."""
+        eyes, sphincters and veins (by the per-pixel stage's organ channels). `up` None keeps
+        the checkpoint's head (another starts a fresh one). `on_save` is called after each
+        checkpoint is written (to commit a volume, say)."""
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.on_save = on_save
+        ckpt = self.out / "ckpt.pt"
+        # On the CPU, where `migrate` makes its new weights; loading puts them on the device.
+        state = None
+        for f in (ckpt, self.out / "ckpt.prev.pt"):
+            if state is None and f.exists():
+                try:
+                    state = torch.load(f, map_location="cpu")
+                except Exception as e:  # cut short mid-write: the one before it
+                    print(f"can't load {f}: {e}", flush=True)
+        # A model that has the stage keeps it, and needs its inputs.
+        deferred = deferred or bool(state and state.get("cfg", {}).get("deferred"))
+        up = up or (state.get("cfg", {}).get("up", "shuffle") if state else "shuffle")
         n_shards = len(list(Path(data).glob("shard_*")))
         assert n_shards >= 2, "need at least two shards (the last one is held out)"
         self.train_set = Shards(data, range(n_shards - 1), pixels=deferred)
@@ -63,9 +80,6 @@ class Trainer:
         self.cfg["up"] = up
         if deferred:
             self.cfg["deferred"] = True
-        ckpt = self.out / "ckpt.pt"
-        # On the CPU, where `migrate` makes its new weights; loading puts them on the device.
-        state = torch.load(ckpt, map_location="cpu") if ckpt.exists() else None
         migrated, warmup = False, WARMUP
         if state is not None:
             self.cfg = state.get("cfg", self.cfg)
@@ -82,6 +96,8 @@ class Trainer:
             if deferred:
                 weights, cfg, added = migrate_deferred(weights, cfg)
                 if added:
+                    # The rest stands still while the stage starts: a fresh head would stay random.
+                    assert not new_head, "a new head and a new stage at once: train the head first"
                     migrated = True
                     self.freeze_until = state["step"] + freeze
             self.freeze_until = max(self.freeze_until, state.get("freeze_until", 0))
@@ -126,17 +142,21 @@ class Trainer:
                 self.opt.load_state_dict(state["opt"])
                 self.warm_from, self.warmup = state.get("warm", (0, WARMUP))
             else:  # from before the coverage bias: restore the rest, start `cover` fresh
+                assert self.model.deferred is None, "optimizer groups don't match the checkpoint's"
                 cover = self.opt.param_groups.pop()
                 self.opt.load_state_dict(state["opt"])
                 self.opt.add_param_group(cover)
             self.step = state["step"]
             print(f"resumed at step {self.step}" + (" (migrated: fresh optimizer)" if migrated else "")
                   + (f", new {missing}" if missing else ""))
+        # How far through the learning rate's decay the run the checkpoint was saved in got
+        # (minutes spent of minutes in all), for a run that resumes it.
+        self.clock = state.get("clock") if state is not None else None
         # A slow average of the weights, used for validation, samples and export: steadier than the
         # weights of any one step.
         self.ema_decay = ema_decay
         self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
-        if ckpt.exists() and "ema" in state:
+        if state is not None and "ema" in state:
             self.ema.load_state_dict(state["ema"])
         params = sum(p.numel() for p in self.model.parameters())
         print(f"{params / 1e6:.1f}M params, {len(self.train_set)} train / {len(self.val_set)} val views, {self.device}")
@@ -158,6 +178,30 @@ class Trainer:
         if group.get("stage") or self.model.deferred is None:
             return 1.0
         return 0.0 if self.step < self.freeze_until else self.trunk_scale
+
+    def _freeze(self):
+        """Gradients only for the groups that learn this step: a frozen trunk costs no backward
+        and takes no part in clipping."""
+        for g in self.opt.param_groups:
+            learn = self._scale(g) > 0
+            for p in g["params"]:
+                p.requires_grad_(learn)
+
+    def probe(self):
+        """One training step's forward and backward on a batch of the widest views, without
+        stepping: an out-of-memory shows now rather than hours in. Returns the peak GiB."""
+        widths = np.array(self.train_set.widths)
+        idx = np.flatnonzero(widths == widths.max())[: self.loader.batch_sampler.batch]
+        self.model.train().requires_grad_(True)
+        if self.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        pred, target, weight = self.forward(collate([self.train_set[i] for i in idx]), weight=True)
+        loss = self.losses(pred, target, weight)[0]
+        self.scaler.scale(loss).backward()
+        self.opt.zero_grad(set_to_none=True)
+        peak = torch.cuda.max_memory_allocated() / 2**30 if self.device == "cuda" else 0.0
+        print(f"probe: {len(idx)} views {int(widths.max())} wide, peak {peak:.1f} GiB", flush=True)
+        return peak
 
     def forward(self, batch, model=None, weight=False):
         """(prediction, target) for a batch: the level alone. With `weight`, also how much
@@ -190,24 +234,32 @@ class Trainer:
             perceptual = self.lpips(pred * 2 - 1, target * 2 - 1).float().mean()
         return fit + self.lpips_weight * perceptual, l1, perceptual
 
-    def run(self, minutes=None, steps=None, log_every=50, sample_every=500, decay=False):
+    def run(self, minutes=None, steps=None, log_every=50, sample_every=500, decay=False, spent=0.0, total=None):
         """Train for `minutes` and/or `steps`. With `decay`, the learning rate follows a cosine
         over this run (by time when `minutes` is given), so each run ends settled; the next
-        run restarts at the full rate."""
+        run restarts at the full rate. A run picked up partway (after a restart) passes the
+        minutes it already `spent` of `total`, and the decay carries on from there."""
         self.model.train()
+        total = total or (spent + minutes if minutes else None)
         start, done, l1s, lps = time.time(), 0, [], []
+        self.clock = (spent, total)
+        frozen = None
         while (steps is None or done < steps) and (minutes is None or time.time() - start < minutes * 60):
             progress = None
             if decay:
-                progress = (time.time() - start) / (minutes * 60) if minutes else done / steps
+                progress = (spent + (time.time() - start) / 60) / total if minutes else done / steps
+            self.clock = (spent + (time.time() - start) / 60, total)
             for g in self.opt.param_groups:
                 g["lr"] = self._lr(progress) * self._scale(g)
+            if frozen != (self.step < self.freeze_until):
+                frozen = self.step < self.freeze_until
+                self._freeze()
             pred, target, weight = self.forward(next(self.batches), weight=True)
             loss, l1, perceptual = self.losses(pred, target, weight)
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.opt)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.grad is not None], 1.0)
             self.scaler.step(self.opt)
             self.scaler.update()
             with torch.no_grad():
@@ -218,7 +270,7 @@ class Trainer:
             done += 1
             if self.step % log_every == 0:
                 recent = lambda xs: float(np.mean(xs[-log_every:]))  # noqa: E731
-                self.log(train_l1=recent(l1s), train_lpips=recent(lps), lr=self.opt.param_groups[0]["lr"], secs=time.time() - start)
+                self.log(train_l1=recent(l1s), train_lpips=recent(lps), lr=self.opt.param_groups[0]["lr"], stage_lr=self.opt.param_groups[-1]["lr"], secs=time.time() - start)
             if self.step % sample_every == 0:
                 self.checkpoint()
         self.checkpoint()
@@ -246,15 +298,25 @@ class Trainer:
         Image.fromarray((grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)).save(path)
 
     def checkpoint(self):
+        """Save, then validate and sample (which can fail without costing the save). The
+        checkpoint is written beside the old one and swapped in, the old kept as ckpt.prev.pt,
+        so a run stopped mid-save leaves a whole one."""
+        state = {
+            "model": self.model.state_dict(), "ema": self.ema.state_dict(), "opt": self.opt.state_dict(),
+            "step": self.step, "cfg": self.cfg, "warm": (self.warm_from, self.warmup), "freeze_until": self.freeze_until,
+            "clock": self.clock,
+        }
+        ckpt = self.out / "ckpt.pt"
+        torch.save(state, self.out / "ckpt.pt.tmp")
+        if ckpt.exists():
+            shutil.copyfile(ckpt, self.out / "ckpt.prev.pt")
+        os.replace(self.out / "ckpt.pt.tmp", ckpt)
+        if self.on_save:
+            self.on_save()
         val_l1, val_lpips = self.validate()
         self.log(val_l1=val_l1, val_lpips=val_lpips, cover=self.model.cover.abs().mean().item())
         self.sample(self.out / f"sample_{self.step:07d}.png")
         self.sample(self.out / "sample_latest.png")
-        state = {
-            "model": self.model.state_dict(), "ema": self.ema.state_dict(), "opt": self.opt.state_dict(),
-            "step": self.step, "cfg": self.cfg, "warm": (self.warm_from, self.warmup), "freeze_until": self.freeze_until,
-        }
-        torch.save(state, self.out / "ckpt.pt")
 
     def log(self, **kv):
         rec = {"step": self.step, **kv}
@@ -276,7 +338,7 @@ if __name__ == "__main__":
     ap.add_argument("--sample-every", type=int, default=10**9)
     ap.add_argument("--lpips", type=float, default=0.1, help="weight of the perceptual loss")
     ap.add_argument("--decay", action="store_true", help="cosine learning-rate decay over this run")
-    ap.add_argument("--up", default="shuffle", choices=["shuffle", "resize"], help="the upsampling head; another than the checkpoint's starts fresh")
+    ap.add_argument("--up", default=None, choices=["shuffle", "resize"], help="the upsampling head; another than the checkpoint's starts fresh")
     ap.add_argument("--deferred", action="store_true", help="add (or keep) the per-pixel stage")
     ap.add_argument("--freeze", type=int, default=10000, help="steps the rest stands still when the stage is new")
     ap.add_argument("--organ-weight", type=float, default=0.0, help="extra weight of L1 on organs")
