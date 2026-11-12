@@ -30,7 +30,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from data import Shards, WidthBatches, collate
-from model import Renderer, loss_fn, migrate, migrate_head
+from model import Renderer, loss_fn, migrate, migrate_deferred, migrate_head
 
 # Steps of learning-rate warm-up after the optimizer starts afresh.
 WARMUP = 500
@@ -42,17 +42,27 @@ WARMUP_NEW_HEAD = 3000
 class Trainer:
     def __init__(
         self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1, ema_decay=0.999,
-        up="shuffle",
+        up="shuffle", deferred=False, freeze=10000, trunk_scale=0.1, organ_weight=0.0,
     ):
+        """With `deferred`, the model gets (or keeps) the per-pixel stage (model.Deferred):
+        added to a model without one, everything else is frozen for `freeze` steps and then
+        learns at `trunk_scale` of the rate. `organ_weight` is how much more L1 counts on
+        eyes, sphincters and veins (by the per-pixel stage's organ channels)."""
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         n_shards = len(list(Path(data).glob("shard_*")))
         assert n_shards >= 2, "need at least two shards (the last one is held out)"
-        self.train_set = Shards(data, range(n_shards - 1))
-        self.val_set = Shards(data, [n_shards - 1])
+        self.train_set = Shards(data, range(n_shards - 1), pixels=deferred)
+        self.val_set = Shards(data, [n_shards - 1], pixels=deferred)
+        self.organ_weight = organ_weight
+        # Until which step everything but the per-pixel stage stands still, and how fast it
+        # learns after.
+        self.freeze_until, self.trunk_scale = 0, trunk_scale
         self.cfg = dict(d=128, heads=4, enc_layers=2, dec_layers=2) if small else {}
         self.cfg["up"] = up
+        if deferred:
+            self.cfg["deferred"] = True
         ckpt = self.out / "ckpt.pt"
         # On the CPU, where `migrate` makes its new weights; loading puts them on the device.
         state = torch.load(ckpt, map_location="cpu") if ckpt.exists() else None
@@ -69,6 +79,12 @@ class Trainer:
             if new_head:
                 warmup = WARMUP_NEW_HEAD
                 migrated = True
+            if deferred:
+                weights, cfg, added = migrate_deferred(weights, cfg)
+                if added:
+                    migrated = True
+                    self.freeze_until = state["step"] + freeze
+            self.freeze_until = max(self.freeze_until, state.get("freeze_until", 0))
             if migrated:
                 state = {**state, "model": weights, "ema": weights, "opt": None}
                 self.cfg = cfg
@@ -77,9 +93,16 @@ class Trainer:
         self.lpips_weight = lpips_weight
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(self.device).eval().requires_grad_(False)
         covers = ("cover", "part_cover", "organ_cover")
-        main = [p for n, p in self.model.named_parameters() if n not in covers]
+        stage = lambda n: n.startswith("deferred.")  # noqa: E731
+        main = [p for n, p in self.model.named_parameters() if n not in covers and not stage(n)]
         self.opt = torch.optim.AdamW(main, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
         self.opt.add_param_group({"params": [getattr(self.model, n) for n in covers], "weight_decay": 0.0})
+        if self.model.deferred is not None:
+            # The latent textures aren't decayed: they are the stage's memory, not weights.
+            latents = ("deferred.level", "deferred.flesh", "deferred.eye", "deferred.iris")
+            mlp = [p for n, p in self.model.named_parameters() if stage(n) and n not in latents]
+            self.opt.add_param_group({"params": mlp, "stage": True})
+            self.opt.add_param_group({"params": [p for n, p in self.model.named_parameters() if n in latents], "weight_decay": 0.0, "stage": True})
         self.lr = lr
         self.amp = self.device == "cuda"
         self.scaler = torch.amp.GradScaler(enabled=self.amp)
@@ -129,20 +152,43 @@ class Trainer:
             lr *= 0.05 + 0.95 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
         return lr
 
-    def forward(self, batch, model=None):
-        """(prediction, target) for a batch: the level alone."""
+    def _scale(self, group):
+        """How much of the learning rate a parameter group gets: all of it for the per-pixel
+        stage; for the rest, none while frozen and then `trunk_scale` (once there is a stage)."""
+        if group.get("stage") or self.model.deferred is None:
+            return 1.0
+        return 0.0 if self.step < self.freeze_until else self.trunk_scale
+
+    def forward(self, batch, model=None, weight=False):
+        """(prediction, target) for a batch: the level alone. With `weight`, also how much
+        each pixel's L1 counts [b, 240, width] (None: all alike)."""
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch[:5])
         organs = tuple(x.to(self.device, non_blocking=True) for x in batch[6])
-        with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            pred = (model or self.model)(feats, tex, pad, cams, width=images.shape[3], organs=organs)
-        return pred.float(), images
+        model = model or self.model
+        px = None
+        if model.deferred is not None and len(batch) > 7:
+            from pixels import inputs
 
-    def losses(self, pred, target):
-        """(training loss, L1, LPIPS) for a batch."""
+            px = inputs(batch[7], self.device)
+        with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
+            pred = model(feats, tex, pad, cams, width=images.shape[3], organs=organs, pixels=px)
+        if not weight:
+            return pred.float(), images
+        w = None
+        if px is not None and self.organ_weight > 0:
+            plain = px[0]
+            organ = (plain[:, 9] + plain[:, 10] + (plain[:, 18] > 0.5).float()).clamp(max=1)
+            w = 1 + self.organ_weight * organ
+        return pred.float(), images, w
+
+    def losses(self, pred, target, weight=None):
+        """(training loss, L1, LPIPS) for a batch; `weight` [b, 240, width] weighs the L1 the
+        loss uses (the L1 it reports is plain)."""
         l1 = loss_fn(pred, target)
+        fit = l1 if weight is None else ((pred - target).abs().mean(1) * weight).sum() / weight.sum()
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
             perceptual = self.lpips(pred * 2 - 1, target * 2 - 1).float().mean()
-        return l1 + self.lpips_weight * perceptual, l1, perceptual
+        return fit + self.lpips_weight * perceptual, l1, perceptual
 
     def run(self, minutes=None, steps=None, log_every=50, sample_every=500, decay=False):
         """Train for `minutes` and/or `steps`. With `decay`, the learning rate follows a cosine
@@ -155,9 +201,9 @@ class Trainer:
             if decay:
                 progress = (time.time() - start) / (minutes * 60) if minutes else done / steps
             for g in self.opt.param_groups:
-                g["lr"] = self._lr(progress)
-            pred, target = self.forward(next(self.batches))
-            loss, l1, perceptual = self.losses(pred, target)
+                g["lr"] = self._lr(progress) * self._scale(g)
+            pred, target, weight = self.forward(next(self.batches), weight=True)
+            loss, l1, perceptual = self.losses(pred, target, weight)
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.opt)
@@ -206,7 +252,7 @@ class Trainer:
         self.sample(self.out / "sample_latest.png")
         state = {
             "model": self.model.state_dict(), "ema": self.ema.state_dict(), "opt": self.opt.state_dict(),
-            "step": self.step, "cfg": self.cfg, "warm": (self.warm_from, self.warmup),
+            "step": self.step, "cfg": self.cfg, "warm": (self.warm_from, self.warmup), "freeze_until": self.freeze_until,
         }
         torch.save(state, self.out / "ckpt.pt")
 
@@ -231,6 +277,10 @@ if __name__ == "__main__":
     ap.add_argument("--lpips", type=float, default=0.1, help="weight of the perceptual loss")
     ap.add_argument("--decay", action="store_true", help="cosine learning-rate decay over this run")
     ap.add_argument("--up", default="shuffle", choices=["shuffle", "resize"], help="the upsampling head; another than the checkpoint's starts fresh")
+    ap.add_argument("--deferred", action="store_true", help="add (or keep) the per-pixel stage")
+    ap.add_argument("--freeze", type=int, default=10000, help="steps the rest stands still when the stage is new")
+    ap.add_argument("--organ-weight", type=float, default=0.0, help="extra weight of L1 on organs")
     a = ap.parse_args()
-    t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips, up=a.up)
+    t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips, up=a.up,
+                deferred=a.deferred, freeze=a.freeze, organ_weight=a.organ_weight)
     t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every, decay=a.decay)

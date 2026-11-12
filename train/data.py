@@ -53,8 +53,10 @@ RAW_ORGAN_FEATURES = 19
 
 
 class Shards(Dataset):
-    def __init__(self, root, shards=None):
-        """`root` holds shard_* directories, or is itself one shard (e.g. a walk)."""
+    def __init__(self, root, shards=None, pixels=False):
+        """`root` holds shard_* directories, or is itself one shard (e.g. a walk). With
+        `pixels`, each item also carries what the per-pixel stage needs (pixels.prepare)."""
+        self.pixels = pixels
         root = Path(root)
         dirs = [root] if (root / "views.npy").exists() else sorted(root.glob("shard_*"))
         if shards is not None:
@@ -121,7 +123,7 @@ class Shards(Dataset):
         else:
             parts, mask = np.zeros((0, 49), np.float32), np.zeros((H, w), np.uint8)
         pfeats, pids = part_tokens(parts, v)
-        return (
+        item = (
             torch.from_numpy(feats),
             torch.from_numpy(tex),
             torch.from_numpy(cam_token(v)),
@@ -132,6 +134,11 @@ class Shards(Dataset):
             torch.from_numpy(ofeats),
             torch.from_numpy(okinds),
         )
+        if self.pixels:
+            from pixels import prepare
+
+            item += (prepare(tris, turning, raw, v, amount),)
+        return item
 
 
     def creatures(self, i):
@@ -328,7 +335,8 @@ def collate(batch):
     """Pad triangle and part tokens to the longest in the batch; the pads mark padding.
     The views must share a width.
     Returns (feats, tex, pad, cams, images, (part feats, part ids, part pad, creature masks),
-    (organ feats, organ kinds, organ pad))."""
+    (organ feats, organ kinds, organ pad)), and with Shards' `pixels` the views' prepared
+    G-buffer inputs as a list."""
     n = max(1, max(item[0].shape[0] for item in batch))
     m = max(1, max(item[4].shape[0] for item in batch))
     o = max(1, max(item[7].shape[0] for item in batch))
@@ -341,7 +349,7 @@ def collate(batch):
     ofeats = torch.zeros(len(batch), o, ORGAN_FEATURES)
     okinds = torch.zeros(len(batch), o, dtype=torch.long)
     opad = torch.ones(len(batch), o, dtype=torch.bool)
-    for i, (f, t, _, _, pf, pi, _, of, ok) in enumerate(batch):
+    for i, (f, t, _, _, pf, pi, _, of, ok) in enumerate(item[:9] for item in batch):
         feats[i, : len(f)] = f
         tex[i, : len(t)] = t
         pad[i, : len(f)] = False
@@ -354,4 +362,5 @@ def collate(batch):
     cams = torch.stack([item[2] for item in batch])
     images = torch.stack([item[3] for item in batch])
     masks = torch.stack([item[6] for item in batch])
-    return feats, tex, pad, cams, images, (pfeats, pids, ppad, masks), (ofeats, okinds, opad)
+    out = feats, tex, pad, cams, images, (pfeats, pids, ppad, masks), (ofeats, okinds, opad)
+    return out + ([item[9] for item in batch],) if len(batch[0]) > 9 else out

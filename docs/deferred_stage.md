@@ -108,7 +108,15 @@ cut off. And a blend with the previous frame along the camera's motion, if it fl
    to a mean error of 0.010 (the dither and the textures' 16-colour palettes, which the
    rebuild leaves out), 0.4% of pixels off by more than 0.15, and a pixel's shift any way
    doubles the error. About a second a view on the CPU.
-2. The model change, export, and a CPU test that the run-7 start renders as before.
+2. The model change, export, and a CPU test that the run-7 start renders as before. Done
+   but for export: `model.Deferred`, `train/pixels.py` (the per-pixel inputs: 22 plain
+   channels, and coordinates for the latents), `Shards(pixels=True)` (the loaders split and
+   project; the trainer rasterises on its device), and `Trainer(deferred=True, freeze,
+   organ_weight)` / `train.py --deferred`. Run 7 with a fresh stage draws exactly what run 7
+   draws; six CPU steps train, freeze and save. The stage adds 6.4M parameters, nearly all
+   latent textures. The decoder reads 71 channels (16 head, 22 plain, 8 level, 8 flesh, 8 eye,
+   4 iris), more than the bench's 48. `export_weights.py` and the game don't know the stage
+   yet (step 4).
 3. Pilot, 2.5 h. Decide on the full run from the flesh/organ numbers and the samples.
 4. Engine: G-buffer pass, latent textures, the WGSL kernel; compare against PyTorch on the
    same view (as `datagen check` does for the network now) and time it.

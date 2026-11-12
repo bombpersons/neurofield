@@ -112,9 +112,10 @@ class UpHead(nn.Module):
         self.noise_scale = nn.ParameterList([nn.Parameter(torch.zeros(c)) for c in UP])
         self.rgb = nn.Conv2d(UP[-1], 3, 3, padding=1)
 
-    def forward(self, q, gw, noise=None):
+    def forward(self, q, gw, noise=None, features=False):
         """`noise` [b, 4, 16 gh, 16 gw]: channel i, at the size of doubling i (the
-        top-left corner of it), is that doubling's noise; None for none."""
+        top-left corner of it), is that doubling's noise; None for none. With `features`,
+        also the last full-size channels [b, UP[-1], 16 gh, 16 gw] (for Deferred)."""
         b, gh = q.shape[0], q.shape[1] // gw
         x = self.proj(q).transpose(1, 2).reshape(b, -1, gh, gw)
         for i, (up, scale) in enumerate(zip(self.ups, self.noise_scale)):
@@ -122,11 +123,63 @@ class UpHead(nn.Module):
             if noise is not None:
                 x = x + scale[:, None, None] * noise[:, i : i + 1, : x.shape[2], : x.shape[3]]
             x = F.gelu(x)
-        return self.rgb(x)
+        return (self.rgb(x), x) if features else self.rgb(x)
+
+
+class Deferred(nn.Module):
+    """The per-pixel stage (docs/deferred_stage.md): at every pixel, the head's last
+    channels, what the G-buffer says of the pixel (pixels.inputs) and learned latent
+    textures sampled where the pixel lies on them (one per level texture, one per painted
+    flesh slot, and an eye by blink with an iris that follows the gaze), through a small
+    MLP, added to the head's colour. Its last layer starts at zero, so a model that gains
+    one draws what it did."""
+
+    LEVEL, LEVEL_SIZE = 8, 128  # channels, texels a side: the 12 level textures, 4 x 3
+    FLESH, FLESH_SIZE = 8, 256  # the 8 painted flesh slots, 4 x 2
+    EYE, EYE_SIZE, BLINKS = 8, 64, 8
+    IRIS = 4
+
+    def __init__(self, hidden=64):
+        super().__init__()
+        from pixels import CHANNELS
+
+        self.level = nn.Parameter(torch.randn(self.LEVEL, 3 * self.LEVEL_SIZE, 4 * self.LEVEL_SIZE) * 0.1)
+        self.flesh = nn.Parameter(torch.randn(self.FLESH, 2 * self.FLESH_SIZE, 4 * self.FLESH_SIZE) * 0.1)
+        self.eye = nn.Parameter(torch.randn(self.EYE, self.BLINKS, self.EYE_SIZE, self.EYE_SIZE) * 0.1)
+        self.iris = nn.Parameter(torch.randn(self.IRIS, self.EYE_SIZE, self.EYE_SIZE) * 0.1)
+        inp = UP[-1] + CHANNELS + self.LEVEL + self.FLESH + self.EYE + self.IRIS
+        self.mlp = nn.Sequential(nn.Conv2d(inp, hidden, 1), nn.GELU(), nn.Conv2d(hidden, hidden, 1), nn.GELU(), nn.Conv2d(hidden, 3, 1))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    @staticmethod
+    def _atlas(tex, cols, rows, size, which, uv):
+        """Sample tile `which` [b, h, w] of an atlas [c, rows * size, cols * size] at uv
+        [b, h, w, 2] (0..1, kept half a texel inside the tile): [b, c, h, w]."""
+        e = 0.5 / size
+        uv = uv * (1 - 2 * e) + e
+        x = ((which % cols).float() + uv[..., 0]) / cols * 2 - 1
+        y = ((which // cols).float() + uv[..., 1]) / rows * 2 - 1
+        grid = torch.stack([x, y], -1)
+        return F.grid_sample(tex[None].expand(len(uv), -1, -1, -1), grid, align_corners=False)
+
+    def forward(self, head, plain, at):
+        """`head` [b, UP[-1], h, w]; `plain`, `at` as pixels.inputs gives them."""
+        level = self._atlas(self.level, 4, 3, self.LEVEL_SIZE, at["tex"], at["uv"])
+        flesh = self._atlas(self.flesh, 4, 2, self.FLESH_SIZE, at["slot"], at["lay"]) * at["flesh"][:, None]
+        b = len(head)
+        u, v = at["eye_uv"][..., 0], at["eye_uv"][..., 1]
+        grid = torch.stack([u, v, at["blink"].clamp(0, 1) * 2 - 1], -1)[:, None]  # [b, 1, h, w, 3]
+        eye = F.grid_sample(self.eye[None].expand(b, -1, -1, -1, -1), grid, align_corners=False)[:, :, 0]
+        g = at["gaze"] - 0.5
+        iris = F.grid_sample(self.iris[None].expand(b, -1, -1, -1), torch.stack([u - 0.8 * g[..., 0], v - 0.8 * g[..., 1]], -1), align_corners=False)
+        on = at["eye"][:, None].float()
+        x = torch.cat([head, plain, level * plain[:, :1], flesh, eye * on, iris * on], 1)
+        return self.mlp(x)
 
 
 class Renderer(nn.Module):
-    def __init__(self, d=256, heads=8, enc_layers=4, dec_layers=6, bands=8, low=2, up="shuffle"):
+    def __init__(self, d=256, heads=8, enc_layers=4, dec_layers=6, bands=8, low=2, up="shuffle", deferred=False):
         super().__init__()
         self.bands, self.low = bands, low
         tri_in = TRI_FEATURES + 6 * 2 * bands  # + Fourier of the 3 vertices' NDC
@@ -153,15 +206,17 @@ class Renderer(nn.Module):
         self.register_buffer("noise_dirs", noise_dirs, persistent=False)
         self.out_norm = nn.LayerNorm(d)
         self.head = UpHead(d, up=up)
+        self.deferred = Deferred() if deferred else None
 
-    def forward(self, feats, tex, pad, cams, width=W, parts=None, noise=None, tex_mix=None, temp=None, q_noise=None, organs=None):
+    def forward(self, feats, tex, pad, cams, width=W, parts=None, noise=None, tex_mix=None, temp=None, q_noise=None, organs=None, pixels=None):
         """An image [b, 3, 240, width] (width a multiple of 16) of the triangle tokens seen
         with camera tokens `cams`. `parts` is (part feats, part ids, part pad) as `collate`
         gives them, None for no creatures; `organs` likewise (feats, kinds, pad). `noise` is the head's (see UpHead). The other optional
         inputs are for disturbing a trained model (the game's dream effects): `tex_mix`
         [NUM_TEX, NUM_TEX] mixes texture embeddings (identity: none), `temp` [1] is the
         cross-attention temperature (1: none), and `q_noise` [patches, DREAM_DIRS] pushes
-        each patch query along fixed random directions (zeros: none)."""
+        each patch query along fixed random directions (zeros: none). `pixels` is what
+        pixels.inputs gives the per-pixel stage, if the model has one."""
         b = feats.shape[0]
         gw = width // PATCH
         ndc = feats[:, :, 9:15]
@@ -203,7 +258,10 @@ class Renderer(nn.Module):
                 bias = torch.cat([bias, -ostrength[None, :, None, None] * odist[:, None]], -1)
             bias = bias.masked_fill(pad[:, None, None], float("-inf"))
             q = blk(q, mem=x, mem_bias=bias, temp=temp)
-        return self.head(self.out_norm(q), gw, noise)
+        if self.deferred is None or pixels is None:
+            return self.head(self.out_norm(q), gw, noise)
+        rgb, last = self.head(self.out_norm(q), gw, noise, features=True)
+        return rgb + self.deferred(last, *pixels)
 
 
 def cover_distance(ndc, c):
@@ -256,6 +314,17 @@ def migrate_organs(weights, cfg):
             out[k] = v
     out["organ_cover"] = weights.get("cover", new["cover"]).clone()
     return out, True
+
+
+def migrate_deferred(weights, cfg):
+    """Give a model without a per-pixel stage a fresh one (which draws nothing yet).
+    Returns (weights, cfg, whether anything changed)."""
+    if any(k.startswith("deferred.") for k in weights):
+        return weights, {**cfg, "deferred": True}, False
+    cfg = {**cfg, "deferred": True}
+    out = dict(weights)
+    out.update({k: v for k, v in Renderer(**cfg).state_dict().items() if k.startswith("deferred.")})
+    return out, cfg, True
 
 
 def migrate_head(weights, cfg, up):

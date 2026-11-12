@@ -118,13 +118,10 @@ def project(tris, v):
     return screen, 1.0 / z, parent, weights, pv
 
 
-def gbuffer(tris, v, device="cpu", chunk=1 << 22):
-    """Rasterise one view: a dict of per-pixel tensors [240, width]: `tri` (the tris row
-    shown, -1 for none), `weights` [.., 3] (on that triangle's corners), `inv_z` (1/z,
-    tiles), and for checks against the renderer `piece` (index into `pieces`) and `lam`
-    [.., 3] (screen weights on the piece's corners). `pieces` is project()'s output."""
-    width = int(v[26])
-    screen, inv_z, parent, weights, pv = project(tris, v)
+def rasterise(screen, inv_z, width, device="cpu", chunk=1 << 22):
+    """Pieces (`project`'s screen corners [P, 3, 2] and 1/z [P, 3], arrays or tensors) to
+    pixels: (the piece each shows [240, width], -1 for none; its screen weights on the
+    piece's corners [240, width, 3]; 1/z [240, width], 0 where nothing is)."""
     dev = torch.device(device)
     S = torch.as_tensor(screen, dtype=torch.float32, device=dev)
     IZ = torch.as_tensor(inv_z, dtype=torch.float32, device=dev)
@@ -136,11 +133,11 @@ def gbuffer(tris, v, device="cpu", chunk=1 << 22):
     hi = (S.max(1).values - 0.5).floor()
     hi = torch.stack([hi[:, 0].clamp(max=width - 1), hi[:, 1].clamp(max=H - 1)], 1)
     live &= (hi >= lo).all(1)
-    gw, gh = width // TILE, H // TILE
+    gw = width // TILE
     t_lo, t_hi = (lo // TILE).long(), (hi // TILE).long()
     pid = torch.nonzero(live).squeeze(1)
-    nx = (t_hi[pid, 0] - t_lo[pid, 0] + 1)
-    ny = (t_hi[pid, 1] - t_lo[pid, 1] + 1)
+    nx = t_hi[pid, 0] - t_lo[pid, 0] + 1
+    ny = t_hi[pid, 1] - t_lo[pid, 1] + 1
     count = nx * ny
     pair_piece = pid.repeat_interleave(count)
     k = torch.arange(int(count.sum()), device=dev) - torch.repeat_interleave(torch.cumsum(count, 0) - count, count)
@@ -151,7 +148,7 @@ def gbuffer(tris, v, device="cpu", chunk=1 << 22):
 
     best = torch.full((H * width,), -1.0, device=dev)
     who = torch.full((H * width,), -1, dtype=torch.long, device=dev)
-    lam_out = torch.zeros(H * width, 3, device=dev)
+    lam = torch.zeros(H * width, 3, device=dev)
     oy, ox = torch.meshgrid(torch.arange(TILE, device=dev), torch.arange(TILE, device=dev), indexing="ij")
     off = torch.stack([ox.flatten(), oy.flatten()], 1)  # [256, 2]
     step = max(1, chunk // (TILE * TILE))
@@ -174,19 +171,24 @@ def gbuffer(tris, v, device="cpu", chunk=1 << 22):
         win = inside & (iz == best[flat])
         f = flat[win]
         who[f] = pp[:, None].expand_as(flat)[win]
-        lam_out[f] = torch.stack([l0, l1, l2], -1)[win]
-    covered = who >= 0
-    tri = torch.full((H * width,), -1, dtype=torch.long, device=dev)
-    W = torch.as_tensor(weights, dtype=torch.float32, device=dev)
-    tri[covered] = torch.as_tensor(parent, device=dev)[who[covered]]
-    w = torch.zeros(H * width, 3, device=dev)
-    w[covered] = (lam_out[covered, :, None] * W[who[covered]]).sum(1)
+        lam[f] = torch.stack([l0, l1, l2], -1)[win]
     shape = (H, width)
-    return {
-        "tri": tri.view(shape),
-        "weights": w.view(*shape, 3),
-        "inv_z": best.clamp(min=0).view(shape),
-        "piece": who.view(shape),
-        "lam": lam_out.view(*shape, 3),
-        "pieces": pv,
-    }
+    return who.view(shape), lam.view(*shape, 3), best.clamp(min=0).view(shape)
+
+
+def gbuffer(tris, v, device="cpu"):
+    """Rasterise one view: a dict of per-pixel tensors [240, width]: `tri` (the tris row
+    shown, -1 for none), `weights` [.., 3] (on that triangle's corners), `inv_z` (1/z,
+    tiles), and for checks against the renderer `piece` and `lam` [.., 3] (screen weights
+    on the piece's corners), with `pieces` the pieces' corners in view space."""
+    width = int(v[26])
+    screen, inv_z, parent, weights, pv = project(tris, v)
+    dev = torch.device(device)
+    piece, lam, iz = rasterise(screen, inv_z, width, dev)
+    covered = piece >= 0
+    tri = torch.full_like(piece, -1)
+    tri[covered] = torch.as_tensor(parent, device=dev)[piece[covered]]
+    W = torch.as_tensor(weights, dtype=torch.float32, device=dev)
+    w = torch.zeros(*piece.shape, 3, device=dev)
+    w[covered] = (lam[covered, :, None] * W[piece[covered]]).sum(1)
+    return {"tri": tri, "weights": w, "inv_z": iz, "piece": piece, "lam": lam, "pieces": pv}
