@@ -354,12 +354,69 @@ pub struct Dreamed {
     lid: u16,
 }
 
-/// How the folds of flesh stand at `p` (tiles), about -1..1.
+/// How the folds of flesh stand at `p` (tiles), about -1..1. They are broad, a couple of
+/// tiles from crease to crease, with the creases rounded: the net is told their height at
+/// each level triangle's corners and the middles of its edges (`turning_features`), and
+/// anything finer than that it couldn't place, only blur. The fine relief is the painted
+/// flesh's own (`RELIEF`), which it can learn from where the texture lies.
 fn folds(p: [f32; 3], seed: u64) -> f32 {
-    let bend = [noise(p.map(|c| c * 0.7), seed ^ 1), noise(p.map(|c| c * 0.7 + 9.0), seed ^ 2), noise(p.map(|c| c * 0.7 + 17.0), seed ^ 3)];
-    let q = [0, 1, 2].map(|c| p[c] * 1.5 + bend[c] * 1.4);
-    let ridges = 1.0 - 2.5 * noise(q, seed ^ 4).abs();
-    0.75 * ridges + 0.5 * noise(p.map(|c| c * 0.6), seed ^ 5)
+    let bend = [noise(p.map(|c| c * 0.3), seed ^ 1), noise(p.map(|c| c * 0.3 + 9.0), seed ^ 2), noise(p.map(|c| c * 0.3 + 17.0), seed ^ 3)];
+    let q = [0, 1, 2].map(|c| p[c] * 0.45 + bend[c] * 1.2);
+    let n = noise(q, seed ^ 4);
+    let ridges = 1.0 - 2.5 * (n * n + 0.0025).sqrt();
+    0.75 * ridges + 0.5 * noise(p.map(|c| c * 0.25), seed ^ 5)
+}
+
+/// Triangles split wherever a corner of another lies partway along one of their edges, so
+/// that neighbours share each edge whole. `cut` then makes the same points along it on both
+/// sides, and the folded sheet over them doesn't crack open there.
+fn split_at_junctions(tris: Vec<Tri>) -> Vec<Tri> {
+    // However the corners lie, one triangle doesn't become more pieces than this.
+    const MAX_PIECES: usize = 4096;
+    let mut corners: Vec<[i32; 3]> = tris.iter().flat_map(|t| t.v.map(|v| v.p)).collect();
+    corners.sort_unstable();
+    corners.dedup();
+    // A corner strictly between `a` and `b`, on the line through them. (Only exactly: allowing
+    // the corners of sloping edges that are rounded a unit off it ran away splitting.)
+    let along = |a: [i32; 3], b: [i32; 3]| {
+        let (lo, hi) = (a[0].min(b[0]), a[0].max(b[0]));
+        let from = corners.partition_point(|c| c[0] < lo);
+        let to = corners.partition_point(|c| c[0] <= hi);
+        let ab = [0, 1, 2].map(|k| (b[k] - a[k]) as i64);
+        let len = ab.iter().map(|x| x * x).sum::<i64>();
+        corners[from..to].iter().copied().find(|&c| {
+            let ac = [0, 1, 2].map(|k| (c[k] - a[k]) as i64);
+            let d = (0..3).map(|k| ac[k] * ab[k]).sum::<i64>();
+            let straight = ab[1] * ac[2] == ab[2] * ac[1] && ab[2] * ac[0] == ab[0] * ac[2] && ab[0] * ac[1] == ab[1] * ac[0];
+            straight && d > 0 && d < len
+        })
+    };
+    let mut out = Vec::with_capacity(tris.len());
+    let mut todo = Vec::new();
+    for t in tris {
+        todo.push(t);
+        let mut pieces = 1;
+        while let Some(t) = todo.pop() {
+            let found = if pieces < MAX_PIECES { (0..3).find_map(|i| along(t.v[i].p, t.v[(i + 1) % 3].p).map(|p| (i, p))) } else { None };
+            let Some((i, p)) = found else {
+                out.push(t);
+                continue;
+            };
+            pieces += 1;
+            let (a, b) = (t.v[i], t.v[(i + 1) % 3]);
+            let f = (0..3).map(|k| (p[k] - a.p[k]) as f32).map(|x| x * x).sum::<f32>().sqrt()
+                / (0..3).map(|k| (b.p[k] - a.p[k]) as f32).map(|x| x * x).sum::<f32>().sqrt();
+            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+            let m = Vert { p, uv: [0, 1].map(|k| mix(a.uv[k], b.uv[k])), col: [0, 1, 2].map(|k| mix(a.col[k], b.col[k])), alb: [0, 1, 2].map(|k| mix(a.alb[k], b.alb[k])) };
+            // Both halves keep the winding: the middle stands in for one end of the edge each.
+            let (mut first, mut second) = (t, t);
+            first.v[(i + 1) % 3] = m;
+            second.v[i] = m;
+            todo.push(second);
+            todo.push(first);
+        }
+    }
+    out
 }
 
 /// How much of a place at `p` (world units) has turned, 0 at the edge of the patch.
@@ -648,6 +705,7 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
     }
     let is_flesh = |scene: &Scene, t: &Tri| t.v.iter().any(|v| scene.strangeness(v.p.map(|c| c as f32)) > 0.45);
     let (keep, turn): (Vec<Tri>, Vec<Tri>) = std::mem::take(&mut scene.tris).into_iter().partition(|t| !is_flesh(scene, t));
+    let turn = split_at_junctions(turn);
     let walls: Vec<Tri> = turn.iter().filter(|t| t.normal()[1] > -0.7).copied().collect();
     let small: Vec<Tri> = turn.iter().flat_map(cut).collect();
     let painted = tex::fully_strange_dir().and_then(|dir| Painted::load(scene, &dir));
@@ -1634,6 +1692,58 @@ mod tests {
         let d = sculpt(&mut scene, 3, None);
         assert!(!d.mouths.is_empty(), "no sphincters to check");
         assert_eq!(scene.creatures.len(), before);
+    }
+
+    /// Corners lying partway along another triangle's edge, and the triangles' total area.
+    fn junctions(tris: &[Tri]) -> (usize, f64) {
+        let mut corners: Vec<[i64; 3]> = tris.iter().flat_map(|t| t.v.map(|v| v.p.map(|c| c as i64))).collect();
+        corners.sort_unstable();
+        corners.dedup();
+        let mut found = 0;
+        let mut area = 0.0;
+        for t in tris {
+            let p = t.v.map(|v| v.p.map(|c| c as i64));
+            let cr = |u: [i64; 3], w: [i64; 3]| [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+            let d = |u: [i64; 3], w: [i64; 3]| [0, 1, 2].map(|k| w[k] - u[k]);
+            area += cr(d(p[0], p[1]), d(p[0], p[2])).iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt() / 2.0;
+            for i in 0..3 {
+                let (a, b) = (p[i], p[(i + 1) % 3]);
+                let ab = d(a, b);
+                let len: i64 = ab.iter().map(|x| x * x).sum();
+                found += corners.iter().filter(|&&c| {
+                    let ac = d(a, c);
+                    let k: i64 = (0..3).map(|j| ac[j] * ab[j]).sum();
+                    cr(ab, ac) == [0; 3] && k > 0 && k < len
+                }).count();
+            }
+        }
+        (found, area)
+    }
+
+    #[test]
+    fn neighbours_share_whole_edges_once_split() {
+        let v = |x: i32, z: i32| Vert { p: [x, 0, z], uv: [0, 0], col: [128; 3], alb: [128; 3] };
+        let tri = |a, b, c| Tri { v: [a, b, c], tex: 0, n: [0.0, -1.0, 0.0], tint: [1.0; 3] };
+        // One long edge along z = 0 with two small triangles' corners on it from the other side.
+        let tris = vec![
+            tri(v(0, 0), v(512, 0), v(256, 256)),
+            tri(v(0, 0), v(128, -128), v(128, 0)),
+            tri(v(128, 0), v(128, -128), v(384, 0)),
+        ];
+        let (before, area) = junctions(&tris);
+        assert_eq!(before, 2);
+        let split = split_at_junctions(tris);
+        let (after, area_after) = junctions(&split);
+        assert_eq!(after, 0);
+        assert_eq!(split.len(), 5);
+        assert!((area - area_after).abs() < 1e-6, "{area} became {area_after}");
+
+        let (scene, _) = crate::world::walkable_scene(&mut Rng::new(5), 30);
+        let (_, area) = junctions(&scene.tris);
+        let split = split_at_junctions(scene.tris.clone());
+        let (after, area_after) = junctions(&split);
+        assert_eq!(after, 0);
+        assert!((area - area_after).abs() / area < 1e-9);
     }
 
     #[test]

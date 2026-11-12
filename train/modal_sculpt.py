@@ -7,7 +7,7 @@ kernels' output (`fetch`, which needs the Modal secret `kaggle` holding KAGGLE_A
     .venv/bin/modal volume put neurofield runs/kaggle7/out/ckpt.pt /ckpt/ckpt.pt
     .venv/bin/modal run train/modal_sculpt.py::fetch
 
-    .venv/bin/modal run --detach train/modal_sculpt.py --hours 2.5 --gpu L4 --name sculpt1
+    .venv/bin/modal run --detach train/modal_sculpt.py --hours 2.5 --gpu T4 --name sculpt1
     .venv/bin/modal app logs neurofield-sculpt                          # while it runs
     .venv/bin/modal volume get neurofield /runs/sculpt1 runs/          # afterwards
 
@@ -97,5 +97,8 @@ def train(hours: float, name: str):
 
 @app.local_entrypoint()
 def main(hours: float = 2.5, name: str = "sculpt1", gpu: str = "L4"):
-    # A quarter of an hour over the training time, for setup and the last checkpoint.
-    train.with_options(gpu=gpu, timeout=int((hours + 0.25) * 3600)).remote(hours, name)
+    # A quarter of an hour over the training time, for setup and the last checkpoint. Spawned,
+    # so with --detach it runs on whatever happens to this end: a `modal run` killed while
+    # waiting on `.remote` cancels the call, detached or not.
+    call = train.with_options(gpu=gpu, timeout=int((hours + 0.25) * 3600)).spawn(hours, name)
+    print(f"training as {call.object_id}: .venv/bin/modal app logs neurofield-sculpt")
