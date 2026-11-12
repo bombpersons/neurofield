@@ -140,6 +140,9 @@ pub struct Area {
     /// Adds to or pins strangeness inside the area.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strangeness: Option<AreaStrange>,
+    /// A safe place (a camp, a chapel): the player puts their weapons away inside it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub friendly: bool,
 }
 
 /// What an area does to strangeness inside it (fading out over a tile outside).
@@ -316,6 +319,11 @@ pub enum EntityKind {
         role: crate::world::person::Role,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         wear: Vec<crate::world::clothes::Wear>,
+        /// What they're called, and what they say when spoken to, a box of speech each.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lines: Vec<String>,
     },
     /// `size` is (width, height, depth) in world units.
     Prop { shape: PropShape, size: [f32; 3], tex: u8, tint: [f32; 3] },
@@ -686,6 +694,15 @@ impl Level {
         scene.ambient = self.ambient;
         scene.strange = self.strange();
         scene.sky = self.plain.clone();
+        scene.friendly_areas = self
+            .areas
+            .iter()
+            .filter(|a| a.friendly)
+            .flat_map(|a| a.boxes.iter())
+            .map(|&(lo, hi)| {
+                ([lo[0] as f32 * TF, -hi[1] as f32 * STEP as f32, lo[2] as f32 * TF], [hi[0] as f32 * TF, -lo[1] as f32 * STEP as f32, hi[2] as f32 * TF])
+            })
+            .collect();
         if scene.sky.is_some() {
             scene.strange.amount = 0.0;
         }
@@ -718,10 +735,13 @@ impl Level {
                     scene.add_box([x, floor, z], crate::world::things::CHEST, crate::world::things::CHEST_BODY, e.yaw, 2, [0.7, 0.55, 0.4]);
                     scene.span_mut(n).blocked = true;
                 }
-                EntityKind::Person { look, seed, role, wear } => {
+                EntityKind::Person { look, seed, role, wear, name, lines } => {
                     let mut look = look.clone().unwrap_or_else(|| crate::world::person::Look::random(*seed));
                     look.clothes.extend(wear.iter().copied());
                     scene.add_person(look, *role, [x, floor, z], e.yaw, *seed);
+                    let p = scene.people.last_mut().expect("just added");
+                    p.name = name.clone();
+                    p.lines = lines.clone();
                 }
                 // Items are the game's to draw and pick up.
                 EntityKind::PlayerStart
@@ -850,7 +870,7 @@ mod tests {
         for x in 0..4 {
             l.open(x, 0, 0, 12);
         }
-        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [4, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Pin(0.8)) });
+        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [4, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Pin(0.8)), friendly: false });
         let mut scene = l.to_scene();
         let p = [1.5 * TF, -STEP as f32, 0.5 * TF];
         let whole = scene.strangeness(p);
@@ -871,8 +891,8 @@ mod tests {
         }
         l.strangeness.noise.0 = 0.0;
         l.strangeness.depth = vec![(0.0, 0.1)];
-        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [3, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Pin(0.8)) });
-        l.areas.push(Area { name: "b".into(), label: "room".into(), boxes: vec![([8, 0, 0], [10, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Add(0.3)) });
+        l.areas.push(Area { name: "a".into(), label: "room".into(), boxes: vec![([0, 0, 0], [3, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Pin(0.8)), friendly: false });
+        l.areas.push(Area { name: "b".into(), label: "room".into(), boxes: vec![([8, 0, 0], [10, 12, 1])], surface: None, notes: String::new(), strangeness: Some(AreaStrange::Add(0.3)), friendly: false });
         let scene = l.to_scene();
         let at = |x: f32| scene.strangeness([x * TF, -STEP as f32, 0.5 * TF]);
         assert!((at(1.5) - 0.8).abs() < 1e-4, "pinned inside: {}", at(1.5));

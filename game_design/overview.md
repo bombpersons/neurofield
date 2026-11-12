@@ -157,6 +157,9 @@ player often has to choose between fighting a creature and running from it.
 - A raised shield blocks attacks and spells that come from the direction it
   faces, not from behind. A blocked blow pushes the camera back with a wobble,
   and the shield moves with it.
+- **Friendly places.** In the castle town, and in safe areas marked in the
+  dungeon, the player puts their weapons away: they drop out of view and can't
+  be used. Leaving, the player readies them again. A notice says which.
 
 ### Stamina
 

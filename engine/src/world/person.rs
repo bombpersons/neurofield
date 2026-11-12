@@ -135,6 +135,11 @@ impl Bones {
 pub struct Person {
     pub look: Look,
     pub role: Role,
+    /// What they're called, if the player is to know, and what they say when spoken to.
+    pub name: Option<String>,
+    pub lines: Vec<String>,
+    /// What made them up.
+    pub seed: u64,
     pub body: Creature,
     pub bones: Bones,
     /// The hair's mesh, in the head's frame (see `hair`).
@@ -174,6 +179,9 @@ impl Person {
             rng,
             look,
             role,
+            name: None,
+            lines: Vec::new(),
+            seed,
             body,
             bones,
         }
@@ -605,6 +613,17 @@ mod tests {
         let looks = apply(at.axes, [0.0, 0.0, 1.0]);
         let to = norm(sub(eye, at.centre));
         assert!(dot(looks, to) > 0.85, "the head faces {looks:?}, the player is {to:?}");
+    }
+
+    #[test]
+    fn the_castle_is_peopled_and_safe() {
+        let l = crate::world::level::Level::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../levels/castle.ron"))).unwrap();
+        let scene = l.to_scene();
+        assert_eq!(scene.people.len(), 8);
+        let guard = scene.people.iter().find(|p| p.role == Role::Guard).unwrap();
+        assert_eq!(guard.name.as_deref(), Some("Gate guard"));
+        assert!(guard.lines.len() >= 2 && guard.look.clothes.iter().any(|w| w.kind == clothes::Kind::LeatherCap));
+        assert!(scene.friendly(guard.body.base), "the waking world is safe everywhere");
     }
 
     #[test]

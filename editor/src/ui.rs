@@ -1113,7 +1113,7 @@ impl Viewer<'_> {
             if let Some(b) = crate::tools::cells_box(&self.doc.level, faces) {
                 let l = &mut self.doc.level;
                 let name = format!("area {}", l.areas.len() + 1);
-                l.areas.push(engine::world::level::Area { name, label: "room".into(), boxes: vec![b], surface: None, notes: String::new(), strangeness: None });
+                l.areas.push(engine::world::level::Area { name, label: "room".into(), boxes: vec![b], surface: None, notes: String::new(), strangeness: None, friendly: false });
                 self.s.sel = Sel::Area(l.areas.len() - 1);
             }
         }
@@ -1413,6 +1413,7 @@ fn entity_label(e: &LevelEntity) -> String {
     let at = format!("({:.1}, {:.1}, {:.1})", e.pos[0] / TF, up(e.pos[1]), e.pos[2] / TF);
     match &e.kind {
         EntityKind::Creature { kind, .. } => format!("#{} {kind:?} {at}", e.id),
+        EntityKind::Person { name: Some(name), .. } => format!("#{} {name} {at}", e.id),
         EntityKind::Person { role, .. } => format!("#{} {role:?} {at}", e.id),
         EntityKind::Key { name } => format!("#{} {name} {at}", e.id),
         EntityKind::Prop { shape, .. } => format!("#{} {shape:?} {at}", e.id),
@@ -1560,7 +1561,7 @@ fn entity_properties(
                 });
                 ui.end_row();
             }
-            EntityKind::Person { look, seed, role, wear } => {
+            EntityKind::Person { look, seed, role, wear, name, lines } => {
                 use engine::world::person::Role;
                 ui.label("role");
                 ui.horizontal(|ui| {
@@ -1585,6 +1586,19 @@ fn entity_properties(
                 ui.end_row();
                 // Armour over their clothes.
                 use engine::world::clothes::{Kind as Garment, Wear};
+                ui.label("name");
+                let mut text = name.clone().unwrap_or_default();
+                if ui.text_edit_singleline(&mut text).changed() {
+                    *name = (!text.trim().is_empty()).then_some(text);
+                }
+                ui.end_row();
+                // One box of speech a line; a blank line between them.
+                ui.label("says");
+                let mut text = lines.join("\n\n");
+                if ui.add(egui::TextEdit::multiline(&mut text).desired_rows(3)).changed() {
+                    *lines = text.split("\n\n").map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                }
+                ui.end_row();
                 ui.label("wears");
                 ui.horizontal_wrapped(|ui| {
                     for g in [Garment::LeatherCap, Garment::LeatherVest, Garment::WorkGloves, Garment::CopperRing] {
@@ -1828,6 +1842,9 @@ fn area_properties(ui: &mut egui::Ui, a: &mut engine::world::level::Area, defaul
             2 => Some(AreaStrange::Pin(v.clamp(0.0, 1.0))),
             _ => None,
         };
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut a.friendly, "friendly").on_hover_text("A safe place: the player puts their weapons away inside it");
     })
     .response
     .on_hover_text("Fades out over a tile outside the area");

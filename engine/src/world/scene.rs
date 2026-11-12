@@ -355,6 +355,9 @@ pub struct Scene {
     pub sky: Option<crate::world::level::Sky>,
     /// The people in it (see `person`).
     pub people: Vec<crate::world::person::Person>,
+    /// Boxes (world units, lo and hi corners) of the safe places in it, where the player
+    /// puts their weapons away; the waking world is safe everywhere.
+    pub friendly_areas: Vec<([f32; 3], [f32; 3])>,
 }
 
 /// Position and orientation of one view. Angles use the GTE's 4096 = 360°.
@@ -685,6 +688,7 @@ impl Scene {
             things: Default::default(),
             sky: None,
             people: Vec::new(),
+            friendly_areas: Vec::new(),
         };
         scene.build_level();
         if !scene.outdoor {
@@ -841,6 +845,11 @@ impl Scene {
 
     /// What fog fades to for a camera at `pos`, RGB 0..1: black while grounded,
     /// the level's lurid fog colour where it is strange.
+    /// Whether `p` is somewhere safe (see `friendly_areas`).
+    pub fn friendly(&self, p: [f32; 3]) -> bool {
+        self.sky.is_some() || self.friendly_areas.iter().any(|(lo, hi)| (0..3).all(|i| p[i] >= lo[i] && p[i] <= hi[i]))
+    }
+
     pub fn fog_colour(&self, pos: [i32; 3]) -> [f32; 3] {
         if let Some(sky) = &self.sky {
             return sky.horizon;
@@ -1001,6 +1010,7 @@ impl Scene {
             things: Default::default(),
             sky: None,
             people: Vec::new(),
+            friendly_areas: Vec::new(),
         }
     }
 

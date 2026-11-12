@@ -51,6 +51,9 @@ const GUARDED: f32 = 0.75;
 const KNOCK: f32 = 0.45;
 pub const STUN: f32 = 1.1;
 
+/// How fast the hands are put away out of sight and brought back, in whole moves a second.
+const STOW: f32 = 1.8;
+
 /// How far the walking bob moves the hands per world unit it moves the camera.
 const BOB: f32 = 0.005;
 /// Sideways lag per yaw unit a second of turning, its limit, and how fast it follows.
@@ -205,6 +208,9 @@ pub struct Hands {
     hands: [Hand; 2],
     sway: f32,
     last_yaw: Option<f32>,
+    /// Weapons put away (somewhere friendly), and how far: 0 in hand, 1 out of sight.
+    stow: bool,
+    away: f32,
 }
 
 impl Hands {
@@ -221,7 +227,7 @@ impl Hands {
     /// Start a swing of the sword in hand `side`, laboured if `tired`: false if there's no
     /// sword there, it's still swinging, or the player is stunned.
     pub fn swing(&mut self, side: Side, tired: bool) -> bool {
-        if self.stunned() {
+        if self.stunned() || self.put_away() {
             return false;
         }
         let hand = &mut self.hands[side as usize];
@@ -273,6 +279,19 @@ impl Hands {
         }
     }
 
+    /// Put the weapons away, or with false take them out again; true if that's a change.
+    pub fn stow(&mut self, on: bool) -> bool {
+        let changed = self.stow != on;
+        self.stow = on;
+        changed
+    }
+
+    /// Whether the weapons are put away, or on their way there or back: nothing can be done
+    /// with them.
+    pub fn put_away(&self) -> bool {
+        self.stow || self.away > 0.0
+    }
+
     pub fn stunned(&self) -> bool {
         self.hands.iter().any(|h| matches!(h.act, Some((Act::Break, _))))
     }
@@ -307,6 +326,8 @@ impl Hands {
     pub fn update(&mut self, dt: f32, yaw: f32, held: [bool; 2]) -> Vec<(Side, bool)> {
         let mut swept = Vec::new();
         let stunned = self.stunned();
+        self.away = if self.stow { (self.away + STOW * dt).min(1.0) } else { (self.away - STOW * dt).max(0.0) };
+        let held = if self.put_away() { [false; 2] } else { held };
         for ((hand, held), side) in self.hands.iter_mut().zip(held).zip(SIDES) {
             if !held {
                 hand.spent = false;
@@ -349,6 +370,11 @@ impl Hands {
     /// What each hand holds and its pose now, with the camera's walking bob `bob` (world
     /// units).
     pub fn shown(&self, bob: f32) -> Vec<(Kind, Pose)> {
+        if self.away >= 1.0 {
+            return Vec::new();
+        }
+        // Put away, they drop down out of the bottom of the view, tipping forward.
+        let down = smooth(self.away);
         self.hands
             .iter()
             .zip(SIDES)
@@ -356,7 +382,8 @@ impl Hands {
                 let pose = h.pose();
                 let mut pose = if side == Side::Left { pose.mirrored() } else { pose };
                 pose.pos[0] += self.sway;
-                pose.pos[1] += bob * BOB;
+                pose.pos[1] += bob * BOB + 0.9 * down;
+                pose.rot[0] += 0.9 * down;
                 Some((h.held?, pose))
             })
             .collect()
@@ -532,6 +559,22 @@ mod tests {
 
     fn right(h: &Hands) -> Pose {
         h.shown(0.0)[0].1
+    }
+
+    #[test]
+    fn put_away_the_weapons_go_out_of_sight_and_do_nothing() {
+        let mut h = armed(Some(Item::Sword), Some(Item::Buckler));
+        assert!(h.stow(true) && !h.stow(true));
+        assert!(!h.swing(Side::Right, false), "no swinging while they're put away");
+        step(&mut h, 0.2, [false, true]);
+        assert!(!h.guarding() && !h.shown(0.0).is_empty(), "on their way down");
+        step(&mut h, 1.0, [false, true]);
+        assert!(h.shown(0.0).is_empty() && !h.guarding());
+        assert!(h.stow(false));
+        step(&mut h, 0.2, [false, false]);
+        assert!(!h.shown(0.0).is_empty() && !h.swing(Side::Right, false), "still coming back");
+        step(&mut h, 1.0, [false, false]);
+        assert!(h.swing(Side::Right, false));
     }
 
     #[test]

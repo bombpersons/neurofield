@@ -80,7 +80,9 @@ mod foes;
 mod menu;
 mod player;
 mod hands;
+mod talk;
 use hands::Hands;
+use talk::Talk;
 use hud::HudState;
 use menu::{Menu, Outcome, Press};
 use player::{Player, Side, SIDES};
@@ -195,6 +197,8 @@ struct Sim {
     on_pad: bool,
     /// The pause menu, while it's open; the game stands still under it.
     menu: Option<Menu>,
+    /// Someone being spoken to: the player stands and listens.
+    talk: Option<Talk>,
     /// What the player has dropped in this level.
     drops: Vec<drops::Dropped>,
     /// Quit game was chosen.
@@ -263,7 +267,17 @@ impl Sim {
     /// Use whatever is in front: a door, a lever or a chest. What a chest holds goes into
     /// the inventory, or on the floor before it when there's no room.
     fn use_thing(&mut self) {
+        if let Some(talk) = &mut self.talk {
+            if !talk.press() {
+                self.end_talk();
+            }
+            return;
+        }
         let (feet, yaw) = self.feet();
+        if let Some(i) = talk::speaker(&self.level.scene, feet, yaw) {
+            self.talk = Some(Talk::with(&self.level.scene, i));
+            return;
+        }
         let held = self.held.clone();
         let Some(used) = self.level.scene.use_thing(feet, yaw, &held) else { return };
         let mut said = used.said;
@@ -289,10 +303,19 @@ impl Sim {
         self.say(said);
     }
 
+    fn end_talk(&mut self) {
+        if let Some(t) = self.talk.take() {
+            if let Some(p) = self.level.scene.people.get_mut(t.person) {
+                p.talking = false;
+            }
+        }
+    }
+
     /// A new level, or the file again (it may have been edited), its own strangeness
     /// (a file keeps the slider's).
     fn reload(&mut self) {
         self.version += 1;
+        self.talk = None;
         self.held.clear();
         self.drops.clear();
         match &self.file {
@@ -335,9 +358,10 @@ impl Sim {
         self.paused || self.menu.is_some()
     }
 
-    /// Whether the player's own actions count: not standing still, not on auto-walk.
+    /// Whether the player's own actions count: not standing still, not on auto-walk, not
+    /// listening to someone.
     fn in_control(&self) -> bool {
-        !self.frozen() && !self.auto_walk
+        !self.frozen() && !self.auto_walk && self.talk.is_none()
     }
 
     fn toggle_menu(&mut self) {
@@ -613,6 +637,10 @@ struct Report {
     stats: [i32; 3],
     /// What lies dropped, and where.
     drops: Vec<(String, Vec3)>,
+    /// Who's speaking and what they've said of their line so far, empty when no one is.
+    talk: String,
+    /// The weapons are put away (somewhere friendly).
+    stowed: bool,
 }
 
 fn main() {
@@ -777,6 +805,7 @@ fn main() {
             pad_arms: [false; 2],
             on_pad: false,
             menu: None,
+            talk: None,
             drops: lying,
             quit: false,
         })
@@ -1033,6 +1062,13 @@ fn pad_buttons(pad: &ControllerState, sim: &mut Sim) {
         sim.toggle_menu();
         return;
     }
+    // Talking, circle goes on with it and nothing else is done.
+    if sim.talk.is_some() {
+        if pad.pressed(Button::Circle) {
+            sim.use_thing();
+        }
+        return;
+    }
     if !sim.in_control() {
         return;
     }
@@ -1233,6 +1269,11 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         equipped: sim.player.equipped.iter().map(|s| s.map_or(String::new(), |p| p.wear().map_or(p.name(), |(l, of)| format!("{} {l}/{of}", p.name())))).collect(),
         stats: { let s = sim.player.stats(); [s.attack, s.defence, s.magic] },
         drops: sim.drops.iter().map(|d| (d.item.name(), Vec3::from(d.at))).collect(),
+        talk: sim.talk.as_ref().map_or(String::new(), |t| {
+            let b = t.bubble(None);
+            format!("{}: {}", b.name.unwrap_or_else(|| "someone".into()), b.line.chars().take(b.typed).collect::<String>())
+        }),
+        stowed: sim.hands.put_away(),
     };
     if sim.frozen() {
         return;
@@ -1279,7 +1320,23 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
             sim.said = None;
         }
     }
-    let stunned = sim.hands.stunned();
+    // The words type on, faster while the button's held, the speaker's mouth moving with them.
+    let hurry = key.pressed(KeyCode::KeyE) || pad.held(Button::Circle);
+    if let Some(t) = &mut sim.talk {
+        t.update(1.0 / TICK as f32, hurry);
+        let typing = t.typing();
+        if let Some(p) = sim.level.scene.people.get_mut(t.person) {
+            p.talking = typing;
+        }
+    }
+    // Somewhere friendly the weapons are put away, and taken out again on leaving it.
+    let armed = sim.player.hand(Side::Right).is_some() || sim.player.hand(Side::Left).is_some();
+    if sim.hands.stow(sim.level.scene.friendly(feet)) && armed && !sim.auto_walk {
+        let what = if sim.level.scene.friendly(feet) { "You put your weapons away" } else { "You ready your weapons" };
+        sim.toast = Some((what.to_string(), TOAST_SECS));
+    }
+    // Stunned, or listening to someone, the player can only look about.
+    let stunned = sim.hands.stunned() || sim.talk.is_some();
     let level = &mut sim.level;
     if sim.auto_walk {
         level.walker.step(&level.scene, &mut sim.rng);
@@ -1674,6 +1731,14 @@ fn update_hud(time: Res<Time>, mut sim: ResMut<Sim>, mut hud: ResMut<Hud>, mut i
     let yaw = sim.level.walker.yaw / 4096.0 * std::f32::consts::TAU;
     let mut state = HudState::of(&sim.player, sim.menu.as_ref(), width, sim.on_pad, yaw, sim.hands.shown(sim.level.walker.bob()));
     state.toast = sim.toast.as_ref().map(|t| t.0.clone());
+    if let Some(t) = &sim.talk {
+        // The tail points just over the speaker's head.
+        let at = sim.level.scene.people.get(t.person).and_then(|p| {
+            let head = p.eyes();
+            talk::on_screen(&sim.level.walker.camera(), width, [head[0], head[1] - 0.12 * engine::world::scene::T as f32, head[2]])
+        });
+        state.talk = Some(t.bubble(at));
+    }
     if !sim.drops.is_empty() {
         state.drops = drops::triangles(&sim.drops, &sim.level.scene, &sim.level.walker.camera(), width);
     }

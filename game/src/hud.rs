@@ -40,6 +40,10 @@ const STEEL: Rgba = [200, 205, 215, 255];
 const WOOD: Rgba = [150, 105, 60, 255];
 const LEATHER: Rgba = [120, 80, 45, 255];
 const COPPER: Rgba = [215, 130, 70, 255];
+/// Speech bubbles: their widest, ground and ink.
+const BUBBLE_W: i32 = 210;
+const BUBBLE: Rgba = [250, 246, 236, 245];
+const INK: Rgba = [40, 30, 34, 255];
 /// Height of an equipment slot's row.
 const GEAR_ROW: i32 = 12;
 /// The menus' panels, darker than the HUD's so text reads over a bright frame.
@@ -73,6 +77,20 @@ pub struct HudState {
     pub menu: Option<MenuShown>,
     /// A notice that something happened (gear breaking), shown for a moment.
     pub toast: Option<String>,
+    /// What someone is saying.
+    pub talk: Option<Bubble>,
+}
+
+/// A speech bubble: who's speaking, their line and how much of it is typed out, where
+/// their head is on the screen (the bubble's tail points there), and whether they've more
+/// to say after it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bubble {
+    pub name: Option<String>,
+    pub line: String,
+    pub typed: usize,
+    pub at: Option<(i32, i32)>,
+    pub more: bool,
 }
 
 /// The menu as it is drawn, with what it shows of the player.
@@ -108,6 +126,7 @@ impl HudState {
             hands,
             drops: Vec::new(),
             toast: None,
+            talk: None,
             menu: menu.map(|m| MenuShown {
                 menu: m.clone(),
                 items: p.items.clone(),
@@ -354,6 +373,79 @@ impl Canvas<'_> {
         }
         if let Some(k) = key {
             self.text(x + 2, y + 1, &k.to_string(), FRAME);
+        }
+    }
+
+    /// `text` in the bitmap font, with no edge (dark on a light ground).
+    fn plain_text(&mut self, x: i32, y: i32, text: &str, c: Rgba) {
+        let image = font::text_image(text);
+        let Some(data) = image.data.as_ref() else { return };
+        let (w, h) = (image.width() as i32, image.height() as i32);
+        for py in 0..h {
+            for px in 0..w {
+                if data[((py * w + px) * 4 + 3) as usize] != 0 {
+                    self.put(x + px, y + py, c);
+                }
+            }
+        }
+    }
+
+    /// A speech bubble over the speaker's head (or at the top when they're out of view),
+    /// its tail pointing at them, the speaker's name on a tab above it, and a mark at the
+    /// bottom when there's more to come.
+    fn bubble(&mut self, b: &Bubble) {
+        let w = (BUBBLE_W).min(self.w - 2 * MARGIN);
+        let lines = wrap(&b.line, w - 12);
+        let line_h = font::GLYPH_H as i32 + 2;
+        let h = lines.len() as i32 * line_h + 9;
+        let top_most = MARGIN + 32;
+        let (x, y) = match b.at {
+            Some((ax, ay)) => ((ax - w / 2).clamp(4, self.w - w - 4), (ay - 16 - h).clamp(top_most, self.h - h - 40)),
+            None => ((self.w - w) / 2, top_most),
+        };
+        // The tail first, so the bubble's edge closes over its root.
+        if let Some((ax, ay)) = b.at {
+            let root = ax.clamp(x + 10, x + w - 10);
+            let tip = (ax.clamp(x + 4, x + w - 4), (ay - 6).clamp(y + h + 2, y + h + 14));
+            if tip.1 > y + h {
+                let fill = [BUBBLE[0], BUBBLE[1], BUBBLE[2]];
+                self.triangle(&ScreenTri { p: [(root - 5, y + h - 2), (root + 5, y + h - 2), tip], colour: [fill; 3] });
+                self.line(((root - 5) as f32, (y + h - 1) as f32), (tip.0 as f32, tip.1 as f32), INK);
+                self.line(((root + 5) as f32, (y + h - 1) as f32), (tip.0 as f32, tip.1 as f32), INK);
+            }
+        }
+        self.fill(x + 1, y, w - 2, h, BUBBLE);
+        self.fill(x, y + 1, w, h - 2, BUBBLE);
+        // Rounded corners: the outline steps in at each.
+        self.fill(x + 2, y, w - 4, 1, INK);
+        self.fill(x + 2, y + h - 1, w - 4, 1, INK);
+        self.fill(x, y + 2, 1, h - 4, INK);
+        self.fill(x + w - 1, y + 2, 1, h - 4, INK);
+        for (cx, cy) in [(x + 1, y + 1), (x + w - 2, y + 1), (x + 1, y + h - 2), (x + w - 2, y + h - 2)] {
+            self.put(cx, cy, INK);
+        }
+        if let Some((ax, _)) = b.at {
+            // Open the outline where the tail joins.
+            let root = ax.clamp(x + 10, x + w - 10);
+            self.fill(root - 4, y + h - 1, 9, 1, BUBBLE);
+        }
+        let mut left = b.typed;
+        for (i, line) in lines.iter().enumerate() {
+            let n = line.chars().count();
+            let shown: String = line.chars().take(left).collect();
+            self.plain_text(x + 6, y + 5 + i as i32 * line_h, &shown, INK);
+            // The space the wrap took away counts as typed too.
+            left = left.saturating_sub(n + 1);
+        }
+        if let Some(name) = &b.name {
+            let nw = font::text_width(name) as i32 + 8;
+            self.fill(x + 6, y - 11, nw, 11, PANEL);
+            self.outline(x + 6, y - 11, nw, 11, FRAME);
+            self.text(x + 10, y - 9, name, FRAME);
+        }
+        if b.more {
+            let (mx, my) = (x + w - 10, y + h - 7);
+            self.triangle(&ScreenTri { p: [(mx - 3, my - 2), (mx + 3, my - 2), (mx, my + 2)], colour: [[INK[0], INK[1], INK[2]]; 3] });
         }
     }
 
@@ -632,6 +724,9 @@ pub fn draw(data: &mut [u8], stride: u32, h: u32, state: &HudState) -> Vec<Hit> 
     if let (Some(toast), None) = (&state.toast, &state.menu) {
         c.toast(toast);
     }
+    if let (Some(talk), None) = (&state.talk, &state.menu) {
+        c.bubble(talk);
+    }
     if let Some(shown) = &state.menu {
         match shown.menu.screen {
             Screen::Pause { row } => c.pause(row),
@@ -667,6 +762,28 @@ mod tests {
 
     fn state() -> HudState {
         HudState::of(&Player::new(), None, W, false, 0.0, held())
+    }
+
+    #[test]
+    fn a_bubble_types_out_over_the_speaker_and_points_at_them() {
+        let bubble = |typed: usize, at| {
+            let mut s = state();
+            s.talk = Some(Bubble { name: Some("Guard".into()), line: "Halt! The keep is closed to visitors today.".into(), typed, at, more: true });
+            drawn(&s)
+        };
+        let ink = |d: &[u8], x0: u32, x1: u32, y0: u32, y1: u32| {
+            (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| at(d, x, y)[..3] == INK[..3]).count()
+        };
+        // Over a speaker at (160, 150): the bubble above, its tail coming down toward them.
+        let none = bubble(0, Some((160, 150)));
+        let some = bubble(12, Some((160, 150)));
+        let all = bubble(100, Some((160, 150)));
+        let words = |d: &[u8]| ink(d, 60, 260, 40, 120);
+        assert!(words(&none) < words(&some) && words(&some) < words(&all), "{} {} {}", words(&none), words(&some), words(&all));
+        assert!(ink(&all, 150, 171, 125, 146) > 0, "the tail reaches down toward the speaker");
+        // Out of view, it sits at the top with no tail.
+        let top = bubble(100, None);
+        assert_eq!(ink(&top, 0, W, 130, H), 0);
     }
 
     #[test]

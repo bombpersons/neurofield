@@ -536,7 +536,7 @@ fn change(edit: Edit, ui: &mut Ui, l: &mut Level) -> Result<(String, Value), Str
             if a.boxes.iter().any(|(lo, hi)| (0..3).any(|i| hi[i] <= lo[i])) {
                 return Err("each box is [min, max] with max beyond min (exclusive)".into());
             }
-            l.areas.push(Area { name: a.name.clone(), label: a.label, boxes: a.boxes, surface: a.surface, notes: a.notes, strangeness: a.strangeness });
+            l.areas.push(Area { name: a.name.clone(), label: a.label, boxes: a.boxes, surface: a.surface, notes: a.notes, strangeness: a.strangeness, friendly: false });
             let index = l.areas.len() - 1;
             ui.sel = Sel::Area(index);
             (format!("added area {}", a.name), json!({"index": index}))
