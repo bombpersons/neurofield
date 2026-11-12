@@ -333,6 +333,21 @@ pub enum EntityKind {
     Lever { targets: Vec<u32> },
     /// Where the player comes round after dying, in a town (else at the player start).
     Respawn,
+    /// Where this level meets the level file `to` (beside this one), whose own link of the
+    /// same `name` stands in the same doorway facing back (see `link`): at the middle of a
+    /// cell open in both, facing out of this level. Coming in from a level of the waking
+    /// world, the dream fades in over `fade` tiles past it.
+    Link {
+        to: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fade: f32,
+    },
+}
+
+fn is_zero(f: &f32) -> bool {
+    *f == 0.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -521,6 +536,15 @@ impl Level {
         self.entities.iter().find(|e| e.kind == EntityKind::Respawn).map(|e| (e.pos, e.yaw)).or_else(|| self.player_start())
     }
 
+    /// Where the level meets others.
+    pub fn links(&self) -> Vec<crate::world::link::LinkAt> {
+        let links = self.entities.iter().filter_map(|e| match &e.kind {
+            EntityKind::Link { to, name, fade } => Some(crate::world::link::LinkAt::new(e.id, to, name, *fade, e.pos, e.yaw)),
+            _ => None,
+        });
+        links.collect()
+    }
+
     pub fn next_id(&self) -> u32 {
         self.entities.iter().map(|e| e.id + 1).max().unwrap_or(1)
     }
@@ -638,9 +662,23 @@ impl Level {
     /// The level as a scene: geometry, lights, strangeness, creatures, props, and
     /// doors, keys and levers (`Scene::things`).
     pub fn to_scene(&self) -> Scene {
-        let w = self.columns.keys().map(|k| k.0 + 1).max().unwrap_or(1);
-        let d = self.columns.keys().map(|k| k.1 + 1).max().unwrap_or(1);
-        let top = self.columns.values().flatten().map(|r| r.to).max().unwrap_or(4);
+        // Past each link the level is open a cell further, for walking across the edge.
+        let links = self.links();
+        let mut columns = self.columns.clone();
+        for l in &links {
+            let Some(r) = self.columns.get(&l.doorway()).and_then(|runs| {
+                let layer = (-l.pos[1] / STEP as f32).round() as i32;
+                runs.iter().find(|r| r.from <= layer && layer < r.to)
+            }) else {
+                continue;
+            };
+            let flat = Run { slope: None, ..*r };
+            columns.entry(l.strip()).or_insert_with(|| vec![flat]);
+        }
+        let columns = &columns;
+        let w = columns.keys().map(|k| k.0 + 1).max().unwrap_or(1);
+        let d = columns.keys().map(|k| k.1 + 1).max().unwrap_or(1);
+        let top = columns.values().flatten().map(|r| r.to).max().unwrap_or(4);
         let room = |s: &Surface, b: Option<&([i32; 3], [i32; 3])>| {
             let (lo, hi) = b.copied().unwrap_or(([0; 3], [w, top, d]));
             Room {
@@ -662,7 +700,7 @@ impl Level {
         }
 
         let mut cols = vec![Vec::new(); (w * d) as usize];
-        for (&(x, z), runs) in &self.columns {
+        for (&(x, z), runs) in columns {
             if x < 0 || z < 0 {
                 continue;
             }
@@ -718,6 +756,7 @@ impl Level {
         }
         scene.paint = self.paint.iter().map(|(&((x, l, z), f), &t)| (([x, l, z], f), t)).collect();
         scene.build_level();
+        crate::world::link::cut(&mut scene, &links);
 
         for e in &self.entities {
             let [x, y, z] = e.pos;
@@ -757,6 +796,7 @@ impl Level {
                 // Items are the game's to draw and pick up.
                 EntityKind::PlayerStart
                 | EntityKind::Respawn
+                | EntityKind::Link { .. }
                 | EntityKind::Door { .. }
                 | EntityKind::Key { .. }
                 | EntityKind::Lever { .. }

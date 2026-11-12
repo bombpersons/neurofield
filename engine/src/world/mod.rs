@@ -7,6 +7,7 @@ pub mod clothes;
 pub mod config;
 pub mod creature;
 pub mod level;
+pub mod link;
 pub mod door;
 pub mod dreamed;
 pub mod face;

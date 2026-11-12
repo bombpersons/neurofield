@@ -35,12 +35,15 @@ pub struct Save {
     pub drops: Vec<Dropped>,
     #[serde(default)]
     pub dead: Vec<usize>,
+    /// How the other levels the player has been to stand (`links::Kept`), by file.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kept: std::collections::BTreeMap<PathBuf, crate::links::Kept>,
 }
 
 impl Save {
     /// A new player in `level`, at its respawn point.
     pub fn fresh(level: PathBuf) -> Save {
-        Save { level, at: None, player: Player::new(), keys: Vec::new(), things: None, drops: Vec::new(), dead: Vec::new() }
+        Save { level, at: None, player: Player::new(), keys: Vec::new(), things: None, drops: Vec::new(), dead: Vec::new(), kept: Default::default() }
     }
 }
 

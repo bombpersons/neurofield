@@ -69,6 +69,9 @@ pub(super) const STP_TEXEL: u32 = 64;
 pub(super) const OPAQUE_ONLY: u32 = 128;
 pub(super) const PALETTE: u32 = 256;
 const DEPTH_CUE: u32 = 512;
+const CLIP: u32 = 1024;
+/// The most clipping planes a [`PsxMaterial`] takes.
+pub const MAX_CLIPS: usize = 6;
 /// Bits 12-14: the blend mode, as [`blend_code`].
 pub(super) const BLEND_SHIFT: u32 = 12;
 
@@ -221,6 +224,9 @@ pub struct PsxMaterial {
     /// Optional GTE-style reciprocal cue; overrides camera `DistanceFog` for
     /// this material, independently of `fog`. None preserves ordinary fog.
     pub depth_cue: Option<PsxDepthCue>,
+    /// Draw only where the world position `p` has `c.xyz · p + c.w >= 0` for each plane `c`
+    /// (up to [`MAX_CLIPS`]; more are ignored): what's seen through a doorway, say.
+    pub clip: Vec<Vec4>,
     /// Dither this surface when [`PsxLook::dither`] is on. The GPU dithers
     /// shaded and texture-modulated polygons; raw-textured ones were not.
     pub dither: bool,
@@ -255,6 +261,7 @@ impl Default for PsxMaterial {
             lit: true,
             fog: true,
             depth_cue: None,
+            clip: Vec::new(),
             dither: true,
             double_sided: false,
             cutout: true,
@@ -281,6 +288,8 @@ pub struct PsxUniform {
     pub ambient: Vec4,
     pub depth_cue: Vec4,
     pub far_color: Vec4,
+    pub clip: [Vec4; MAX_CLIPS],
+    pub clip_count: u32,
     pub light_dirs: [Vec4; MAX_LIGHTS],
     pub light_colors: [Vec4; MAX_LIGHTS],
     pub light_count: u32,
@@ -301,6 +310,8 @@ impl AsBindGroupShaderType<PsxUniform> for PsxMaterial {
             ambient: self.lighting.ambient.extend(0.0),
             depth_cue: curve,
             far_color,
+            clip: std::array::from_fn(|i| self.clip.get(i).copied().unwrap_or(Vec4::ZERO)),
+            clip_count: self.clip.len().min(MAX_CLIPS) as u32,
             light_dirs: self.lighting.directions.map(|d| d.extend(0.0)),
             light_colors: self.lighting.colors.map(|c| c.extend(0.0)),
             light_count: self.lighting.count,
@@ -308,6 +319,7 @@ impl AsBindGroupShaderType<PsxUniform> for PsxMaterial {
                 | flag(self.lit, LIT)
                 | flag(self.fog && depth_cue.is_none(), FOG)
                 | flag(depth_cue.is_some(), DEPTH_CUE)
+                | flag(!self.clip.is_empty(), CLIP)
                 | flag(self.look.dither && self.dither, DITHER)
                 | flag(self.look.vertex_snap, SNAP)
                 | flag(self.cutout, CUTOUT)

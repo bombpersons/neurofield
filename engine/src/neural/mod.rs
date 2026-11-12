@@ -139,8 +139,13 @@ impl Level {
 
     /// The same with `tris` in place of the level's triangle features.
     pub fn tokens_of(&self, tris: &[f32], width: u32) -> tokens::Tokens {
+        self.tokens_seen(tris, &self.walker.camera(), width)
+    }
+
+    /// The same seen from `cam` (looking into this level from another, say).
+    pub fn tokens_seen(&self, tris: &[f32], cam: &crate::world::scene::Camera, width: u32) -> tokens::Tokens {
         let mut v = Vec::new();
-        view_features(&self.scene, 0, &self.walker.camera(), width, &mut v);
+        view_features(&self.scene, 0, cam, width, &mut v);
         tokens::tokens(tris, &v)
     }
 }

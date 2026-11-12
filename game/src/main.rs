@@ -90,11 +90,40 @@ mod player;
 mod hands;
 mod talk;
 mod save;
+mod links;
 use hands::Hands;
 use talk::{Said, Talk};
 use hud::HudState;
 use menu::{Menu, Outcome, Press};
 use player::{Player, Side, SIDES};
+
+/// Where a dungeon meets the waking world (a link to a level of it, with a fade): each pixel
+/// of the dungeon shows the network's picture the more the further it is from the link, over
+/// the dungeon's link's fade, the PS1 picture showing for the rest (and for the waking world
+/// beyond). Seen from either side, so nothing changes as the player steps through.
+#[derive(Clone, Copy, Debug)]
+struct Stair {
+    /// The dungeon's link (tiles, in the dungeon), and the tiles over which the network's
+    /// picture comes in.
+    at: [f32; 3],
+    fade: f32,
+    /// How near the player is, 1 at the link to 0 a fade away (the torch is dimmed so).
+    near: f32,
+    /// Seen from the waking world: the dungeon beside it (`Sim::beside`) that the network
+    /// draws through the doorway.
+    through: Option<usize>,
+    /// How much of the network's picture there is at all: from the waking world it comes in
+    /// only as the player nears the doorway (from afar the network makes little of what's
+    /// through it), all of it at the doorway and past it.
+    seen: f32,
+}
+
+/// Tiles from the doorway, in the waking world, over which the network's picture of the
+/// dungeon through it comes in.
+const STAIR_SEEN: (f32, f32) = (1.5, 5.0);
+
+/// Tiles past a stair's fade it still counts, in case the link can be seen from there.
+const STAIR_SIGHT: f32 = 4.0;
 
 /// Stamina a swing uses, and holding up a shield uses a second.
 const SWING_TIRE: f32 = 7.0;
@@ -193,8 +222,8 @@ struct Sim {
     start: Option<([f32; 3], f32)>,
     /// Bumped for a new level: its meshes are rebuilt and its creatures start afresh.
     version: u64,
-    /// Bumped when the level's lights are baked again, which its meshes will have to show.
-    look: u64,
+    /// Which loaded level is walked, for its meshes (`links::meshes`).
+    meshes: u64,
     /// Keys picked up in this level: entity ids and names.
     held: Vec<(u32, String)>,
     /// What last happened (a door, a key), and seconds left to show it.
@@ -232,6 +261,18 @@ struct Sim {
     waking: f32,
     /// Creatures to lay dead as the level comes back from a save, once its herd is made.
     dead: Vec<usize>,
+    /// Where the level meets others, the levels it meets that are loaded, and those still
+    /// loading (`links`).
+    links: Vec<engine::world::link::LinkAt>,
+    beside: Vec<links::Beside>,
+    loading: links::Loading,
+    /// Bumped when the levels beside change, for their meshes.
+    beside_version: u64,
+    /// How the levels the player has left stand, by file.
+    kept: std::collections::BTreeMap<PathBuf, links::Kept>,
+    /// Near where the dungeon meets the waking world, how the network's picture comes in
+    /// (`Stair`).
+    stair: Option<Stair>,
 }
 
 impl Sim {
@@ -244,7 +285,6 @@ impl Sim {
     /// Light the level for its strangeness.
     fn relight(&mut self) {
         self.level.set_strangeness(self.strangeness);
-        self.look += 1;
     }
 
     /// Whether the level is of the waking world (the castle): only ever the PS1 picture,
@@ -260,7 +300,7 @@ impl Sim {
 
     /// Whether the rasteriser is needed, showing through a fade as well.
     fn raster_on(&self) -> bool {
-        self.shown() != Mode::Network || self.veil > 0.0
+        self.shown() != Mode::Network || self.veil > 0.0 || self.stair.is_some()
     }
 
     /// Whether a clear seeing potion has the dream draining, gone, or coming back: then the
@@ -356,18 +396,23 @@ impl Sim {
         self.held.clear();
         self.drops.clear();
         match &self.file {
-            Some(f) => match load_level(f, self.start, false, &mut self.rng) {
-                Ok((level, lying)) => {
-                    self.level = level;
-                    self.drops = lying;
+            Some(f) => match links::load(f, self.start, false, &mut self.rng) {
+                Ok(l) => {
+                    self.level = l.level;
+                    self.drops = l.lying;
+                    self.links = l.links;
                 }
                 Err(e) => eprintln!("{e}"),
             },
             None => {
                 self.level = Level::new(&mut self.rng);
                 self.strangeness = self.level.scene.strange.base;
+                self.links.clear();
             }
         }
+        // Edited, the levels beside may not fit any more.
+        self.beside.clear();
+        self.meshes = links::meshes();
         self.settle();
     }
 
@@ -387,6 +432,144 @@ impl Sim {
         if self.growths.is_some() {
             self.growths = Some(Growths::new(&self.level.scene));
         }
+        self.look_beside();
+    }
+
+    /// Load the levels this one links to that aren't loaded, and let go of the rest.
+    fn look_beside(&mut self) {
+        let here = self.level_file();
+        let wanted: Vec<(u32, PathBuf)> = match &here {
+            Some(h) => self.links.iter().map(|l| (l.id, links::joins(h, l))).collect(),
+            None => Vec::new(),
+        };
+        let before = self.beside.len();
+        self.beside.retain(|b| wanted.iter().any(|(id, f)| *id == b.through && *f == b.loaded.file));
+        if self.beside.len() != before {
+            self.beside_version += 1;
+        }
+        self.loading.keep(|id, f| wanted.iter().any(|w| w.0 == id && w.1 == f));
+        for (id, file) in wanted {
+            if !self.beside.iter().any(|b| b.through == id) && !self.loading.pending(id) {
+                let seed = self.rng.next() as u64;
+                self.loading.start(id, file, seed, self.growths.is_some());
+            }
+        }
+    }
+
+    /// Take in the levels that have loaded beside this one (waiting for link `wait`'s).
+    fn take_beside(&mut self, wait: Option<u32>) {
+        let Some(here) = self.level_file() else { return };
+        for (id, got) in self.loading.done(wait) {
+            let Some(l) = self.links.iter().find(|l| l.id == id) else { continue };
+            match got.and_then(|loaded| links::Beside::meet(&here, l, loaded)) {
+                Ok(mut b) => {
+                    if let Some(k) = self.kept.get(&b.loaded.file) {
+                        b.loaded.level.scene.restore_things(&k.things);
+                    }
+                    self.beside.push(b);
+                    self.beside_version += 1;
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+    }
+
+    /// The feet have come through a link: the level beside it is the one walked now, and
+    /// this one waits beside it, as it's left.
+    fn cross(&mut self, id: u32) {
+        if !self.beside.iter().any(|b| b.through == id) {
+            self.take_beside(Some(id));
+        }
+        let Some(i) = self.beside.iter().position(|b| b.through == id) else { return };
+        let b = self.beside.swap_remove(i);
+        let Some(here) = self.level_file() else { return };
+        self.end_talk();
+        self.kept.insert(
+            here.clone(),
+            links::Kept { things: self.level.scene.things_state(), keys: std::mem::take(&mut self.held), drops: std::mem::take(&mut self.drops) },
+        );
+        let mut left = std::mem::replace(&mut self.level, b.loaded.level);
+        std::mem::swap(&mut left.walker, &mut self.level.walker);
+        self.level.walker.carry(&b.place.inverse(), &mut left.walker);
+        let gone = links::Loaded {
+            file: here,
+            level: left,
+            lying: Vec::new(),
+            links: std::mem::replace(&mut self.links, b.loaded.links),
+            meshes: std::mem::replace(&mut self.meshes, b.loaded.meshes),
+            prepared: None,
+        };
+        // The level's own strangeness, so it's lit as it was beside (and its meshes kept).
+        self.strangeness = self.level.scene.strange.base;
+        let file = b.loaded.file.clone();
+        match self.kept.get(&file) {
+            Some(k) => {
+                self.level.scene.restore_things(&k.things);
+                self.held = k.keys.clone();
+                self.drops = k.drops.clone();
+            }
+            None => self.drops = b.loaded.lying,
+        }
+        self.file = Some(file);
+        self.start = None;
+        self.beside = vec![links::Beside { loaded: gone, through: b.back, back: b.through, place: b.place.inverse() }];
+        self.beside_version += 1;
+        self.settle();
+        self.level.things_moved();
+    }
+
+    /// The planes (world units) through which the level beside, `b`, is seen from the eye:
+    /// its doorway's (`link::Doorway::portal`). Nothing is seen of it without one.
+    fn portal(&self, b: &links::Beside) -> Vec<[f32; 4]> {
+        let eye = self.level.walker.camera().pos.map(|c| c as f32);
+        match self.level.scene.doorways.iter().find(|d| d.link.id == b.through) {
+            Some(d) => d.portal(eye),
+            // Behind the eye: nothing passes.
+            None => vec![[0.0, 0.0, 0.0, -1.0]],
+        }
+    }
+
+    /// Step through a link the feet have come through, if they have.
+    fn through_links(&mut self) {
+        let (feet, _) = self.feet();
+        let through = self.links.iter().find(|l| l.in_doorway(feet) && l.past(feet) > 0.0).map(|l| l.id);
+        if let Some(id) = through {
+            self.cross(id);
+        }
+    }
+
+    /// Near where a dungeon meets the waking world, the network's picture comes in going
+    /// down from it, place by place (`Stair`), as the torch comes up.
+    fn stair_fade(&mut self) {
+        let (feet, _) = self.feet();
+        let mut stair: Option<Stair> = None;
+        let plain = self.plain();
+        for (i, b) in self.beside.iter().enumerate() {
+            // Down in the dungeon, toward the way up; up in the waking world, toward the way
+            // down, while the network is drawing at all.
+            if b.plain() == plain || (plain && self.mode != Mode::Network) {
+                continue;
+            }
+            let Some(l) = self.links.iter().find(|l| l.id == b.through) else { continue };
+            let Some(back) = b.loaded.links.iter().find(|o| o.id == b.back) else { continue };
+            let (dungeon, through) = if plain { (back, Some(i)) } else { (l, None) };
+            let fade = dungeon.fade.max(0.01);
+            let d = (0..3).map(|k| (feet[k] - l.pos[k]).powi(2)).sum::<f32>().sqrt() / TF;
+            // Far enough away, nothing seen is near the link any more.
+            if d > fade + STAIR_SIGHT {
+                continue;
+            }
+            let near = if plain { 1.0 } else { 1.0 - smoothstep(0.0, fade, d) };
+            let seen = if plain { 1.0 - smoothstep(STAIR_SEEN.0, STAIR_SEEN.1, d) } else { 1.0 };
+            if seen <= 0.0 {
+                continue;
+            }
+            if stair.is_none_or(|s| near > s.near) {
+                stair = Some(Stair { at: dungeon.pos.map(|c| c / TF), fade, near, through, seen });
+            }
+        }
+        self.stair = stair;
+        self.level.walker.torch_dim = 1.0 - stair.map_or(0.0, |s| s.near);
     }
 
     /// Affliction as it shows: drained away while the player sees clearly.
@@ -423,6 +606,7 @@ impl Sim {
         };
         let mut s = save::Save::fresh(level);
         s.player = self.player.clone();
+        s.kept = self.kept.clone();
         match save::write(&dir, save::TOWN, &s) {
             Ok(()) => {
                 save::remove(&dir, save::RESUME);
@@ -453,6 +637,7 @@ impl Sim {
             things: Some(self.level.scene.things_state()),
             drops: self.drops.clone(),
             dead: self.herd.dead(),
+            kept: self.kept.clone(),
         };
         if let Err(e) = save::write(&dir, save::RESUME, &s) {
             eprintln!("saving: {e}");
@@ -461,9 +646,14 @@ impl Sim {
 
     /// Go to the save's level as it says, the player as they were.
     fn enter(&mut self, s: save::Save) -> Result<(), String> {
-        let (level, lying) = load_level(&s.level, s.at, true, &mut self.rng)?;
-        self.level = level;
-        self.drops = if s.at.is_some() { s.drops } else { lying };
+        let l = links::load(&s.level, s.at, true, &mut self.rng)?;
+        self.level = l.level;
+        self.meshes = l.meshes;
+        self.strangeness = self.level.scene.strange.base;
+        self.links = l.links;
+        self.beside.clear();
+        self.kept = s.kept;
+        self.drops = if s.at.is_some() { s.drops } else { l.lying };
         self.held = s.keys;
         self.file = Some(s.level);
         self.start = None;
@@ -735,16 +925,6 @@ fn title_case(text: &str) -> String {
     c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
-/// A hand-built level, and the items lying about in it; the walker at `start`, else its
-/// respawn point if `respawn`, else its player start.
-fn load_level(file: &std::path::Path, start: Option<([f32; 3], f32)>, respawn: bool, rng: &mut Rng) -> Result<(Level, Vec<drops::Dropped>), String> {
-    let level = engine::world::level::Level::load(file)?;
-    let start = start.or_else(|| if respawn { level.respawn() } else { None });
-    let built = Level::from_file(&level, start, rng).map_err(|e| format!("{}: {e}", file.display()))?;
-    let lying = drops::of_level(&built.scene, &level);
-    Ok((built, lying))
-}
-
 /// The network's 320x240 frame.
 #[derive(Resource)]
 struct Frame(Handle<Image>);
@@ -764,15 +944,35 @@ struct Creatures {
     near: Vec<f32>,
 }
 
-/// The scene's meshes in psx-bevy, and the versions of the scene they were built from,
-/// and the version of each moving part's meshes (`Scene::things`).
+/// The meshes of each loaded level (by `links::meshes` number), kept while it's loaded: the
+/// walked one's and those beside it alike, as stepping through a doorway only changes how
+/// they're drawn (`engine::render::Placed`). And what only the walked level has.
 #[derive(Resource, Default)]
 struct Parts {
-    entities: Vec<Entity>,
-    /// `Sim::version` and `Sim::look`.
-    version: Option<(u64, u64)>,
-    things: Vec<u32>,
+    levels: HashMap<u64, LevelParts>,
+    /// The walked level's sky and creatures, and which level and how they were made.
+    own: Option<((u64, Lit, bool), Vec<Entity>)>,
 }
+
+/// How a level's meshes were lit: its strangeness, and whether a clear seeing potion had
+/// taken it all away.
+type Lit = (u32, bool);
+
+struct LevelParts {
+    lit: Lit,
+    meshes: engine::render::LevelMeshes,
+    /// The version of each moving part's meshes (`Scene::things`).
+    things: Vec<u32>,
+    /// Where it's placed (None walked), once it has been, and whether its people show.
+    placed: Option<Option<engine::world::link::Placement>>,
+    people: Option<bool>,
+    /// The planes it's seen through, beside the walked level.
+    clip: Vec<Vec4>,
+}
+
+/// Which loaded level a mesh is of (`Parts`).
+#[derive(Component)]
+struct Of(u64);
 
 #[derive(Component)]
 struct Status;
@@ -842,6 +1042,9 @@ struct Report {
     dying: f32,
     dark: f32,
     level: String,
+    /// The levels loaded beside it, and how much the PS1 picture shows near the waking world.
+    beside: Vec<String>,
+    stair: f32,
 }
 
 fn main() {
@@ -913,9 +1116,12 @@ fn main() {
         .filter(|_| !opts.contains_key("level-file") && !opts.contains_key("seed"))
         .and_then(|d| save::read(d, save::RESUME).or_else(|| save::read(d, save::TOWN)));
     let file = opts.get("level-file").map(PathBuf::from).or_else(|| resume.as_ref().map(|r| r.level.clone()));
-    let (mut level, lying) = match &file {
-        Some(f) => load_level(f, start, false, &mut rng).unwrap_or_else(|e| panic!("{e}")),
-        None => (Level::new(&mut rng), Vec::new()),
+    let (mut level, lying, level_links) = match &file {
+        Some(f) => {
+            let l = links::load(f, start, false, &mut rng).unwrap_or_else(|e| panic!("{e}"));
+            (l.level, l.lying, l.links)
+        }
+        None => (Level::new(&mut rng), Vec::new(), Vec::new()),
     };
     let eyes = opts.get("sculpt").map(PathBuf::from);
     let sculpted = eyes.as_deref().map(|dir| engine::world::dreamed::sculpt(&mut level.scene, seed, Some(dir)));
@@ -971,7 +1177,7 @@ fn main() {
         file,
         start,
         version: 0,
-        look: 0,
+        meshes: links::meshes(),
         held: Vec::new(),
         said: None,
         player,
@@ -987,6 +1193,12 @@ fn main() {
         dying: None,
         waking: 0.0,
         dead: Vec::new(),
+        links: level_links,
+        beside: Vec::new(),
+        loading: Default::default(),
+        beside_version: 0,
+        kept: Default::default(),
+        stair: None,
     };
     if let Some(r) = resume {
         let from = r.level.display().to_string();
@@ -994,6 +1206,7 @@ fn main() {
             eprintln!("carrying on from the save in {from}: {e}");
         }
     }
+    sim.look_beside();
 
     let mut app = App::new();
     let mut plugins = DefaultPlugins
@@ -1534,6 +1747,8 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         dying: sim.dying.unwrap_or(-1.0),
         dark: sim.dark(),
         level: sim.file.as_ref().map_or(String::new(), |f| f.display().to_string()),
+        beside: sim.beside.iter().map(|b| b.loaded.file.display().to_string()).collect(),
+        stair: sim.stair.map_or(0.0, |s| s.near),
     };
     if sim.frozen() {
         return;
@@ -1548,6 +1763,9 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         return;
     }
     sim.waking = (sim.waking - dt / WAKE).max(0.0);
+    sim.take_beside(None);
+    sim.through_links();
+    sim.stair_fade();
     let clear = sim.player.clarity > 0.0;
     let straining = sim.hands.guarding() || sim.level.walker.sprinting();
     sim.player.update(1.0 / TICK as f32, straining);
@@ -1644,8 +1862,69 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
     }
 }
 
-/// RGB floats (roughly 0..1, the network's) into an RGBA8 image.
-fn upload_floats(image: &mut Image, rgb: &[f32], width: u32) {
+/// The walked level's camera `cam` as the level beside it, `b`, has it, looking in through
+/// the doorway at `door` (world units, the walked level's): its fog starts from the doorway,
+/// as it would for someone standing in it, so the far side isn't lost in it from afar.
+fn camera_in(b: &links::Beside, cam: &engine::world::scene::Camera, door: [f32; 3]) -> engine::world::scene::Camera {
+    let back = b.place.inverse();
+    let own = b.loaded.level.walker.camera();
+    let away = (0..3).map(|k| (cam.pos[k] as f32 - door[k]).powi(2)).sum::<f32>().sqrt() as i32;
+    engine::world::scene::Camera {
+        pos: back.point(cam.pos.map(|c| c as f32)).map(|v| v.round() as i32),
+        yaw: cam.yaw + back.turn * 1024,
+        fog_near: own.fog_near + away,
+        fog_far: own.fog_far + away,
+        torch: [0.0; 3],
+        ..*cam
+    }
+}
+
+/// How much of the network's picture each pixel shows near a stair, [H][width]: by how far
+/// what it shows of the dungeon (`tris`, seen by `cam`) is from the link. What its triangles
+/// don't cover is the waking world's beyond the link, all PS1.
+fn stair_alpha(
+    stair: &Stair,
+    tris: &[f32],
+    cam: &engine::world::scene::Camera,
+    before: Option<(&[f32], &engine::world::scene::Camera)>,
+    portal: Option<(&engine::world::link::Placement, &[[f32; 4]])>,
+    width: u32,
+) -> Vec<f32> {
+    let mut depth = engine::neural::dream_net::level_depth(tris, cam, width);
+    // Seen from the waking world, its own walls hide the dungeon (the cameras are one).
+    if let Some((tris, cam)) = before {
+        for (d, &near) in depth.iter_mut().zip(&engine::neural::dream_net::level_depth(tris, cam, width)) {
+            if near < *d {
+                *d = f32::MAX;
+            }
+        }
+    }
+    let m = engine::world::view::view_matrix(cam).m.map(|r| r.map(|e| e as f32 / 4096.0));
+    let eye = cam.pos.map(|c| c as f32 / TF);
+    let h = cam.h as f32;
+    let mut alpha = vec![0.0; depth.len()];
+    for (i, (&z, a)) in depth.iter().zip(alpha.iter_mut()).enumerate() {
+        if z == f32::MAX {
+            continue;
+        }
+        let (px, py) = ((i % width as usize) as f32 + 0.5, (i / width as usize) as f32 + 0.5);
+        let c = [(px - width as f32 / 2.0) * z / h, (py - H as f32 / 2.0) * z / h, z];
+        let p = [0, 1, 2].map(|j| eye[j] + m[0][j] * c[0] + m[1][j] * c[1] + m[2][j] * c[2]);
+        // Seen from the waking world, only what's seen through the doorway.
+        if let Some((place, planes)) = portal {
+            let q = place.point(p.map(|c| c * TF));
+            if planes.iter().any(|n| n[0] * q[0] + n[1] * q[1] + n[2] * q[2] + n[3] < 0.0) {
+                continue;
+            }
+        }
+        let d = (0..3).map(|k| (p[k] - stair.at[k]).powi(2)).sum::<f32>().sqrt();
+        *a = smoothstep(0.0, stair.fade, d) * stair.seen;
+    }
+    alpha
+}
+
+/// RGB floats (roughly 0..1, the network's) into an RGBA8 image, opaque or as `alpha` says.
+fn upload_floats(image: &mut Image, rgb: &[f32], alpha: Option<&[f32]>, width: u32) {
     let stride = MAX_W as usize * 4;
     let data = image.data.get_or_insert_with(Vec::new);
     data.resize(stride * H as usize, 255);
@@ -1655,6 +1934,13 @@ fn upload_floats(image: &mut Image, rgb: &[f32], width: u32) {
                 px[i] = (c[i].clamp(0.0, 1.0) * 255.0) as u8;
             }
             px[3] = 255;
+        }
+    }
+    if let Some(alpha) = alpha {
+        for (row, from) in data.chunks_exact_mut(stride).zip(alpha.chunks_exact(width as usize)) {
+            for (px, a) in row.chunks_exact_mut(4).zip(from) {
+                px[3] = (a.clamp(0.0, 1.0) * 255.0) as u8;
+            }
         }
     }
 }
@@ -1688,7 +1974,31 @@ fn draw(
             sim.people.update(&mut sim.level.scene, sim.version, player, dt);
         }
     }
-    if sim.shown() != Mode::Raster {
+    let portal = sim.stair.and_then(|s| Some((s, s.through?)));
+    if let Some((stair, i)) = portal {
+        // From the waking world, the dungeon beside it through the doorway.
+        let t0 = std::time::Instant::now();
+        let width = sim.width;
+        let sim = &mut *sim;
+        let cam = sim.level.walker.camera();
+        let b = &sim.beside[i];
+        let door = b.place.point(stair.at.map(|c| c * TF));
+        let seen = camera_in(b, &cam, door);
+        let level = &b.loaded.level;
+        let mut tokens = level.tokens_seen(&level.tris, &seen, width);
+        let disturbed = effects::apply_set(&[None; effects::EFFECTS.len()], &mut tokens, &level.tris);
+        let rgb = net.render(&tokens, &disturbed);
+        let planes = sim.portal(b);
+        let alpha = stair_alpha(&stair, &level.tris, &seen, Some((&sim.level.tris, &cam)), Some((&b.place, &planes)), width);
+        if let Some(mut image) = images.get_mut(&frame.0) {
+            upload_floats(&mut image, &rgb, Some(&alpha), width);
+        }
+        if let Ok(mut sprite) = sprite.single_mut() {
+            sprite.rect = Some(Rect::new(0.0, 0.0, width as f32, H as f32));
+        }
+        sim.tris = tokens.len();
+        sim.net_ms = sim.net_ms * 0.9 + 0.1 * t0.elapsed().as_secs_f32() * 1000.0;
+    } else if sim.shown() != Mode::Raster {
         let t0 = std::time::Instant::now();
         let width = sim.width;
         let sim = &mut *sim;
@@ -1704,8 +2014,9 @@ fn draw(
                 eprintln!("dream layer: {e}");
             }
         }
+        let alpha = sim.stair.map(|s| stair_alpha(&s, &sim.level.tris, &cam, None, None, width));
         if let Some(mut image) = images.get_mut(&frame.0) {
-            upload_floats(&mut image, &rgb, width);
+            upload_floats(&mut image, &rgb, alpha.as_deref(), width);
         }
         if let Ok(mut sprite) = sprite.single_mut() {
             sprite.rect = Some(Rect::new(0.0, 0.0, width as f32, H as f32));
@@ -1748,44 +2059,113 @@ fn draw(
 }
 
 /// The scene's meshes, rebuilt when it changes.
-fn build_scene(mut commands: Commands, sim: Res<Sim>, mut parts: ResMut<Parts>, mut gfx: engine::render::Gfx) {
-    // With no strangeness in force the lights no longer depend on `look`.
-    let now = (sim.version, if sim.calm >= 1.0 { u64::MAX } else { sim.look });
-    // New lights can wait until the rasteriser is on show.
-    if parts.version == Some(now) || (parts.version.is_some_and(|v| v.0 == now.0) && !sim.raster_on()) {
-        return;
+fn build_scene(mut commands: Commands, mut sim: ResMut<Sim>, mut parts: ResMut<Parts>, mut gfx: engine::render::Gfx) {
+    let sim = &mut *sim;
+    let walked = sim.meshes;
+    let wanted: Vec<u64> = std::iter::once(walked).chain(sim.beside.iter().map(|b| b.loaded.meshes)).collect();
+    parts.levels.retain(|id, p| {
+        let keep = wanted.contains(id);
+        if !keep {
+            for e in p.meshes.parts.iter().chain(&p.meshes.people) {
+                commands.entity(*e).despawn();
+            }
+        }
+        keep
+    });
+    let raster_on = sim.raster_on();
+    for i in 0..wanted.len() {
+        let id = wanted[i];
+        // Seen only through the doorway it's joined at.
+        let clip = if i > 0 { sim.portal(&sim.beside[i - 1]).into_iter().map(engine::render::view_plane).collect() } else { Vec::new() };
+        let (scene, at, prepared) = match i {
+            0 => (&sim.level.scene, None, None),
+            _ => {
+                let b = &mut sim.beside[i - 1];
+                (&b.loaded.level.scene, Some(b.place), b.loaded.prepared.take())
+            }
+        };
+
+        // With no strangeness in force the lights don't depend on it.
+        let lit = (scene.strange.base.to_bits(), at.is_none() && sim.calm >= 1.0);
+        // New lights for the walked level can wait until the rasteriser is on show.
+        let fresh = match parts.levels.get(&id) {
+            None => true,
+            Some(p) => p.lit != lit && (at.is_some() || raster_on),
+        };
+        if fresh {
+            if let Some(old) = parts.levels.remove(&id) {
+                for e in old.meshes.parts.iter().chain(&old.meshes.people) {
+                    commands.entity(*e).despawn();
+                }
+            }
+            let meshes = engine::render::spawn_level(&mut commands, &mut gfx, scene, prepared, true);
+            for e in meshes.parts.iter().chain(&meshes.people) {
+                commands.entity(*e).insert(Of(id));
+            }
+            let things = scene.things.parts.iter().map(|p| p.version).collect();
+            parts.levels.insert(id, LevelParts { lit, meshes, things, placed: None, people: None, clip: Vec::new() });
+        }
+        let Some(p) = parts.levels.get_mut(&id) else { continue };
+        if p.placed != Some(at) || (at.is_some() && p.clip != clip) {
+            for &e in p.meshes.parts.iter().chain(&p.meshes.people) {
+                match &at {
+                    Some(place) => commands.entity(e).insert((engine::render::placed_transform(place), engine::render::Placed { clip: clip.clone() })),
+                    None => commands.entity(e).insert(Transform::IDENTITY).remove::<engine::render::Placed>(),
+                };
+            }
+            p.placed = Some(at);
+            p.clip = clip;
+        }
+        // The walked level's people are drawn as they move, when something moves them.
+        let people = at.is_some() || !scene.creatures_move;
+        if p.people != Some(people) {
+            for &e in &p.meshes.people {
+                commands.entity(e).insert(if people { Visibility::Inherited } else { Visibility::Hidden });
+            }
+            p.people = Some(people);
+        }
     }
-    for e in parts.entities.drain(..) {
-        commands.entity(e).despawn();
+    let own = (walked, parts.levels.get(&walked).map(|p| p.lit).unwrap_or_default(), sim.level.scene.creatures_move);
+    if parts.own.as_ref().map(|o| o.0) != Some(own) {
+        if let Some((_, old)) = parts.own.take() {
+            for e in old {
+                commands.entity(e).despawn();
+            }
+        }
+        if let Some(p) = parts.levels.get(&walked) {
+            let made = engine::render::spawn_own(&mut commands, &mut gfx, &sim.level.scene, &p.meshes.level);
+            parts.own = Some((own, made));
+        }
     }
-    parts.entities = engine::render::spawn(&mut commands, &mut gfx, &sim.level.scene);
-    parts.version = Some(now);
-    parts.things = sim.level.scene.things.parts.iter().map(|p| p.version).collect();
 }
 
-/// The meshes of each door, key or lever that moved since they were made.
+/// The meshes of each door, key or lever of the walked level that moved since they were made.
 fn move_things(
     mut commands: Commands,
     sim: Res<Sim>,
     mut parts: ResMut<Parts>,
-    shown: Query<(Entity, &engine::render::ThingPart)>,
+    shown: Query<(Entity, &engine::render::ThingPart, &Of)>,
     mut gfx: engine::render::Gfx,
 ) {
     let scene = &sim.level.scene;
-    for (i, p) in scene.things.parts.iter().enumerate() {
-        if parts.things.get(i) == Some(&p.version) {
+    let Some(p) = parts.levels.get_mut(&sim.meshes) else { return };
+    for (i, t) in scene.things.parts.iter().enumerate() {
+        if p.things.get(i) == Some(&t.version) {
             continue;
         }
-        for (e, t) in &shown {
-            if t.0 == i {
+        for (e, part, of) in &shown {
+            if part.0 == i && of.0 == sim.meshes {
                 commands.entity(e).despawn();
-                parts.entities.retain(|&x| x != e);
+                p.meshes.parts.retain(|&x| x != e);
             }
         }
         let new = engine::render::spawn_thing(&mut commands, &mut gfx, scene, i);
-        parts.entities.extend(new);
-        if let Some(v) = parts.things.get_mut(i) {
-            *v = p.version;
+        for &e in &new {
+            commands.entity(e).insert(Of(sim.meshes));
+        }
+        p.meshes.parts.extend(new);
+        if let Some(v) = p.things.get_mut(i) {
+            *v = t.version;
         }
     }
 }
@@ -1981,7 +2361,8 @@ fn layout(
     let Ok((mut ns, mut nt, mut nv)) = network.single_mut() else { return };
     ns.custom_size = Some(size * scale);
     nt.translation.x = half;
-    *nv = if mode == Mode::Raster { Visibility::Hidden } else { Visibility::Visible };
+    let portal = sim.stair.is_some_and(|s| s.through.is_some());
+    *nv = if mode == Mode::Raster && !portal { Visibility::Hidden } else { Visibility::Visible };
     let opaque = if sim.mode == Mode::Network { 1.0 - sim.veil } else { 1.0 };
     if ns.color.alpha() != opaque {
         ns.color = Color::WHITE.with_alpha(opaque);

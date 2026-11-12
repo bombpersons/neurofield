@@ -42,6 +42,17 @@ The opening area is a castle with an outdoor market and houses around it.
 
 ## The dungeon
 
+- **The way down.** The keep's door opens on the castle inside, where the queen
+  sits in the throne room. Stairs by the hall's west wall go down to the
+  cellars. There are no loading screens: each level is its own file, joined to
+  the next at a doorway (a `Link`), and the levels a level joins are loaded in
+  the background and drawn through their doorways. Stepping through one hands
+  the player over to the next level. On the stairs, each pixel of the cellars
+  shows the neural picture more the further down it is, the PS1 one the nearer
+  the castle, from either side of the doorway.
+- **What stays.** Doors, chests, levers, keys taken and things dropped stay as
+  the player left them, and are saved; creatures come back each time the
+  player does.
 - **Coming and going.** The player can go back up to the castle whenever they
   like to restock or talk to people.
 - **Shortcuts.** As the game goes on, the player unlocks shortcuts that make the

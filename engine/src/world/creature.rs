@@ -878,10 +878,12 @@ impl Scene {
     /// Moving, a creature no longer holds the cell it was put in (which kept generated walks
     /// out of it): bodies collide by their `girth` wherever they are.
     pub fn set_creatures_move(&mut self, on: bool) {
-        self.creatures_move = on;
-        if !on {
+        // Once is enough: the skins are made for good.
+        if !on || self.creatures_move {
+            self.creatures_move = on;
             return;
         }
+        self.creatures_move = on;
         for g in self.grown.clone() {
             let [x, y, z] = self.creatures[g.creature].base;
             if let Some(n) = self.node_at(x, y - 16.0, z) {

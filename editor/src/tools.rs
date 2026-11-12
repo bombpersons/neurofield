@@ -152,6 +152,7 @@ pub fn entity_icon(kind: &EntityKind) -> &'static str {
         EntityKind::Lever { .. } => i::JOYSTICK,
         EntityKind::Item { .. } => i::FLASK,
         EntityKind::Respawn => i::BED,
+        EntityKind::Link { .. } => i::DOOR_OPEN,
     }
 }
 
@@ -168,6 +169,7 @@ pub fn entity_kinds() -> Vec<(&'static str, EntityKind)> {
         ("Item", EntityKind::Item { name: engine::world::level::ITEMS[0].into(), count: 1 }),
         ("Person", EntityKind::Person { look: None, seed: 1, role: engine::world::person::Role::Wander, wear: Vec::new(), name: None, lines: Vec::new(), saves: false }),
         ("Respawn", EntityKind::Respawn),
+        ("Link", EntityKind::Link { to: String::new(), name: String::new(), fade: 0.0 }),
     ]
 }
 
@@ -1306,7 +1308,7 @@ pub fn place_on(scene: &Scene, h: &Hit, kind: &EntityKind, yaw: f32, free: bool)
 /// Where an entity of `kind` goes for world point `p` and its facing: on the floor
 /// at the middle of the cell (or right at `p` if `free`), facing `yaw`. Doors go
 /// on the middle of the cell's nearest edge instead, facing into the cell (so
-/// they open into it).
+/// they open into it), and links too, facing out across it.
 pub fn place_at(scene: &Scene, kind: &EntityKind, p: [f32; 3], yaw: f32, free: bool) -> Option<([f32; 3], f32)> {
     const TF: f32 = crate::view3d::TF;
     let (x, z) = ((p[0] / TF).floor(), (p[2] / TF).floor());
@@ -1323,6 +1325,13 @@ pub fn place_at(scene: &Scene, kind: &EntityKind, p: [f32; 3], yaw: f32, free: b
         let (ex, ez) = (cx + dx * TF / 2.0 + yaw.cos() * shift, cz + dz * TF / 2.0 + yaw.sin() * shift);
         let fy = floor(cx, cz)?;
         return Some(([ex, fy, ez], yaw));
+    }
+    // A link goes on the cell's nearest edge too, facing out across it.
+    if let EntityKind::Link { .. } = kind {
+        let (fx, fz) = (p[0] / TF - x - 0.5, p[2] / TF - z - 0.5);
+        let (dx, dz) = if fx.abs() > fz.abs() { (fx.signum(), 0.0) } else { (0.0, fz.signum()) };
+        let fy = floor(cx, cz)?;
+        return Some(([cx + dx * TF / 2.0, fy, cz + dz * TF / 2.0], (-dx).atan2(dz)));
     }
     let (px, pz) = if free { (p[0], p[2]) } else { (cx, cz) };
     Some(([px, floor(px, pz)?, pz], yaw))

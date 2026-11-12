@@ -987,9 +987,14 @@ impl Viewer<'_> {
                 let doors = named(|k| matches!(k, EntityKind::Door { .. }));
                 let e = l.entities.iter_mut().find(|e| e.id == id).unwrap();
                 let mut place = None;
-                entity_properties(ui, e, &keys, &doors, &mut self.s.tools.link, &mut place, &mut delete);
+                let mut go = None;
+                let here = self.doc.path.clone();
+                entity_properties(ui, e, &keys, &doors, here.as_deref(), &mut self.s.tools.link, &mut place, &mut go, &mut delete);
                 if let Some(f) = place {
                     self.s.tools.arm_for(f, self.doc);
+                }
+                if let Some(p) = go {
+                    request(&mut self.s, self.doc, After::Open(Some(p)));
                 }
             }
             Sel::Light(i) if i < l.lights.len() => light_properties(ui, i, &mut l.lights[i], &mut delete),
@@ -1023,7 +1028,7 @@ impl Viewer<'_> {
         let filter = self.s.filter.to_lowercase();
         let shown = |label: &str| filter.is_empty() || label.to_lowercase().contains(&filter);
         ui.separator();
-        let kinds = ["PlayerStart", "Respawn", "Person", "Creature", "Door", "Key", "Chest", "Item", "Prop", "Lever"];
+        let kinds = ["PlayerStart", "Respawn", "Link", "Person", "Creature", "Door", "Key", "Chest", "Item", "Prop", "Lever"];
         for k in kinds {
             let items: Vec<(u32, String, Color32)> = self
                 .doc
@@ -1391,6 +1396,7 @@ pub(crate) fn kind_name(k: &EntityKind) -> &'static str {
         EntityKind::Lever { .. } => "Lever",
         EntityKind::Item { .. } => "Item",
         EntityKind::Respawn => "Respawn",
+        EntityKind::Link { .. } => "Link",
     }
 }
 
@@ -1503,8 +1509,10 @@ fn entity_properties(
     e: &mut LevelEntity,
     keys: &[(u32, String)],
     doors: &[(u32, String)],
+    here: Option<&std::path::Path>,
     link: &mut Option<Link>,
     place: &mut Option<For>,
+    go: &mut Option<PathBuf>,
     delete: &mut bool,
 ) {
     let me = e.id;
@@ -1542,6 +1550,46 @@ fn entity_properties(
         ui.end_row();
         match &mut e.kind {
             EntityKind::PlayerStart | EntityKind::Respawn => {}
+            EntityKind::Link { to, name, fade } => {
+                let dir = here.and_then(|h| h.parent());
+                ui.label("to level");
+                ui.horizontal(|ui| {
+                    let mut files: Vec<String> = dir
+                        .and_then(|d| std::fs::read_dir(d).ok())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|f| f.ok()?.file_name().into_string().ok())
+                        .filter(|f| f.ends_with(".ron"))
+                        .collect();
+                    files.sort();
+                    egui::ComboBox::from_id_salt("link to").selected_text(to.as_str()).show_ui(ui, |ui| {
+                        for f in files {
+                            ui.selectable_value(to, f.clone(), f);
+                        }
+                    });
+                    ui.add(egui::TextEdit::singleline(to).desired_width(110.0));
+                    let file = dir.map(|d| d.join(&*to)).filter(|f| f.is_file());
+                    if ui.add_enabled(file.is_some(), egui::Button::new("Open")).on_hover_text("Open the level this joins").clicked() {
+                        *go = file;
+                    }
+                });
+                ui.end_row();
+                ui.label("name");
+                ui.add(egui::TextEdit::singleline(name).hint_text("the same as the other level's link"));
+                ui.end_row();
+                ui.label("fade (tiles)");
+                ui.add(egui::DragValue::new(fade).speed(0.1).range(0.0..=30.0).max_decimals(1))
+                    .on_hover_text("Coming in from the waking world, how far past the link the dream takes to fade in");
+                ui.end_row();
+                ui.label("");
+                let met = here.map(|h| crate::view3d::link_status(h, to, name));
+                match met {
+                    Some(Ok(m)) => ui.label(m),
+                    Some(Err(m)) => ui.colored_label(WARNING, m),
+                    None => ui.colored_label(WARNING, "save this level first, beside the one it joins"),
+                };
+                ui.end_row();
+            }
             EntityKind::Creature { kind, size, seed } => {
                 ui.label("kind");
                 egui::ComboBox::from_id_salt("kind").selected_text(format!("{kind:?}")).show_ui(ui, |ui| {

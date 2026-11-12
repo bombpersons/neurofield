@@ -337,24 +337,185 @@ impl Gfx<'_> {
 /// the moving things (`spawn_thing`), and full-colour creatures for the flesh
 /// pass. Returns the entities, to despawn when the scene goes.
 pub fn spawn(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene) -> Vec<Entity> {
-    let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view, layers, .. } = gfx;
-    let (mut out, level) = spawn_psx(commands, meshes, images, materials, textures, scene, torch);
+    // People stand still unless something moves them (and draws them as they move).
+    let m = spawn_level(commands, gfx, scene, None, !scene.creatures_move);
+    let mut out = spawn_own(commands, gfx, scene, &m.level);
+    out.extend(m.parts);
+    out.extend(m.people);
+    out
+}
+
+/// A level's meshes that stay while it's loaded, whether it's the one being walked or one
+/// beside it (`Placed`): its walls, floors and ceilings (`level` the meshes of them), its
+/// doors and the like, and its people as they stand.
+pub struct LevelMeshes {
+    pub parts: Vec<Entity>,
+    pub people: Vec<Entity>,
+    pub level: Vec<Handle<Mesh>>,
+}
+
+/// A scene's level meshes, made ready away from the main thread (`prepare`), for
+/// `spawn_level` to spawn.
+pub struct Prepared(Vec<(u8, Mesh, LevelPart)>);
+
+/// Make `scene`'s level meshes, one per texture, each texture chosen at the strangeness
+/// where the triangle is, lit by the scene alone (the torch comes after).
+pub fn prepare(scene: &Scene) -> Prepared {
+    let mut groups: HashMap<u8, Vec<&Tri>> = HashMap::new();
+    for t in &scene.tris {
+        let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
+        let (id, _) = tex::strange_variant(t.tex, scene.morph(centre));
+        groups.entry(id).or_default().push(t);
+    }
+    let mut ids: Vec<_> = groups.keys().copied().collect();
+    ids.sort();
+    Prepared(ids.into_iter().map(|id| {
+        let (mesh, part) = make_part(&groups[&id], &Torch::default());
+        (id, mesh, part)
+    }).collect())
+}
+
+/// Spawn a level's meshes (`LevelMeshes`), from `prepared` if they were made ready (from
+/// this scene as it is), its people too if `people`.
+pub fn spawn_level(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, prepared: Option<Prepared>, people: bool) -> LevelMeshes {
+    let prepared = prepared.unwrap_or_else(|| prepare(scene));
+    let mut out = LevelMeshes { parts: Vec::new(), people: Vec::new(), level: Vec::new() };
+    {
+        let Gfx { meshes, images, materials, textures, .. } = gfx;
+        for (id, mesh, part) in prepared.0 {
+            let Some(m) = textures.material(id, scene.sky.is_some(), images, materials) else { continue };
+            let fogs = Fogs::of(materials, &m);
+            let mesh = meshes.add(mesh);
+            out.parts.push(commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(m), part, fogs)).id());
+            out.level.push(mesh);
+        }
+    }
+    for i in 0..scene.things.parts.len() {
+        out.parts.extend(spawn_thing(commands, gfx, scene, i));
+    }
+    if people {
+        let Gfx { meshes, images, materials, torch, .. } = gfx;
+        let tris = scene.people_tris(|_| true);
+        out.people = spawn_people(commands, meshes, images, materials, torch, scene, &tris, &mut PeopleLooks::default());
+    }
+    out
+}
+
+/// What only the level being walked has (`level` its level meshes): its sky, its creatures
+/// as PS1 models while nothing moves them, and the full-colour creatures of the flesh pass.
+pub fn spawn_own(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, level: &[Handle<Mesh>]) -> Vec<Entity> {
+    let Gfx { meshes, images, materials, flesh, occluders, torch, view, layers, .. } = gfx;
+    let mut out = Vec::new();
     if let Some(s) = &scene.sky {
         out.push(sky::spawn(commands, meshes, images, materials, s, scene.strange.seed));
     }
-    // People stand still unless something moves them (and draws them as they move).
-    if !scene.creatures_move {
-        let tris = scene.people_tris(|_| true);
-        out.extend(spawn_people(commands, meshes, images, materials, torch, scene, &tris, &mut PeopleLooks::default()));
+    // Creatures drawn through the PS1 pipeline use the scene's own skins. Moving ones are
+    // drawn as they stand instead (`Gfx::spawn_creatures`).
+    let mut skins: HashMap<u8, Vec<&Tri>> = HashMap::new();
+    let still = if scene.creatures_move { &[][..] } else { &scene.creature_tris[..] };
+    for t in still {
+        skins.entry(t.tex).or_default().push(t);
+    }
+    for (id, tris) in skins {
+        let Some(skin) = scene.skins.get(id.wrapping_sub(tex::SKIN_BASE) as usize) else { continue };
+        let m = materials.add(material(images.add(image(skin))));
+        out.push(spawn_part(commands, meshes, &tris, m, torch).0);
     }
     // Kept apart, the creatures are drawn whole: nothing of the level hides them.
-    let level = if layers.0 { Vec::new() } else { level };
+    let level = if layers.0 { Vec::new() } else { level.to_vec() };
     let occluder = occluders.add(flesh::OccluderMaterial::default());
     out.extend(flesh::spawn(commands, meshes, images, flesh, occluder, &level, scene, view));
-    for i in 0..scene.things.parts.len() {
-        out.extend(spawn_thing(commands, gfx, scene, i));
+    out
+}
+
+/// A mesh's material in the walked level's fog, and out of it for drawing a level beside it.
+#[derive(Component, Clone)]
+pub struct Fogs {
+    fogged: Handle<PsxMaterial>,
+    clear: Handle<PsxMaterial>,
+}
+
+impl Fogs {
+    fn of(materials: &mut Assets<PsxMaterial>, m: &Handle<PsxMaterial>) -> Fogs {
+        let clear = materials.get(m).map(|m| PsxMaterial { fog: false, ..m.clone() }).map(|c| materials.add(c));
+        Fogs { fogged: m.clone(), clear: clear.unwrap_or_else(|| m.clone()) }
+    }
+}
+
+/// One of a level's meshes drawn beside the level being walked, where it stands against it
+/// (its transform), as through a doorway into it: by its own light, with no torch, out of
+/// the walked level's fog, and only where `clip`'s planes (`PsxMaterial::clip`; those of the
+/// doorway it's seen through, `view_plane`s of `link::Doorway::portal`) let it be seen.
+/// Taking it away has the mesh drawn as the walked level's again.
+#[derive(Component, Clone, Default, PartialEq)]
+pub struct Placed {
+    pub clip: Vec<Vec4>,
+}
+
+/// A plane in world units (`link::Doorway::portal`'s) as the view's world has it.
+pub fn view_plane(n: [f32; 4]) -> Vec4 {
+    // A view point v is the world's (v.x, -v.y, -v.z) * TF.
+    Vec4::new(n[0], -n[1], -n[2], n[3] / TF)
+}
+
+/// Where a level placed by `p` (`world::link`) stands in the view's world.
+pub fn placed_transform(p: &crate::world::link::Placement) -> Transform {
+    let zero = p.point([0.0; 3]);
+    Transform { translation: to_view(zero), rotation: Quat::from_rotation_y(p.yaw()), ..default() }
+}
+
+/// A level beside the one being walked, drawn where it stands against it (`at`): its
+/// `LevelMeshes`, all `Placed`, and none of its creatures. Returns the entities.
+pub fn spawn_placed(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, at: Transform) -> Vec<Entity> {
+    let m = spawn_level(commands, gfx, scene, None, true);
+    let out: Vec<Entity> = m.parts.into_iter().chain(m.people).collect();
+    for &e in &out {
+        commands.entity(e).insert((at, Placed::default()));
     }
     out
+}
+
+/// Meshes newly `Placed` take their clear materials and lose the torch; those no longer
+/// placed take the walked level's fog and torch again. The clear materials follow `clip`.
+fn place_parts(
+    torch: Res<Torch>,
+    changed: Query<(), Changed<Placed>>,
+    mut gone: RemovedComponents<Placed>,
+    mut parts: Query<(&Fogs, &mut MeshMaterial3d<PsxMaterial>, Option<(&mut LevelPart, &Mesh3d)>, Option<Ref<Placed>>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<PsxMaterial>>,
+) {
+    let gone: Vec<Entity> = gone.read().collect();
+    if changed.is_empty() && gone.is_empty() {
+        return;
+    }
+    let none = Torch::default();
+    let mut relight = |part: Option<(Mut<LevelPart>, &Mesh3d)>, t: &Torch| {
+        let Some((mut part, mesh)) = part else { return };
+        if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
+            if let Some(VertexAttributeValues::Float32x4(colours)) = mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR) {
+                part.relight(t, colours);
+            }
+        }
+    };
+    for e in gone {
+        if let Ok((fogs, mut m, part, None)) = parts.get_mut(e) {
+            m.0 = fogs.fogged.clone();
+            relight(part, &torch);
+        }
+    }
+    for (fogs, mut m, part, placed) in &mut parts {
+        let Some(placed) = placed.filter(|p| p.is_changed()) else { continue };
+        if materials.get(&fogs.clear).is_some_and(|c| c.clip != placed.clip) {
+            if let Some(mut c) = materials.get_mut(&fogs.clear) {
+                c.clip = placed.clip.clone();
+            }
+        }
+        if m.0 != fogs.clear {
+            m.0 = fogs.clear.clone();
+            relight(part, &none);
+        }
+    }
 }
 
 /// People's materials (`Gfx::spawn_people`): each texture's, and each face's image with the
@@ -362,6 +523,7 @@ pub fn spawn(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene) -> Vec<Entit
 #[derive(Default)]
 pub struct PeopleLooks {
     materials: HashMap<u8, Handle<PsxMaterial>>,
+    fogs: HashMap<u8, Fogs>,
     faces: HashMap<u8, (Handle<Image>, u32)>,
 }
 
@@ -414,7 +576,10 @@ fn spawn_people(
                 m
             }
         };
-        out.push(spawn_part(commands, meshes, &tris, m, torch).0);
+        let fogs = looks.fogs.entry(id).or_insert_with(|| Fogs::of(materials, &m)).clone();
+        let e = spawn_part(commands, meshes, &tris, m, torch).0;
+        commands.entity(e).insert(fogs);
+        out.push(e);
     }
     out
 }
@@ -436,8 +601,9 @@ pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usi
     let mut out = Vec::new();
     for (id, tris) in groups {
         let Some(m) = textures.material(id, scene.sky.is_some(), images, materials) else { continue };
+        let fogs = Fogs::of(materials, &m);
         let (e, mesh) = spawn_part(commands, meshes, &tris, m, torch);
-        commands.entity(e).insert(ThingPart(i));
+        commands.entity(e).insert((ThingPart(i), fogs));
         out.push(e);
         if layers.0 {
             continue;
@@ -449,46 +615,6 @@ pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usi
     out
 }
 
-/// The PS1 pipeline's meshes, and the level's own (for the flesh pass's depth).
-fn spawn_psx(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    images: &mut Assets<Image>,
-    materials: &mut Assets<PsxMaterial>,
-    textures: &mut LevelTextures,
-    scene: &Scene,
-    torch: &Torch,
-) -> (Vec<Entity>, Vec<Handle<Mesh>>) {
-    let mut groups: HashMap<u8, Vec<&Tri>> = HashMap::new();
-    for t in &scene.tris {
-        let centre = [0, 1, 2].map(|c| t.v.iter().map(|v| v.p[c] as f32).sum::<f32>() / 3.0);
-        let (id, _) = tex::strange_variant(t.tex, scene.morph(centre));
-        groups.entry(id).or_default().push(t);
-    }
-    let (mut out, mut level) = (Vec::new(), Vec::new());
-    let mut ids: Vec<_> = groups.keys().copied().collect();
-    ids.sort();
-    for id in ids {
-        let Some(m) = textures.material(id, scene.sky.is_some(), images, materials) else { continue };
-        let (e, mesh) = spawn_part(commands, meshes, &groups[&id], m, torch);
-        out.push(e);
-        level.push(mesh);
-    }
-    // Creatures drawn through the PS1 pipeline use the scene's own skins. Moving ones are
-    // drawn as they stand instead (`Gfx::spawn_creatures`).
-    let mut skins: HashMap<u8, Vec<&Tri>> = HashMap::new();
-    let still = if scene.creatures_move { &[][..] } else { &scene.creature_tris[..] };
-    for t in still {
-        skins.entry(t.tex).or_default().push(t);
-    }
-    for (id, tris) in skins {
-        let Some(skin) = scene.skins.get(id.wrapping_sub(tex::SKIN_BASE) as usize) else { continue };
-        let m = materials.add(material(images.add(image(skin))));
-        out.push(spawn_part(commands, meshes, &tris, m, torch).0);
-    }
-    (out, level)
-}
-
 fn spawn_part(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -496,6 +622,13 @@ fn spawn_part(
     m: Handle<PsxMaterial>,
     torch: &Torch,
 ) -> (Entity, Handle<Mesh>) {
+    let (mesh, part) = make_part(tris, torch);
+    let mesh = meshes.add(mesh);
+    (commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(m), part)).id(), mesh)
+}
+
+/// A mesh of `tris`, lit by `torch`, and what relights it.
+fn make_part(tris: &[&Tri], torch: &Torch) -> (Mesh, LevelPart) {
     let (mut pos, mut uv, mut verts) = (Vec::new(), Vec::new(), Vec::new());
     for t in tris {
         let p = t.v.map(|v| v.p.map(|c| c as f32));
@@ -527,8 +660,7 @@ fn spawn_part(
     let colours = part.colours(torch);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
     mesh.insert_indices(Indices::U32((0..n as u32).collect()));
-    let mesh = meshes.add(mesh);
-    (commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(m), part)).id(), mesh)
+    (mesh, part)
 }
 
 type Corner = (PartVert, [f32; 2]);
@@ -611,16 +743,9 @@ fn srgb_to_linear(c: f32) -> f32 {
 
 /// Relights the parts when the torch moves or changes: only those it reached or reaches,
 /// so the rest aren't sent to the GPU again.
-pub fn apply_torch(torch: Res<Torch>, mut parts: Query<(&mut LevelPart, &Mesh3d)>, mut meshes: ResMut<Assets<Mesh>>) {
+pub fn apply_torch(torch: Res<Torch>, mut parts: Query<(&mut LevelPart, &Mesh3d), Without<Placed>>, mut meshes: ResMut<Assets<Mesh>>) {
     for (mut part, mesh) in &mut parts {
         if !torch.is_changed() && !part.is_added() {
-            continue;
-        }
-        if part.is_added() {
-            let colours = part.colours(&torch);
-            if let Some(mut m) = meshes.get_mut(&mesh.0) {
-                m.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
-            }
             continue;
         }
         // Only a part the torch reached or reaches is touched: getting it to change sends it
@@ -651,7 +776,7 @@ impl Plugin for LevelGfxPlugin {
             .init_resource::<View>()
             .init_resource::<LevelTextures>()
             .add_systems(Startup, spawn_camera)
-            .add_systems(PostUpdate, (apply_view, apply_torch, sky::follow).chain().before(bevy::camera::CameraUpdateSystems));
+            .add_systems(PostUpdate, (apply_view, place_parts, apply_torch, sky::follow).chain().before(bevy::camera::CameraUpdateSystems));
         flesh::plugin(app);
     }
 }

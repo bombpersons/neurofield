@@ -153,6 +153,7 @@ fn main() {
         brushing: false,
         tinted: false,
     })
+    .init_resource::<view3d::Beside>()
     .insert_resource(dream::DreamView::new(dream_path))
     .add_systems(Startup, setup)
     .add_systems(Update, egui_on_display)
@@ -163,6 +164,7 @@ fn main() {
             auto_screenshot,
             close_requested,
             view3d::rebuild,
+            view3d::place_beside,
             view3d::camera_control,
             view3d::apply_camera,
             view3d::screen_mode,

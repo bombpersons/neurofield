@@ -18,12 +18,15 @@ import bevy_pbr::render::{
 import bevy_pbr::render::mesh_view_bindings::fog;
 
 const MAX_LIGHTS: u32 = 8u;
+const MAX_CLIPS: u32 = 6u;
 
 struct PsxUniform {
     color: vec4<f32>,
     ambient: vec4<f32>,
     depth_cue: vec4<f32>,
     far_color: vec4<f32>,
+    clip: array<vec4<f32>, MAX_CLIPS>,
+    clip_count: u32,
     light_dirs: array<vec4<f32>, MAX_LIGHTS>,
     light_colors: array<vec4<f32>, MAX_LIGHTS>,
     light_count: u32,
@@ -39,6 +42,7 @@ const FLAG_CUTOUT: u32 = 32u;
 const FLAG_STP_TEXEL: u32 = 64u;
 const FLAG_OPAQUE_ONLY: u32 = 128u;
 const FLAG_DEPTH_CUE: u32 = 512u;
+const FLAG_CLIP: u32 = 1024u;
 const BLEND_SHIFT: u32 = 12u;
 const BLEND_HALF: u32 = 1u;
 const BLEND_ADD: u32 = 2u;
@@ -161,6 +165,13 @@ fn vertex(vertex_in: Vertex) -> PsxVarying {
 
 @fragment
 fn fragment(in: PsxVarying) -> @location(0) vec4<f32> {
+    if has(FLAG_CLIP) {
+        for (var i = 0u; i < min(material.clip_count, MAX_CLIPS); i++) {
+            if dot(material.clip[i].xyz, in.world) + material.clip[i].w < 0.0 {
+                discard;
+            }
+        }
+    }
     let uv = in.uv_w / in.w;
     var rgb = in.color_w / in.w;
     // Untextured surfaces count as all-STP: a semi-transparent one blends whole.

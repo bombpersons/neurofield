@@ -171,6 +171,7 @@ default but stored as floats), a yaw, and properties that depend on its kind:
 |---|---|
 | `PlayerStart` | (exactly one) |
 | `Respawn` | (one at most) Where the player comes round after dying, in a town; without one, the player start |
+| `Link` | Where this level meets another: `to` (a level file beside this one), `name` (the other level's link back must have the same one), `fade` (tiles; going down from the waking world, how far the dream takes to come in). Sits on a cell edge, as a door does, facing out of this level: the edge is a hole, and the other level is drawn through it, its own link on the same edge facing back. The cell past the edge is open for walking across, and nothing there is drawn. The editor draws the joined level where it meets this one, and says whether its link answers |
 | `Door` | Sits on a cell face between two open cells. Width in tiles, height in layers, `hinge` (left, right, or slides up), `open` (starting state), `locked`, `key` (an entity id) |
 | `Key` | `name` (shown in the UI) |
 | `Chest` | `contents` (item names, one a thing: a name twice is two of it), `locked`, `key` |

@@ -82,6 +82,8 @@ pub struct Walker {
     torch_radius: i32,
     body: Body,
     pub kick: Kick,
+    /// How much of the torch shows, 0..1 (it comes up going down from the waking world).
+    pub torch_dim: f32,
 }
 
 fn centre(c: Node) -> (f32, f32) {
@@ -163,6 +165,7 @@ impl Walker {
             torch_radius: (rng.fr(2.0, 4.0) * TF) as i32,
             body: Body::default(),
             kick: Kick::default(),
+            torch_dim: 1.0,
         })
     }
 
@@ -187,6 +190,7 @@ impl Walker {
             torch_radius: (3.0 * TF) as i32,
             body: Body::default(),
             kick: Kick::default(),
+            torch_dim: 1.0,
         })
     }
 
@@ -270,9 +274,27 @@ impl Walker {
             h: H,
             fog_near: self.fog_near,
             fog_far: self.fog_far,
-            torch: self.torch,
+            torch: self.torch.map(|c| c * self.torch_dim),
             torch_radius: self.torch_radius,
         }
+    }
+
+    /// The walker carried into the level placed by `p` (this one's points are `p.point` of
+    /// them there) as it walks, trading its fog and torch for `there`'s (that level's own
+    /// walker's, which keeps these for coming back).
+    pub fn carry(&mut self, p: &crate::world::link::Placement, there: &mut Walker) {
+        [self.x, self.y, self.z] = p.point([self.x, self.y, self.z]);
+        let turn = p.turn as f32 * 1024.0;
+        self.yaw += turn;
+        self.look_yaw += turn;
+        if let Some(y) = &mut self.body.last_yaw {
+            *y += turn;
+        }
+        self.path.clear();
+        std::mem::swap(&mut self.fog_near, &mut there.fog_near);
+        std::mem::swap(&mut self.fog_far, &mut there.fog_far);
+        std::mem::swap(&mut self.torch, &mut there.torch);
+        std::mem::swap(&mut self.torch_radius, &mut there.torch_radius);
     }
 
     /// A camera like this walker's, looking at somewhere on creature `c` from any

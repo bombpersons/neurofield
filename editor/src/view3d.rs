@@ -390,5 +390,102 @@ pub fn entity_colour(k: &EntityKind) -> Color {
         EntityKind::Lever { .. } => Color::srgb(0.4, 0.8, 1.0),
         EntityKind::Item { .. } => Color::srgb(0.85, 0.4, 1.0),
         EntityKind::Respawn => Color::srgb(0.3, 0.8, 1.0),
+        EntityKind::Link { .. } => Color::srgb(1.0, 1.0, 1.0),
     }
+}
+
+/// What a level file beside this one holds, read again when it changes on disk.
+struct Read {
+    modified: Option<std::time::SystemTime>,
+    level: Option<engine::world::level::Level>,
+}
+
+/// Read `file` once for each time it changes, keeping what was read in `cache`.
+fn read_level<'a>(cache: &'a mut std::collections::HashMap<std::path::PathBuf, Read>, file: &std::path::Path) -> Option<&'a engine::world::level::Level> {
+    let modified = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+    let fresh = cache.get(file).is_some_and(|r| r.modified == modified);
+    if !fresh {
+        let level = engine::world::level::Level::load(file).ok();
+        cache.insert(file.to_path_buf(), Read { modified, level });
+    }
+    cache.get(file)?.level.as_ref()
+}
+
+static READ: std::sync::Mutex<Option<std::collections::HashMap<std::path::PathBuf, Read>>> = std::sync::Mutex::new(None);
+
+/// The link in the level file `to` (beside `here`) that answers one named `name` in `here`:
+/// named the same and joining `here`.
+fn answering(cache: &mut std::collections::HashMap<std::path::PathBuf, Read>, here: &std::path::Path, to: &str, name: &str) -> Result<engine::world::link::LinkAt, String> {
+    let file = here.parent().unwrap_or(std::path::Path::new(".")).join(to);
+    if to.is_empty() {
+        return Err("choose the level it joins".into());
+    }
+    let Some(level) = read_level(cache, &file) else {
+        return Err(format!("{to} isn't there or doesn't read"));
+    };
+    let me = here.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+    let links = level.links();
+    let back: Vec<_> = links.iter().filter(|l| std::path::Path::new(&l.to).file_name().and_then(|f| f.to_str()) == Some(me)).collect();
+    if let Some(l) = back.iter().find(|l| l.name == name) {
+        return Ok((*l).clone());
+    }
+    Err(match back.len() {
+        0 => format!("{to} has no link back to {me}"),
+        _ => format!("{to} links back to {me}, but not as {name:?}"),
+    })
+}
+
+/// Whether link `name` of the level at `here` to `to` is met there, as the entity panel says.
+pub fn link_status(here: &std::path::Path, to: &str, name: &str) -> Result<String, String> {
+    let mut read = READ.lock().unwrap();
+    answering(read.get_or_insert_with(Default::default), here, to, name).map(|l| format!("meets {to}'s link #{}", l.id))
+}
+
+/// The levels beside this one, drawn where they meet it through its links.
+#[derive(Resource, Default)]
+pub struct Beside {
+    version: u64,
+    /// Each level placed, and the meshes it's drawn with.
+    placed: Vec<(std::path::PathBuf, engine::world::link::Placement)>,
+    parts: Vec<Entity>,
+    scenes: std::collections::HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, Scene)>,
+}
+
+/// Draw the level each link joins where it meets this one, so the two can be built to fit:
+/// again when this level changes, or one of those does on disk (looked at every few seconds).
+pub fn place_beside(mut commands: Commands, doc: Res<crate::Document>, mut beside: ResMut<Beside>, time: Res<Time>, mut since: Local<f32>, mut gfx: engine::render::Gfx) {
+    *since += time.delta_secs();
+    if beside.version == doc.0.version && *since < 3.0 {
+        return;
+    }
+    *since = 0.0;
+    beside.version = doc.0.version;
+    let Some(here) = doc.0.path.clone() else { return };
+    let mut read = READ.lock().unwrap();
+    let read = read.get_or_insert_with(Default::default);
+    let mut placed = Vec::new();
+    let mut fresh = false;
+    for l in doc.0.level.links() {
+        let Ok(there) = answering(read, &here, &l.to, &l.name) else { continue };
+        let file = here.parent().unwrap_or(std::path::Path::new(".")).join(&l.to);
+        let Some(level) = read_level(read, &file) else { continue };
+        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        if beside.scenes.get(&file).is_none_or(|s| s.0 != modified) {
+            beside.scenes.insert(file.clone(), (modified, level.to_scene()));
+            fresh = true;
+        }
+        placed.push((file, engine::world::link::Placement::between(&l, &there)));
+    }
+    if placed == beside.placed && !fresh {
+        return;
+    }
+    let b = &mut *beside;
+    for e in b.parts.drain(..) {
+        commands.entity(e).despawn();
+    }
+    for (file, p) in &placed {
+        let scene = &b.scenes[file].1;
+        b.parts.extend(engine::render::spawn_placed(&mut commands, &mut gfx, scene, engine::render::placed_transform(p)));
+    }
+    b.placed = placed;
 }

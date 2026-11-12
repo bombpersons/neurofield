@@ -358,6 +358,8 @@ pub struct Scene {
     /// Boxes (world units, lo and hi corners) of the safe places in it, where the player
     /// puts their weapons away; the waking world is safe everywhere.
     pub friendly_areas: Vec<([f32; 3], [f32; 3])>,
+    /// Hand-built levels: where they meet others (`link`).
+    pub doorways: Vec<crate::world::link::Doorway>,
 }
 
 /// Position and orientation of one view. Angles use the GTE's 4096 = 360°.
@@ -689,6 +691,7 @@ impl Scene {
             sky: None,
             people: Vec::new(),
             friendly_areas: Vec::new(),
+            doorways: Vec::new(),
         };
         scene.build_level();
         if !scene.outdoor {
@@ -1011,6 +1014,7 @@ impl Scene {
             sky: None,
             people: Vec::new(),
             friendly_areas: Vec::new(),
+            doorways: Vec::new(),
         }
     }
 
