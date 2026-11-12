@@ -18,7 +18,7 @@ pub mod sky;
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::system::SystemParam;
 use bevy::image::ImageSampler;
-use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use crate::world::scene::{Camera as PsxCamera, Scene, Tri, T};
@@ -124,8 +124,10 @@ fn apply_view(
         return;
     }
     let Some(cam) = view.cam else { return };
+    // Hidden (only the network's picture showing), the level isn't relit as the torch moves;
+    // it is when it shows again.
     let t = Torch::of(&cam);
-    if *torch != t {
+    if *torch != t && !view.hidden {
         *torch = t;
     }
     for (mut camera, mut transform, mut projection, mut fog) in &mut cams {
@@ -152,7 +154,12 @@ pub struct Torch {
 }
 
 impl Torch {
+    /// The camera's torch. An unlit one (by day) is the same wherever it is, so walking
+    /// about doesn't relight the level for nothing.
     pub fn of(cam: &PsxCamera) -> Torch {
+        if cam.torch == [0.0; 3] || cam.torch_radius <= 0 {
+            return Torch::default();
+        }
         Torch { pos: cam.pos.map(|c| c as f32), colour: cam.torch, radius: cam.torch_radius as f32 }
     }
 
@@ -173,6 +180,8 @@ impl Torch {
 #[derive(Component)]
 pub struct LevelPart {
     verts: Vec<PartVert>,
+    /// The vertices the torch lit last, which go back to their own colours when it moves on.
+    lit: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -511,11 +520,12 @@ fn spawn_part(
         });
     }
     let n = verts.len();
-    let part = LevelPart { verts };
+    let mut part = LevelPart { verts, lit: Vec::new() };
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, part.colours(torch));
+    let colours = part.colours(torch);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
     mesh.insert_indices(Indices::U32((0..n as u32).collect()));
     let mesh = meshes.add(mesh);
     (commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(m), part)).id(), mesh)
@@ -550,15 +560,44 @@ fn split(c: [Corner; 3], out: &mut impl FnMut([Corner; 3])) {
 impl LevelPart {
     /// Vertex colours with the torch added. The material reads them as linear
     /// and encodes them, so pass the linear value whose encoding is col / 128.
-    fn colours(&self, torch: &Torch) -> Vec<[f32; 4]> {
-        self.verts
-            .iter()
-            .map(|v| {
-                let t = torch.light(v.p, v.n, v.alb);
-                let c = [0, 1, 2].map(|k| srgb_to_linear(((v.col[k] + t[k]) / 128.0).min(255.0 / 128.0)));
-                [c[0], c[1], c[2], 1.0]
-            })
-            .collect()
+    fn colours(&mut self, torch: &Torch) -> Vec<[f32; 4]> {
+        self.lit = self.in_reach(torch).collect();
+        self.verts.iter().map(|v| Self::colour(v, torch)).collect()
+    }
+
+    fn colour(v: &PartVert, torch: &Torch) -> [f32; 4] {
+        let t = torch.light(v.p, v.n, v.alb);
+        let c = [0, 1, 2].map(|k| srgb_to_linear(((v.col[k] + t[k]) / 128.0).min(255.0 / 128.0)));
+        [c[0], c[1], c[2], 1.0]
+    }
+
+    /// The vertices `torch` can reach.
+    fn in_reach(&self, torch: &Torch) -> impl Iterator<Item = u32> + '_ {
+        let torch = *torch;
+        let lit = torch.colour != [0.0; 3];
+        let r2 = torch.radius * torch.radius;
+        self.verts.iter().enumerate().filter_map(move |(i, v)| {
+            let d = [0, 1, 2].map(|c| v.p[c] - torch.pos[c]);
+            (lit && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < r2).then_some(i as u32)
+        })
+    }
+
+    /// Relight `colours` (as `colours` made them for the torch before) for `torch`: only the
+    /// vertices it lit before or reaches now change. False when none do.
+    fn relight(&mut self, torch: &Torch, colours: &mut [[f32; 4]]) -> bool {
+        let now: Vec<u32> = self.in_reach(torch).collect();
+        if now.is_empty() && self.lit.is_empty() {
+            return false;
+        }
+        let none = Torch::default();
+        for &i in &self.lit {
+            colours[i as usize] = Self::colour(&self.verts[i as usize], &none);
+        }
+        for &i in &now {
+            colours[i as usize] = Self::colour(&self.verts[i as usize], torch);
+        }
+        self.lit = now;
+        true
     }
 }
 
@@ -570,14 +609,34 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Relights every part when the torch moves or changes.
-pub fn apply_torch(torch: Res<Torch>, parts: Query<(Ref<LevelPart>, &Mesh3d)>, mut meshes: ResMut<Assets<Mesh>>) {
-    for (part, mesh) in &parts {
+/// Relights the parts when the torch moves or changes: only those it reached or reaches,
+/// so the rest aren't sent to the GPU again.
+pub fn apply_torch(torch: Res<Torch>, mut parts: Query<(&mut LevelPart, &Mesh3d)>, mut meshes: ResMut<Assets<Mesh>>) {
+    for (mut part, mesh) in &mut parts {
         if !torch.is_changed() && !part.is_added() {
             continue;
         }
-        if let Some(mut m) = meshes.get_mut(&mesh.0) {
-            m.insert_attribute(Mesh::ATTRIBUTE_COLOR, part.colours(&torch));
+        if part.is_added() {
+            let colours = part.colours(&torch);
+            if let Some(mut m) = meshes.get_mut(&mesh.0) {
+                m.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+            }
+            continue;
+        }
+        // Only a part the torch reached or reaches is touched: getting it to change sends it
+        // to the GPU again.
+        if part.lit.is_empty() && part.in_reach(&torch).next().is_none() {
+            continue;
+        }
+        let Some(mut m) = meshes.get_mut(&mesh.0) else { continue };
+        match m.attribute_mut(Mesh::ATTRIBUTE_COLOR) {
+            Some(VertexAttributeValues::Float32x4(colours)) if colours.len() == part.verts.len() => {
+                part.relight(&torch, colours);
+            }
+            _ => {
+                let colours = part.colours(&torch);
+                m.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+            }
         }
     }
 }
