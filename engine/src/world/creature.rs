@@ -337,7 +337,7 @@ impl Creature {
         pts
     }
 
-    fn rescale(&mut self, k: f32) {
+    pub(crate) fn rescale(&mut self, k: f32) {
         for p in &mut self.parts {
             p.half = scale(p.half, k);
             if p.parent.is_none() {

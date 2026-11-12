@@ -3,6 +3,10 @@
 //! nose, mouth) and redrawn as the face moves: the eyes blink and look about, the brows
 //! rise, the mouth opens and shapes itself as they talk.
 //!
+//! The style is soft and cartoonish, against the dungeons: big glossy eyes set low with
+//! heavy upper lashes, little or no nose, a small mouth, often a blush. The face is flat,
+//! shaded only toward its edges.
+//!
 //! Texture coordinates: u across the face toward the head's local +x, v down it. The eyes'
 //! middles sit on row `EYE_ROW`, the mouth's on `MOUTH_ROW`.
 
@@ -10,11 +14,12 @@ use crate::world::rng::Rng;
 use crate::world::tex::{Texture, SIZE};
 use serde::{Deserialize, Serialize};
 
-pub const EYE_ROW: f32 = 31.0;
-pub const BROW_ROW: f32 = 25.0;
-pub const NOSE_ROW: f32 = 41.0;
-pub const MOUTH_ROW: f32 = 48.5;
+pub const EYE_ROW: f32 = 36.0;
+pub const MOUTH_ROW: f32 = 50.5;
+const NOSE_ROW: f32 = 44.0;
 const MID: f32 = SIZE as f32 / 2.0;
+/// Half the distance between the eyes' middles.
+const EYES_APART: f32 = 13.5;
 
 /// Palette slots.
 const OUTLINE: u8 = 0;
@@ -23,14 +28,14 @@ const SHADOW: u8 = 2;
 const SKIN: u8 = 3;
 const LIGHT: u8 = 4;
 const WHITE: u8 = 5;
-const IRIS: u8 = 6;
-const IRIS_DARK: u8 = 7;
-const PUPIL: u8 = 8;
-const BROW: u8 = 9;
-const LIP: u8 = 10;
-const LIP_DARK: u8 = 11;
+const IRIS_DARK: u8 = 6;
+const IRIS: u8 = 7;
+const IRIS_LIGHT: u8 = 8;
+const PUPIL: u8 = 9;
+const BROW: u8 = 10;
+const MOUTH_LINE: u8 = 11;
 const MOUTH: u8 = 12;
-const TEETH: u8 = 13;
+const TONGUE: u8 = 13;
 const CHEEK: u8 = 14;
 const SHINE: u8 = 15;
 
@@ -40,7 +45,7 @@ pub const SKIN_SHADE: f32 = 0.9;
 
 /// The kinds of each feature.
 pub const EYES: u8 = 6;
-pub const BROWS: u8 = 6;
+pub const BROWS: u8 = 4;
 pub const NOSES: u8 = 5;
 pub const MOUTHS: u8 = 5;
 
@@ -54,6 +59,7 @@ pub struct Features {
     pub iris: [f32; 3],
     /// The brows' colour, usually the hair's.
     pub brow: [f32; 3],
+    /// The mouth's colour (the tongue, and the line of a closed mouth is a darker shade).
     pub lips: [f32; 3],
     #[serde(default)]
     pub blush: bool,
@@ -61,17 +67,26 @@ pub struct Features {
 
 impl Features {
     pub fn random(rng: &mut Rng, hair: [f32; 3]) -> Features {
-        let iris = rng.pick(&[[0.35, 0.22, 0.12], [0.2, 0.35, 0.6], [0.3, 0.45, 0.25], [0.45, 0.35, 0.2], [0.15, 0.12, 0.1], [0.4, 0.45, 0.5]]);
-        let lips = rng.pick(&[[0.72, 0.42, 0.4], [0.62, 0.35, 0.33], [0.78, 0.5, 0.48], [0.55, 0.3, 0.3]]);
+        let iris = rng.pick(&[
+            [0.25, 0.45, 0.9],
+            [0.2, 0.7, 0.55],
+            [0.6, 0.35, 0.85],
+            [0.85, 0.55, 0.2],
+            [0.9, 0.4, 0.55],
+            [0.45, 0.28, 0.15],
+            [0.8, 0.2, 0.25],
+            [0.35, 0.6, 0.85],
+        ]);
+        let lips = rng.pick(&[[0.9, 0.45, 0.5], [0.85, 0.4, 0.45], [0.95, 0.55, 0.55]]);
         Features {
             eyes: rng.range(0, EYES as i32) as u8,
             brows: rng.range(0, BROWS as i32) as u8,
             nose: rng.range(0, NOSES as i32) as u8,
             mouth: rng.range(0, MOUTHS as i32) as u8,
             iris,
-            brow: hair.map(|c| c * 0.8),
+            brow: hair.map(|c| c * 0.7),
             lips,
-            blush: rng.chance(0.3),
+            blush: rng.chance(0.6),
         }
     }
 }
@@ -107,21 +122,28 @@ struct EyeKind {
     slant: f32,
     /// The upper lid's resting droop, as a share of the eye's height.
     lid: f32,
-    iris: f32,
-    lashes: bool,
+    /// The iris's half width and half height.
+    iris: [f32; 2],
+    /// Just a dark oval with a glint, no white.
+    dot: bool,
+    /// A second, larger glint.
+    sparkle: bool,
 }
 
 const EYE_KINDS: [EyeKind; EYES as usize] = [
-    EyeKind { w: 5.0, h: 3.0, slant: 0.0, lid: 0.1, iris: 2.3, lashes: false },
-    EyeKind { w: 5.5, h: 2.6, slant: 1.0, lid: 0.15, iris: 2.1, lashes: true },
-    EyeKind { w: 4.5, h: 3.2, slant: -0.5, lid: 0.05, iris: 2.4, lashes: false },
-    EyeKind { w: 6.0, h: 2.8, slant: 0.4, lid: 0.25, iris: 2.1, lashes: false },
-    EyeKind { w: 5.0, h: 3.4, slant: 0.2, lid: 0.0, iris: 2.6, lashes: true },
-    EyeKind { w: 5.5, h: 2.8, slant: -1.0, lid: 0.25, iris: 2.2, lashes: false },
+    // Big and round.
+    EyeKind { w: 7.2, h: 8.4, slant: 0.0, lid: 0.0, iris: [4.8, 6.6], dot: false, sparkle: false },
+    // Tall and sparkling.
+    EyeKind { w: 6.6, h: 9.6, slant: 0.5, lid: 0.0, iris: [4.8, 7.8], dot: false, sparkle: true },
+    // Sleepy.
+    EyeKind { w: 7.8, h: 7.2, slant: -0.5, lid: 0.4, iris: [4.8, 6.0], dot: false, sparkle: false },
+    // Sharp, cat-like.
+    EyeKind { w: 7.8, h: 6.0, slant: 2.0, lid: 0.1, iris: [3.6, 5.4], dot: false, sparkle: false },
+    // Little dots.
+    EyeKind { w: 2.6, h: 3.6, slant: 0.0, lid: 0.0, iris: [2.6, 3.6], dot: true, sparkle: false },
+    // Wide and gentle.
+    EyeKind { w: 8.4, h: 7.2, slant: -1.0, lid: 0.15, iris: [5.4, 6.0], dot: false, sparkle: true },
 ];
-
-/// Half the distance between the eyes' middles.
-const EYES_APART: f32 = 11.5;
 
 struct BrowKind {
     thick: f32,
@@ -133,84 +155,68 @@ struct BrowKind {
 }
 
 const BROW_KINDS: [BrowKind; BROWS as usize] = [
-    BrowKind { thick: 1.6, arch: 1.0, tilt: 0.0, len: 1.15 },
-    BrowKind { thick: 2.4, arch: 0.4, tilt: 0.6, len: 1.2 },
-    BrowKind { thick: 1.2, arch: 2.0, tilt: -0.4, len: 1.0 },
-    BrowKind { thick: 2.0, arch: 0.0, tilt: 1.2, len: 1.1 },
-    BrowKind { thick: 1.4, arch: 1.4, tilt: 0.3, len: 1.3 },
-    BrowKind { thick: 2.8, arch: 0.8, tilt: -0.2, len: 1.25 },
+    BrowKind { thick: 1.0, arch: 1.2, tilt: 0.0, len: 0.8 },
+    BrowKind { thick: 1.5, arch: 0.5, tilt: 0.8, len: 0.9 },
+    BrowKind { thick: 1.0, arch: 0.8, tilt: -1.0, len: 0.75 },
+    BrowKind { thick: 2.0, arch: 0.3, tilt: 0.0, len: 0.6 },
 ];
 
-struct NoseKind {
-    /// Rows from the eyes' line down to the tip.
-    len: f32,
-    /// Half the nostrils' spread.
-    width: f32,
-    /// The bridge drawn as a shadow down one side.
-    bridge: bool,
-    /// A rounded tip, lit.
-    bulb: bool,
+#[derive(Clone, Copy)]
+enum MouthKind {
+    /// A small curve up at the ends.
+    Smile(f32),
+    /// ":3".
+    Cat,
+    /// A short dash.
+    Dash(f32),
+    /// Up at one end.
+    Smirk,
 }
 
-const NOSE_KINDS: [NoseKind; NOSES as usize] = [
-    NoseKind { len: 10.0, width: 2.5, bridge: true, bulb: false },
-    NoseKind { len: 8.0, width: 3.0, bridge: false, bulb: true },
-    NoseKind { len: 12.0, width: 2.0, bridge: true, bulb: true },
-    NoseKind { len: 9.0, width: 3.5, bridge: false, bulb: false },
-    NoseKind { len: 11.0, width: 3.0, bridge: true, bulb: false },
-];
-
-struct MouthKind {
-    /// Half width.
-    w: f32,
-    /// The lower lip's thickness in rows.
-    lip: f32,
-    /// How far the corners sit above the middle at rest.
-    curve: f32,
-}
-
-const MOUTH_KINDS: [MouthKind; MOUTHS as usize] = [
-    MouthKind { w: 6.0, lip: 1.5, curve: 0.0 },
-    MouthKind { w: 7.5, lip: 2.0, curve: 0.5 },
-    MouthKind { w: 5.0, lip: 1.0, curve: -0.6 },
-    MouthKind { w: 6.5, lip: 2.5, curve: 0.2 },
-    MouthKind { w: 8.0, lip: 1.2, curve: -0.2 },
-];
+const MOUTH_KINDS: [MouthKind; MOUTHS as usize] = [MouthKind::Smile(3.0), MouthKind::Cat, MouthKind::Dash(2.5), MouthKind::Smirk, MouthKind::Smile(4.5)];
 
 /// The face's texture as it looks in `state`. `skin` is the skin's colour (as the body's tint).
 pub fn compose(f: &Features, skin: [f32; 3], state: &State) -> Texture {
     let mut c = Canvas { idx: vec![SKIN; SIZE * SIZE] };
     c.shade();
     let eye = &EYE_KINDS[f.eyes as usize % EYE_KINDS.len()];
+    if f.blush {
+        for side in [-1.0, 1.0] {
+            let (x, y) = (MID + side * (EYES_APART + 1.5), EYE_ROW + eye.h + 3.0);
+            c.disc(x, y, 4.0, 1.8, |v| (v == SKIN || v == LIGHT).then_some(CHEEK));
+            // A few strokes across it.
+            for k in -1..=1 {
+                let sx = (x + 2.0 * k as f32).floor() as i32;
+                c.set(sx, y.floor() as i32, LIGHT);
+                c.set(sx + 1, y.floor() as i32 - 1, LIGHT);
+            }
+        }
+    }
     for side in [-1.0, 1.0] {
         c.eye(eye, side, state);
         c.brow(&BROW_KINDS[f.brows as usize % BROW_KINDS.len()], eye, side, state.brow);
     }
-    c.nose(&NOSE_KINDS[f.nose as usize % NOSE_KINDS.len()]);
-    c.mouth(&MOUTH_KINDS[f.mouth as usize % MOUTH_KINDS.len()], state.mouth);
-    if f.blush {
-        for side in [-1.0, 1.0] {
-            c.disc(MID + side * 13.0, NOSE_ROW + 2.0, 2.6, 1.0, |was| if was == SKIN || was == LIGHT { Some(CHEEK) } else { None });
-        }
-    }
+    c.nose(f.nose % NOSES);
+    c.mouth(MOUTH_KINDS[f.mouth as usize % MOUTH_KINDS.len()], state.mouth);
     let k = |a: [f32; 3], s: f32| a.map(|x| ((x * s).clamp(0.0, 1.0) * 255.0).round() as u8);
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t);
     let mut pal = [[0u8; 3]; 16];
-    pal[OUTLINE as usize] = k(skin, 0.28);
-    pal[SHADOW_DEEP as usize] = k(skin, 0.6 * SKIN_SHADE);
-    pal[SHADOW as usize] = k(skin, 0.8 * SKIN_SHADE);
+    pal[OUTLINE as usize] = k(mix(skin, [0.15, 0.08, 0.1], 0.8), 0.6);
+    pal[SHADOW_DEEP as usize] = k(skin, 0.7 * SKIN_SHADE);
+    pal[SHADOW as usize] = k(skin, 0.86 * SKIN_SHADE);
     pal[SKIN as usize] = k(skin, SKIN_SHADE);
-    pal[LIGHT as usize] = k(skin, 1.08 * SKIN_SHADE);
-    pal[WHITE as usize] = [232, 228, 218];
-    pal[IRIS as usize] = k(f.iris, 1.0);
-    pal[IRIS_DARK as usize] = k(f.iris, 0.6);
-    pal[PUPIL as usize] = [16, 12, 12];
+    pal[LIGHT as usize] = k(skin, 1.05 * SKIN_SHADE);
+    pal[WHITE as usize] = [246, 246, 250];
+    pal[IRIS_DARK as usize] = k(f.iris, 0.45);
+    pal[IRIS as usize] = k(f.iris, 0.85);
+    pal[IRIS_LIGHT as usize] = k(mix(f.iris, [1.0; 3], 0.35), 1.0);
+    pal[PUPIL as usize] = k(f.iris, 0.18);
     pal[BROW as usize] = k(f.brow, 1.0);
-    pal[LIP as usize] = k([0, 1, 2].map(|i| 0.5 * (f.lips[i] + skin[i])), 1.0);
-    pal[LIP_DARK as usize] = k(f.lips, 0.6);
-    pal[MOUTH as usize] = [70, 22, 24];
-    pal[TEETH as usize] = [220, 214, 196];
-    pal[CHEEK as usize] = k([0, 1, 2].map(|i| skin[i] * SKIN_SHADE * [1.08, 0.85, 0.85][i]), 1.0);
-    pal[SHINE as usize] = [250, 250, 250];
+    pal[MOUTH_LINE as usize] = k(mix(f.lips, [0.3, 0.1, 0.12], 0.5), 0.8);
+    pal[MOUTH as usize] = [110, 30, 45];
+    pal[TONGUE as usize] = k(f.lips, 1.0);
+    pal[CHEEK as usize] = k(mix(skin, [1.0, 0.45, 0.5], 0.35), SKIN_SHADE);
+    pal[SHINE as usize] = [255, 255, 255];
     Texture { idx: c.idx, pal }
 }
 
@@ -229,8 +235,8 @@ impl Canvas {
         }
     }
 
-    /// Paint texels of an ellipse (radii `rx`, `ry` about the texel centre (cx, cy)) as
-    /// `paint` says, given what each was.
+    /// Paint texels of an ellipse (radii `rx`, `ry` about the point (cx, cy)) as `paint`
+    /// says, given what each was.
     fn disc(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, paint: impl Fn(u8) -> Option<u8>) {
         for y in (cy - ry).floor() as i32..=(cy + ry).ceil() as i32 {
             for x in (cx - rx).floor() as i32..=(cx + rx).ceil() as i32 {
@@ -244,14 +250,14 @@ impl Canvas {
         }
     }
 
-    /// The face rounding away toward its sides and under the brows and nose.
+    /// Flat, rounding away only at the very sides and under the chin.
     fn shade(&mut self) {
         for y in 0..SIZE as i32 {
             for x in 0..SIZE as i32 {
                 let side = ((x as f32 + 0.5 - MID) / MID).abs();
-                let v = if side > 0.9 {
+                let v = if side > 0.93 {
                     SHADOW_DEEP
-                } else if side > 0.72 {
+                } else if side > 0.82 {
                     SHADOW
                 } else {
                     SKIN
@@ -259,160 +265,190 @@ impl Canvas {
                 self.set(x, y, v);
             }
         }
-        // The forehead and cheekbones catch the light.
-        self.disc(MID, 16.0, 8.0, 3.0, |v| (v == SKIN).then_some(LIGHT));
-        for side in [-1.0, 1.0] {
-            self.disc(MID + side * 12.0, EYE_ROW + 6.0, 4.0, 1.6, |v| (v == SKIN).then_some(LIGHT));
-            // Sockets, under the brow.
-            self.disc(MID + side * EYES_APART, EYE_ROW - 2.5, 6.5, 2.6, |v| (v == SKIN || v == LIGHT).then_some(SHADOW));
-        }
-        // Under the chin.
         for x in 0..SIZE as i32 {
-            for y in 58..SIZE as i32 {
+            for y in 60..SIZE as i32 {
                 self.set(x, y, SHADOW);
             }
         }
     }
 
     fn eye(&mut self, k: &EyeKind, side: f32, s: &State) {
-        let cx = MID + side * EYES_APART;
-        let cy = EYE_ROW;
-        // The upper lid's edge: from the top of the eye down to its bottom as it shuts.
+        let (cx, cy) = (MID + side * EYES_APART, EYE_ROW);
         let shut = (k.lid + (1.0 - k.lid) * s.blink.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Shut, the lid's edge stays a line across the eye's lower part.
-        let lid = (-k.h + 2.0 * k.h * shut).min(0.5 * k.h - 0.5);
+        if shut >= 0.95 {
+            // Shut: a lash line bowed downward, flicking up at the outer corner.
+            let n = (k.w * 4.0) as i32;
+            for i in 0..=n {
+                let t = i as f32 / n as f32 * 2.0 - 1.0;
+                let x = cx + t * k.w;
+                let y = cy + 0.15 * k.h + 0.3 * k.h * (1.0 - t * t);
+                self.set(x.floor() as i32, y.floor() as i32, OUTLINE);
+                if k.w > 3.0 {
+                    self.set(x.floor() as i32, y.floor() as i32 - 1, OUTLINE);
+                }
+            }
+            let tip = cx + side * k.w;
+            self.set(tip.floor() as i32 + side as i32, (cy + 0.1 * k.h).floor() as i32, OUTLINE);
+            return;
+        }
+        // The upper lid's edge, from the top of the eye down as it closes.
+        let lid = -k.h + 2.0 * k.h * shut;
+        let lash = if k.dot { 0.0 } else { 1.6 };
         let (gx, gy) = (s.gaze[0].clamp(-1.0, 1.0), s.gaze[1].clamp(-1.0, 1.0));
-        let iris = [cx + gx * (k.w - k.iris), cy - gy * (k.h - 0.6 * k.iris).max(0.5)];
-        for y in (cy - k.h - 1.0).floor() as i32..=(cy + k.h + 1.0).ceil() as i32 {
-            for x in (cx - k.w - 1.0).floor() as i32..=(cx + k.w + 1.0).ceil() as i32 {
+        let iris = [cx + gx * (k.w - k.iris[0]).max(1.2), cy + 0.6 - gy * (k.h - k.iris[1]).max(1.0)];
+        for y in (cy - k.h - 2.0).floor() as i32..=(cy + k.h + 1.0).ceil() as i32 {
+            for x in (cx - k.w - 2.0).floor() as i32..=(cx + k.w + 2.0).ceil() as i32 {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 let dx = (px - cx) / k.w;
-                // The outer corner (away from the nose) rises by `slant`.
+                // The outer corner rises by `slant`.
                 let dy = py - cy + 0.5 * k.slant * dx * side;
-                let inside = dx * dx + (dy / k.h).powi(2) <= 1.0;
-                if !inside {
+                if dx * dx + (dy / k.h).powi(2) > 1.0 {
                     continue;
                 }
-                let edge = dx * dx + (dy / k.h).powi(2) > 0.55;
                 if dy < lid {
-                    // Lid over the eye.
-                    self.set(x, y, if dy < -k.h + 1.0 { SHADOW } else { SKIN });
-                } else if dy < lid + 1.0 {
+                    continue;
+                }
+                if dy < lid + lash {
                     self.set(x, y, OUTLINE);
-                } else if shut >= 0.95 {
-                    self.set(x, y, SKIN);
-                } else {
-                    let (ix, iy) = (px - iris[0], py - iris[1]);
-                    let r = (ix * ix + iy * iy).sqrt();
-                    let v = if r < 0.75 {
+                    continue;
+                }
+                let (ix, iy) = ((px - iris[0]) / k.iris[0], (py - iris[1]) / k.iris[1]);
+                let r = ix * ix + iy * iy;
+                let v = if k.dot {
+                    PUPIL
+                } else if r <= 1.0 {
+                    if ix * ix * 6.0 + iy * iy * 4.5 < 1.0 {
                         PUPIL
-                    } else if r < k.iris - 0.7 {
-                        IRIS
-                    } else if r < k.iris {
+                    } else if r > 0.72 || iy < -0.4 {
                         IRIS_DARK
-                    } else if edge && dy > 0.0 {
-                        LIGHT
+                    } else if iy > 0.35 {
+                        IRIS_LIGHT
                     } else {
-                        WHITE
-                    };
-                    self.set(x, y, v);
+                        IRIS
+                    }
+                } else if dy < lid + lash + 1.0 {
+                    // The lid's shadow on the white.
+                    LIGHT
+                } else {
+                    WHITE
+                };
+                self.set(x, y, v);
+            }
+        }
+        // Glints: a big one up and to the side, a small one low.
+        let glint = |c: &mut Canvas, x: f32, y: f32, big: bool| {
+            let (x, y) = (x.floor() as i32, y.floor() as i32);
+            let on = |c: &Canvas, x: i32, y: i32| c.get(x, y).is_some_and(|v| matches!(v, IRIS_DARK | IRIS | IRIS_LIGHT | PUPIL));
+            for (ox, oy) in if big { &[(0, 0), (1, 0), (0, 1), (1, 1)][..] } else { &[(0, 0)][..] } {
+                if on(c, x + ox, y + oy) {
+                    c.set(x + ox, y + oy, SHINE);
                 }
             }
+        };
+        let big = k.iris[0] > 3.0;
+        glint(self, iris[0] - 0.45 * k.iris[0], iris[1] - 0.5 * k.iris[1], big);
+        glint(self, iris[0] + 0.45 * k.iris[0], iris[1] + 0.4 * k.iris[1], false);
+        if k.sparkle {
+            glint(self, iris[0] + 0.2 * k.iris[0], iris[1] - 0.6 * k.iris[1], false);
         }
-        if shut < 0.95 {
-            // A glint.
-            let g = [(iris[0] - 0.8).floor() as i32, (iris[1] - 0.8).floor() as i32];
-            if self.get(g[0], g[1]).is_some_and(|v| v == IRIS || v == IRIS_DARK || v == PUPIL) {
-                self.set(g[0], g[1], SHINE);
-            }
-        }
-        if k.lashes {
-            // A flick out past the outer corner.
-            let (x, y) = ((cx + side * (k.w + 0.5)).floor() as i32, (cy + lid - k.slant * 0.5).floor() as i32);
-            self.set(x, y, OUTLINE);
-            self.set(x + side as i32, y - 1, OUTLINE);
+        if !k.dot {
+            // The lash flicks out past the outer corner, and a touch of lower lash.
+            let ty = cy + lid + 0.5 - k.slant * 0.5;
+            let tx = cx + side * (k.w + 0.3);
+            self.set(tx.floor() as i32, ty.floor() as i32, OUTLINE);
+            self.set((tx + side).floor() as i32, ty.floor() as i32 - 1, OUTLINE);
+            self.set((cx + side * (k.w - 1.0)).floor() as i32, (cy + 0.85 * k.h).floor() as i32, SHADOW_DEEP);
         }
     }
 
     fn brow(&mut self, k: &BrowKind, eye: &EyeKind, side: f32, raised: f32) {
-        let half = k.len * eye.w;
+        let half = k.len * eye.w.max(4.5);
         let cx = MID + side * EYES_APART;
-        let base = BROW_ROW - 2.0 * raised.clamp(0.0, 1.0) - (eye.h - 3.0);
+        let base = EYE_ROW - eye.h.max(4.0) - 4.0 - 2.0 * raised.clamp(0.0, 1.0);
         let n = (half * 4.0) as i32;
         for i in 0..=n {
             // From the inner end (t = -1) to the outer (t = 1).
             let t = i as f32 / n as f32 * 2.0 - 1.0;
             let x = cx + side * t * half;
-            let y = base - k.arch * (1.0 - t * t) + k.tilt * (1.0 - t) * 0.5 - eye.slant * 0.4 * (t + 1.0);
-            let thick = k.thick * (1.0 - 0.35 * t.max(0.0));
+            let y = base - k.arch * (1.0 - t * t) + k.tilt * (1.0 - t) * 0.5;
+            let thick = k.thick * (1.0 - 0.4 * t.max(0.0));
             for r in 0..thick.ceil() as i32 {
                 self.set(x.floor() as i32, (y + r as f32).floor() as i32, BROW);
             }
         }
     }
 
-    fn nose(&mut self, k: &NoseKind) {
-        let tip = EYE_ROW + k.len;
-        if k.bridge {
-            for y in (EYE_ROW + 2.0) as i32..tip as i32 - 1 {
-                self.set(MID as i32 + 2, y, SHADOW);
+    fn nose(&mut self, kind: u8) {
+        let (x, y) = (MID as i32, NOSE_ROW as i32);
+        match kind {
+            // None at all.
+            0 => {}
+            // A dot.
+            1 => self.set(x, y, SHADOW),
+            // A little shadow under one side.
+            2 => {
+                self.set(x, y, SHADOW);
+                self.set(x + 1, y, SHADOW);
+                self.set(x + 1, y - 1, SHADOW);
             }
-        }
-        // The shadow under the tip, and the nostrils.
-        for x in (MID - k.width) as i32..=(MID + k.width) as i32 {
-            self.set(x, tip as i32 + 1, SHADOW);
-        }
-        for side in [-1.0, 1.0] {
-            self.set((MID + side * k.width - 0.5).floor() as i32, tip as i32, SHADOW_DEEP);
-            self.set((MID + side * (k.width + 1.0) - 0.5).floor() as i32, tip as i32 - 1, SHADOW);
-        }
-        if k.bulb {
-            self.disc(MID, tip - 1.5, 1.6, 1.4, |v| (v == SKIN || v == SHADOW).then_some(LIGHT));
-        } else {
-            self.set(MID as i32, tip as i32 - 1, LIGHT);
+            // A small hooked line.
+            3 => {
+                for dy in -3..=0 {
+                    self.set(x + 1, y + dy, SHADOW);
+                }
+                self.set(x, y, SHADOW);
+            }
+            // A pink tip.
+            _ => self.disc(MID, NOSE_ROW - 0.5, 1.4, 1.0, |v| (v == SKIN).then_some(CHEEK)),
         }
     }
 
-    fn mouth(&mut self, k: &MouthKind, m: Mouth) {
+    fn mouth(&mut self, kind: MouthKind, m: Mouth) {
         let cy = MOUTH_ROW;
-        let (w, open, curve) = match m {
-            Mouth::Closed => (k.w, 0.0, k.curve),
-            Mouth::Ajar => (k.w * 0.9, 1.0, k.curve * 0.5),
-            Mouth::Open => (k.w * 0.85, 3.0, 0.0),
-            Mouth::Oo => (k.w * 0.45, 2.2, 0.0),
-            Mouth::Smile => (k.w * 1.1, 0.0, k.curve + 1.8),
+        // A line through texels.
+        let line = |c: &mut Canvas, from: f32, to: f32, y: &dyn Fn(f32) -> f32| {
+            let n = ((to - from) * 3.0).max(1.0) as i32;
+            for i in 0..=n {
+                let x = from + (to - from) * i as f32 / n as f32;
+                c.set(x.floor() as i32, y(x).floor() as i32, MOUTH_LINE);
+            }
         };
-        // The line between the lips, the corners `curve` above the middle.
-        let line = |x: f32| cy - curve * ((x - MID) / w).powi(2);
-        // Upper lip.
-        for x in (MID - w + 1.0) as i32..(MID + w - 1.0) as i32 {
-            let y = line(x as f32 + 0.5) - open / 2.0;
-            self.set(x, (y - 1.0).floor() as i32, LIP);
-        }
-        // Lower lip.
-        for x in (MID - w * 0.8) as i32..(MID + w * 0.8) as i32 {
-            let y = line(x as f32 + 0.5) + open / 2.0;
-            for r in 1..=k.lip.round() as i32 {
-                self.set(x, (y + r as f32).floor() as i32, LIP);
+        match m {
+            Mouth::Closed => match kind {
+                MouthKind::Smile(w) => line(self, MID - w, MID + w, &|x| cy - 1.2 * ((x - MID) / w).powi(2)),
+                MouthKind::Cat => {
+                    // Two little bumps: a "w" on its side, ":3".
+                    line(self, MID - 3.5, MID + 3.5, &|x| cy - 0.5 + 1.2 * ((x - MID).abs() / 1.75 * std::f32::consts::PI).sin().abs());
+                }
+                MouthKind::Dash(w) => line(self, MID - w, MID + w, &|_| cy),
+                MouthKind::Smirk => line(self, MID - 3.0, MID + 3.5, &|x| cy - 1.5 * ((x - MID + 3.0) / 6.5).powi(2)),
+            },
+            Mouth::Smile => line(self, MID - 4.5, MID + 4.5, &|x| cy - 2.0 * ((x - MID) / 4.5).powi(2)),
+            Mouth::Ajar | Mouth::Open | Mouth::Oo => {
+                // An open "D", the tongue in its lower half; "o" is small and round.
+                let (w, h) = match m {
+                    Mouth::Ajar => (3.2, 1.8),
+                    Mouth::Open => (4.2, 4.0),
+                    _ => (2.0, 2.4),
+                };
+                let top = if m == Mouth::Oo { cy - h } else { cy - 0.8 };
+                for y in (top.floor()) as i32..=(cy + h).ceil() as i32 {
+                    for x in (MID - w - 1.0) as i32..=(MID + w + 1.0) as i32 {
+                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                        let dx = (px - MID) / w;
+                        let inside = if m == Mouth::Oo {
+                            dx * dx + ((py - cy) / h).powi(2) <= 1.0
+                        } else {
+                            py >= top && dx * dx + ((py - top) / (cy + h - top)).powi(2) <= 1.0
+                        };
+                        if inside {
+                            let low = py > cy + 0.4 * h;
+                            self.set(x, y, if low && m != Mouth::Oo { TONGUE } else { MOUTH });
+                        }
+                    }
+                }
             }
-            self.set(x, (y + k.lip + 1.0).floor() as i32, SHADOW);
         }
-        if open < 0.5 {
-            for x in (MID - w) as i32..(MID + w) as i32 {
-                self.set(x, line(x as f32 + 0.5).floor() as i32, LIP_DARK);
-            }
-            return;
-        }
-        // Open: the inside dark, the top teeth showing when it's wide.
-        let ry = open / 2.0 + 0.5;
-        self.disc(MID, cy, w, ry, |_| Some(MOUTH));
-        if open >= 2.5 && m != Mouth::Oo {
-            for x in (MID - w * 0.6) as i32..(MID + w * 0.6) as i32 {
-                self.set(x, (cy - ry + 0.5).floor() as i32, TEETH);
-            }
-        }
-        self.disc(MID, cy, w + 0.6, ry + 0.6, |v| (v != MOUTH && v != TEETH && v != LIP).then_some(LIP_DARK));
-        self.disc(MID, cy, w, ry, |v| (v == LIP_DARK).then_some(MOUTH));
     }
 }
 
@@ -424,13 +460,17 @@ mod tests {
         t.idx.iter().filter(|&&i| i == slot).count()
     }
 
+    fn eye_texels(t: &Texture) -> usize {
+        [WHITE, IRIS_DARK, IRIS, IRIS_LIGHT, PUPIL].iter().map(|&s| count(t, s)).sum()
+    }
+
     /// Mean column of the iris and pupil texels of the eye on `side`.
     fn iris_x(t: &Texture, side: f32) -> f32 {
         let (mut sum, mut n) = (0.0f32, 0.0f32);
         for y in 0..SIZE {
             for x in 0..SIZE {
                 let i = t.idx[y * SIZE + x];
-                if (i == IRIS || i == IRIS_DARK || i == PUPIL) && (x as f32 - MID) * side > 0.0 {
+                if matches!(i, IRIS_DARK | IRIS | IRIS_LIGHT | PUPIL) && (x as f32 - MID) * side > 0.0 {
                     sum += x as f32;
                     n += 1.0;
                 }
@@ -442,36 +482,40 @@ mod tests {
     #[test]
     fn eyes_look_where_they_are_told_and_shut_when_they_blink() {
         let mut rng = Rng::new(3);
-        for _ in 0..30 {
+        for _ in 0..40 {
             let f = Features::random(&mut rng, [0.3, 0.2, 0.1]);
-            let skin = [0.85, 0.66, 0.52];
+            let skin = [0.95, 0.8, 0.7];
             let ahead = compose(&f, skin, &State::default());
-            assert!(count(&ahead, IRIS) + count(&ahead, IRIS_DARK) > 10, "{f:?}");
-            for side in [-1.0, 1.0] {
-                let l = iris_x(&compose(&f, skin, &State { gaze: [-1.0, 0.0], ..Default::default() }), side);
-                let r = iris_x(&compose(&f, skin, &State { gaze: [1.0, 0.0], ..Default::default() }), side);
-                assert!(r > l + 2.0, "{f:?}: iris at {l} looking -x, {r} looking +x");
+            assert!(count(&ahead, PUPIL) + count(&ahead, IRIS) > 10, "{f:?}");
+            if !EYE_KINDS[f.eyes as usize].dot {
+                for side in [-1.0, 1.0] {
+                    let l = iris_x(&compose(&f, skin, &State { gaze: [-1.0, 0.0], ..Default::default() }), side);
+                    let r = iris_x(&compose(&f, skin, &State { gaze: [1.0, 0.0], ..Default::default() }), side);
+                    assert!(r > l + 1.5, "{f:?}: iris at {l} looking -x, {r} looking +x");
+                }
             }
             let shut = compose(&f, skin, &State { blink: 1.0, ..Default::default() });
-            assert_eq!(count(&shut, IRIS) + count(&shut, IRIS_DARK) + count(&shut, PUPIL) + count(&shut, WHITE), 0, "{f:?}");
+            assert_eq!(eye_texels(&shut), 0, "{f:?}");
+            assert!(count(&shut, OUTLINE) > 6, "{f:?}: a shut eye still shows its lashes");
         }
     }
 
     #[test]
     fn the_mouth_opens_and_every_kind_differs() {
-        let skin = [0.6, 0.45, 0.35];
+        let skin = [0.8, 0.6, 0.5];
         for mouth in 0..MOUTHS {
-            let f = Features { eyes: 0, brows: 0, nose: 0, mouth, iris: [0.3; 3], brow: [0.2; 3], lips: [0.7, 0.4, 0.4], blush: false };
+            let f = Features { eyes: 0, brows: 0, nose: 0, mouth, iris: [0.3; 3], brow: [0.2; 3], lips: [0.9, 0.45, 0.5], blush: false };
             let shut = compose(&f, skin, &State::default());
             let open = compose(&f, skin, &State { mouth: Mouth::Open, ..Default::default() });
             assert_eq!(count(&shut, MOUTH), 0);
-            assert!(count(&open, MOUTH) > 8 && count(&open, TEETH) > 0, "kind {mouth}");
+            assert!(count(&shut, MOUTH_LINE) >= 4, "kind {mouth} at rest");
+            assert!(count(&open, MOUTH) > 4 && count(&open, TONGUE) > 0, "kind {mouth}");
         }
         let face = |eyes, brows, nose, mouth| {
-            let f = Features { eyes, brows, nose, mouth, iris: [0.3; 3], brow: [0.2; 3], lips: [0.7, 0.4, 0.4], blush: false };
+            let f = Features { eyes, brows, nose, mouth, iris: [0.3; 3], brow: [0.2; 3], lips: [0.9, 0.45, 0.5], blush: false };
             compose(&f, skin, &State::default()).idx
         };
-        for k in 1..5 {
+        for k in 1..4 {
             assert_ne!(face(k, 0, 0, 0), face(0, 0, 0, 0), "eyes {k}");
             assert_ne!(face(0, k, 0, 0), face(0, 0, 0, 0), "brows {k}");
             assert_ne!(face(0, 0, k, 0), face(0, 0, 0, 0), "nose {k}");

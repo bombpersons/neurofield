@@ -42,8 +42,8 @@ const SYLLABLE: (f32, f32) = (0.08, 0.17);
 /// rather than diamonds.
 const BODY_SIDES: (usize, usize) = (8, 6);
 /// The head's sides and rows, finer than the low-poly body's for the face.
-const HEAD_AROUND: usize = 10;
-const HEAD_ALONG: usize = 7;
+const HEAD_AROUND: usize = 12;
+const HEAD_ALONG: usize = 9;
 /// Head triangles this far forward (as a share of its depth) wear the face.
 const FACE_FROM: f32 = 0.2;
 
@@ -54,6 +54,9 @@ pub struct Look {
     pub height: f32,
     /// 0 slight .. 1 heavy.
     pub build: f32,
+    /// 0 anime proportions .. 1 a chibi's (a big head on a small body).
+    #[serde(default)]
+    pub chibi: f32,
     /// The skin's colour.
     pub skin: [f32; 3],
     pub face: Features,
@@ -64,15 +67,15 @@ impl Look {
     pub fn random(seed: u64) -> Look {
         let mut rng = Rng::new(seed ^ 0x09E0_F1E5);
         let skin = rng.pick(&[
-            [0.96, 0.8, 0.68],
-            [0.9, 0.72, 0.58],
-            [0.8, 0.6, 0.46],
-            [0.66, 0.47, 0.34],
-            [0.5, 0.34, 0.24],
-            [0.36, 0.24, 0.17],
+            [1.0, 0.88, 0.8],
+            [0.97, 0.8, 0.7],
+            [0.9, 0.7, 0.57],
+            [0.76, 0.55, 0.42],
+            [0.58, 0.4, 0.3],
+            [0.44, 0.3, 0.22],
         ]);
         let hair = Hair::random(&mut rng);
-        Look { height: rng.fr(0.62, 0.74), build: rng.f(), skin, face: Features::random(&mut rng, hair.colour), hair }
+        Look { height: rng.fr(0.62, 0.74), build: rng.f(), chibi: 0.0, skin, face: Features::random(&mut rng, hair.colour), hair }
     }
 }
 
@@ -158,7 +161,7 @@ impl Person {
         let placed = self.body.pose();
         let at = &placed[self.bones.head];
         let half = self.body.parts[self.bones.head].half;
-        at.world([0.0, 0.03 * half[1], 0.9 * half[2]])
+        at.world([0.0, (1.0 - 2.0 * face::EYE_ROW / SIZE as f32) * half[1], 0.9 * half[2]])
     }
 
     /// The face as time passes: blinking, the mouth moving while they talk, the head and
@@ -235,28 +238,46 @@ pub fn body(look: &Look, base: [f32; 3], yaw: f32) -> (Creature, Bones) {
         c.parts.push(p);
         c.parts.len() - 1
     };
-    let pelvis = add(Part::new(Shape::Ellipsoid, [0.085 * h * w, 0.055 * h, 0.06 * h * w], 0).root([0.0, -0.52 * h, 0.0]).pivot([0.0; 3]));
+    // Each size with anime proportions (k = 0: about six heads tall, slender, long in the
+    // leg, the head a little large) and for a chibi (k = 1: about two and a half heads tall,
+    // a big round head, short limbs, mitten hands and round feet).
+    let k = look.chibi.clamp(0.0, 1.0);
+    let m = |a: f32, b: f32| (a + (b - a) * k) * h;
+    let pelvis = add(Part::new(Shape::Ellipsoid, [m(0.072, 0.075) * w, m(0.05, 0.05), m(0.052, 0.06) * w], 0).root([0.0, -m(0.53, 0.33), 0.0]).pivot([0.0; 3]));
     let (mut thighs, mut shins, mut feet) = ([0; 2], [0; 2], [0; 2]);
-    for (k, (around, side)) in [(0.0, 1.0), (0.5, -1.0)].into_iter().enumerate() {
-        thighs[k] = add(Part::new(Shape::Capsule, [0.045 * h * w, 0.115 * h, 0.045 * h * w], 0).on(pelvis, 0.3, around, 0.5).rot(rot_z(-side * 0.03)).taper(0.8));
-        shins[k] = add(Part::new(Shape::Capsule, [0.036 * h * w, 0.12 * h, 0.036 * h * w], 0).on(thighs[k], 1.0, 0.0, 0.0).rot(rot_x(-0.04)).taper(0.7));
-        feet[k] = add(Part::new(Shape::Ellipsoid, [0.028 * h, 0.02 * h, 0.055 * h], 0).on(shins[k], 1.0, 0.0, 0.0).rot(rot_x(0.04)).pivot([0.0, -0.5, -0.5]));
+    for (i, (around, side)) in [(0.0, 1.0), (0.5, -1.0)].into_iter().enumerate() {
+        thighs[i] = add(Part::new(Shape::Capsule, [m(0.036, 0.036) * w, m(0.125, 0.07), m(0.036, 0.036) * w], 0).on(pelvis, 0.3, around, 0.5).rot(rot_z(-side * 0.03)).taper(0.8));
+        shins[i] = add(Part::new(Shape::Capsule, [m(0.027, 0.031) * w, m(0.13, 0.075), m(0.027, 0.031) * w], 0).on(thighs[i], 1.0, 0.0, 0.0).rot(rot_x(-0.04)).taper(0.75));
+        feet[i] = add(Part::new(Shape::Ellipsoid, [m(0.022, 0.036), m(0.016, 0.026), m(0.048, 0.058)], 0).on(shins[i], 1.0, 0.0, 0.0).rot(rot_x(0.04)).pivot([0.0, -0.5, -0.5]));
     }
-    // From inside the hips, narrow at the waist and broad at the shoulders.
-    let torso = add(Part::new(Shape::Capsule, [0.08 * h * w, 0.16 * h, 0.058 * h * w], 0).on(pelvis, -0.2, 0.0, 0.0).rot(rot_z(PI)).taper(1.35).bulge(0.08 * look.build));
-    let neck = add(Part::new(Shape::Capsule, [0.028 * h, 0.03 * h, 0.028 * h], 0).on(torso, 0.86, 0.0, 0.0));
-    let head = add(Part::new(Shape::Ellipsoid, [0.06 * h, 0.077 * h, 0.068 * h], 0).on(neck, 0.8, 0.0, 0.0).pivot([0.0, -0.6, -0.1]));
+    // From inside the hips, narrow at the waist and broad at the shoulders (a chibi's is
+    // more of a bean).
+    let torso = Part::new(Shape::Capsule, [m(0.064, 0.075) * w, m(0.14, 0.1), m(0.047, 0.06) * w], 0)
+        .on(pelvis, -0.2, 0.0, 0.0)
+        .rot(rot_z(PI))
+        .taper(1.3 - 0.25 * k)
+        .bulge(0.06 * look.build + 0.12 * k);
+    let torso = add(torso);
+    let neck = add(Part::new(Shape::Capsule, [m(0.019, 0.024), m(0.035, 0.02), m(0.019, 0.024)], 0).on(torso, 0.88 + 0.04 * k, 0.0, 0.0));
+    let head = add(Part::new(Shape::Ellipsoid, [m(0.07, 0.15), m(0.083, 0.15), m(0.075, 0.14)], 0).on(neck, 0.8, 0.0, 0.0).pivot([0.0, -0.75 - 0.1 * k, -0.08 + 0.03 * k]));
     let mut ears = [0; 2];
-    for (k, around) in [0.0, 0.5].into_iter().enumerate() {
-        ears[k] = add(Part::new(Shape::Ellipsoid, [0.008 * h, 0.019 * h, 0.013 * h], 0).on(head, 0.0, around, 0.92).pivot([0.0; 3]));
+    for (i, around) in [0.0, 0.5].into_iter().enumerate() {
+        ears[i] = add(Part::new(Shape::Ellipsoid, [m(0.008, 0.012), m(0.017, 0.024), m(0.011, 0.016)], 0).on(head, -0.1 * k, around, 0.95).pivot([0.0; 3]));
     }
     let (mut upper, mut fore, mut hands) = ([0; 2], [0; 2], [0; 2]);
-    for (k, (around, side)) in [(0.0, 1.0), (0.5, -1.0)].into_iter().enumerate() {
+    for (i, (around, side)) in [(0.0, 1.0), (0.5, -1.0)].into_iter().enumerate() {
         // The shoulder's joint stands out past the torso's side, so the arm hangs clear of it.
-        upper[k] = add(Part::new(Shape::Capsule, [0.03 * h * w, 0.085 * h, 0.03 * h * w], 0).on(torso, 0.76, around, 1.3).rot(rot_z(PI + side * 0.12)).taper(0.85));
-        fore[k] = add(Part::new(Shape::Capsule, [0.027 * h * w, 0.08 * h, 0.027 * h * w], 0).on(upper[k], 1.0, 0.0, 0.0).rot(rot_x(0.12)).taper(0.8));
-        hands[k] = add(Part::new(Shape::Ellipsoid, [0.022 * h, 0.034 * h, 0.012 * h], 0).on(fore[k], 1.0, 0.0, 0.0).pivot([0.0, -0.8, 0.0]));
+        let arm = Part::new(Shape::Capsule, [m(0.022, 0.026) * w, m(0.09, 0.055), m(0.022, 0.026) * w], 0)
+            .on(torso, 0.74 - 0.08 * k, around, 1.3 - 0.1 * k)
+            .rot(rot_z(PI + side * (0.1 + 0.1 * k)))
+            .taper(0.85);
+        upper[i] = add(arm);
+        fore[i] = add(Part::new(Shape::Capsule, [m(0.019, 0.024) * w, m(0.085, 0.05), m(0.019, 0.024) * w], 0).on(upper[i], 1.0, 0.0, 0.0).rot(rot_x(0.12)).taper(0.85));
+        hands[i] = add(Part::new(Shape::Ellipsoid, [m(0.017, 0.03), m(0.03, 0.03), m(0.01, 0.026)], 0).on(fore[i], 1.0, 0.0, 0.0).pivot([0.0, -0.8, 0.0]));
     }
+    // To the height asked for, standing on the floor.
+    let (_, top, bottom) = c.extent();
+    c.rescale(h / (bottom - top).max(1.0));
     let floor = base[1];
     c.fit(floor, floor - 4.0 * TF, 4.0 * TF, true);
     let bones = Bones { pelvis, torso, neck, head, ears, upper_arms: upper, forearms: fore, hands, thighs, shins, feet };
