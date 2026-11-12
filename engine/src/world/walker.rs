@@ -393,6 +393,11 @@ impl Walker {
         self.body.sprinting = true;
     }
 
+    /// Drop back to a walk.
+    pub fn stop_sprint(&mut self) {
+        self.body.sprinting = false;
+    }
+
     pub fn step(&mut self, scene: &Scene, rng: &mut Rng) {
         // Gaze: usually level, sometimes a glance up or down.
         if rng.chance(0.012) {

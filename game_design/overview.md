@@ -67,11 +67,22 @@ doesn't touch it: the colourful, psychedelic look is a separate thing.
 - **The swell** moves the level's walls, floors and ceilings in long, slow
   waves, and bends the creatures with them. It grows as affliction rises.
 - **Tentacles.** From 85% affliction, tentacles grow out of the walls and
-  ceilings the player is looking at, up to eight at full affliction. One within
-  reach turns on the player for 0.7 seconds and then lunges at where they
-  were, so the player can step away. A hit costs 4 HP and adds a little
-  affliction. They wither when the player leaves them behind, when affliction
-  falls, or when a clear seeing potion takes hold.
+  ceilings the player is looking at, up to eight at full affliction. They
+  wither when the player leaves them behind, when affliction falls, or when a
+  clear seeing potion takes hold.
+  - **Whipping.** One within reach attacks with a whip: it turns on the player
+    and rears back, curling, for 0.7 seconds, then cracks through at where they
+    were, its tip last. The wind-up gives the player time to step away or raise
+    a shield. A lash that lands costs 4 HP and some stamina, and adds a little
+    affliction.
+  - **Blocking.** A raised shield facing the tentacle blocks the lash, as it
+    does a creature's blow: it costs stamina, kicks the camera, and can break
+    the guard. A blocked tentacle is thrown off and waits longer before its
+    next lash.
+  - **Fighting back.** Weapons hit tentacles as they hit creatures. A tentacle
+    that is struck flinches out of its lash, and a couple of good blows kill
+    it: it goes limp, flops down onto the ground, lies there a moment and then
+    withers away.
 
 ### Seeing clearly
 

@@ -1,6 +1,9 @@
 //! Tentacles that grow out of the walls and ceilings round a badly afflicted player, and
-//! lash at them. They are one creature for the dream net, with a fixed number of parts: a
-//! tentacle that isn't there has no size, and the net doesn't draw it.
+//! whip at them: each rears back, curling, then cracks through at where the player was, its
+//! tip last. The player can block a lash (the game decides, and `recoil` throws it off) or cut
+//! one down (`strike`): a dead one flops down limp, lies there a while and withers. They are
+//! one creature for the dream net, with a fixed number of parts: a tentacle that isn't there
+//! has no size, and the net doesn't draw it.
 
 use crate::world::creature::{cross, sub, Creature, Part, Shape};
 use crate::world::rng::Rng;
@@ -24,16 +27,32 @@ const FURTHEST: f32 = 4.5;
 /// Tiles between the roots of any two, and how far the player can leave one before it withers.
 const APART: f32 = 1.0;
 const LEFT_BEHIND: f32 = 8.0;
-/// A lash: seconds turning on the player, then lunging (only this part hurts: there is time to
-/// step away), then going slack, then resting before the next.
+/// A lash: seconds turning on the player and rearing back, then cracking through (only this
+/// part hurts: there is time to step away or raise a shield), then going slack, then resting
+/// before the next. Thrown off (blocked or struck), it rests longer.
 const WINDUP: f32 = 0.7;
-const LUNGE: f32 = 0.25;
+const CRACK: f32 = 0.25;
 const SLACK: f32 = 0.8;
 const REST: f32 = 2.0;
-/// How much longer a tentacle is at the end of its lunge.
+const THROWN_OFF: f32 = 1.5;
+/// How far each joint curls back as it rears (radians), and past straight as it cracks; and
+/// how far behind the joint before it each one follows through, in shares of the crack.
+const REAR: f32 = 0.45;
+const FOLLOW: f32 = 0.35;
+const LAG: f32 = 0.12;
+/// How much longer a tentacle is at the end of its crack.
 const STRETCH: f32 = 1.25;
-/// How close the lunge has to pass to the player's chest to touch them (tiles).
+/// How close the crack has to pass to the player's chest to touch them (tiles).
 const TOUCH: f32 = 0.3;
+/// Health: a couple of good blows.
+const HP: i32 = 6;
+/// Once dead: seconds to flop down, how far its joints sag (radians), and seconds it lies
+/// there before it withers.
+const WILT: f32 = 0.7;
+const SAG: f32 = 0.3;
+const LIE: f32 = 2.5;
+/// Down (y is down).
+const DOWN: [f32; 3] = [0.0, 1.0, 0.0];
 /// The player's chest, below the eye (y is down), and the seconds between hits.
 const CHEST: f32 = 0.25 * TF;
 const HIT_EVERY: f32 = 1.2;
@@ -96,25 +115,60 @@ struct Tentacle {
     /// Seconds into a lash, if it is lashing, and seconds before it can.
     lash: Option<f32>,
     rest: f32,
+    hp: i32,
+    /// Seconds since it was killed.
+    dead: Option<f32>,
+}
+
+/// A lash that reached the player: which tentacle, and where it grows from.
+#[derive(Clone, Copy, Debug)]
+pub struct Lash {
+    pub which: usize,
+    pub root: [f32; 3],
 }
 
 impl Tentacle {
-    /// How far it has turned on the player, 0..1.
+    /// How far it has turned from `out` to `aim`, 0..1: on the player as it lashes, down as it dies.
     fn turned(&self) -> f32 {
+        if let Some(t) = self.dead {
+            return smooth(t / WILT);
+        }
         self.lash.map_or(0.0, |t| {
-            if t < WINDUP + LUNGE { smooth(t / WINDUP) } else { 1.0 - smooth((t - WINDUP - LUNGE) / SLACK) }
+            if t < WINDUP + CRACK { smooth(t / WINDUP) } else { 1.0 - smooth((t - WINDUP - CRACK) / SLACK) }
         })
     }
 
-    /// How far through its lunge it has stretched, 0..1.
-    fn lunged(&self) -> f32 {
+    /// How far through its crack it has stretched, 0..1.
+    fn stretched(&self) -> f32 {
         self.lash.map_or(0.0, |t| {
-            if t < WINDUP + LUNGE { smooth((t - WINDUP) / LUNGE) } else { 1.0 - smooth((t - WINDUP - LUNGE) / SLACK) }
+            if t < WINDUP + CRACK { smooth((t - WINDUP) / CRACK) } else { 1.0 - smooth((t - WINDUP - CRACK) / SLACK) }
         })
     }
 
-    fn lunging(&self) -> bool {
-        self.lash.is_some_and(|t| (WINDUP..WINDUP + LUNGE).contains(&t))
+    fn cracking(&self) -> bool {
+        self.dead.is_none() && self.lash.is_some_and(|t| (WINDUP..WINDUP + CRACK).contains(&t))
+    }
+
+    fn alive(&self) -> bool {
+        self.dead.is_none() && self.life > 0.0
+    }
+
+    /// How far joint `s` (1..) is curled (radians): back as it rears, through past straight as
+    /// it cracks (later the nearer the tip), easing back as it goes slack; sagging once dead.
+    fn curl(&self, s: usize) -> f32 {
+        if let Some(t) = self.dead {
+            return SAG * smooth(t / WILT);
+        }
+        let Some(t) = self.lash else { return 0.0 };
+        if t < WINDUP {
+            -REAR * smooth(t / WINDUP)
+        } else if t < WINDUP + CRACK {
+            let lag = (s - 1) as f32 * LAG;
+            let u = ((t - WINDUP) / CRACK - lag) / (1.0 - (SEGMENTS - 2) as f32 * LAG);
+            -REAR + (REAR + FOLLOW) * smooth(u)
+        } else {
+            FOLLOW * (1.0 - smooth((t - WINDUP - CRACK) / SLACK))
+        }
     }
 
     /// How far it can reach from its root.
@@ -125,7 +179,7 @@ impl Tentacle {
     /// Set this tentacle's parts for `clock` seconds.
     fn pose(&self, parts: &mut [Part], clock: f32) {
         let turned = self.turned();
-        let long = self.half * self.grown * (1.0 + (STRETCH - 1.0) * self.lunged());
+        let long = self.half * self.grown * (1.0 + (STRETCH - 1.0) * self.stretched());
         let y = norm([0, 1, 2].map(|c| self.out[c] + (self.aim[c] - self.out[c]) * turned));
         let x = norm(cross(y, if y[1].abs() > 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] }));
         let z = cross(x, y);
@@ -135,9 +189,10 @@ impl Tentacle {
             let girth = self.girth * 0.8f32.powi(s as i32) * self.grown.sqrt();
             p.half = if self.grown > 0.0 { [girth.max(0.2), long.max(0.2), girth.max(0.2)] } else { [0.0; 3] };
             if s > 0 {
+                // Swaying while it waits; still while it lashes, and once dead.
                 let w = clock * 1.4 + self.phase - s as f32 * 0.8;
-                let k = (0.15 + 0.1 * s as f32) * (1.0 - turned);
-                p.rot = mul(rot_x(k * w.sin()), rot_z(k * (w * 0.7 + 1.0).cos()));
+                let k = if self.dead.is_some() { 0.0 } else { (0.15 + 0.1 * s as f32) * (1.0 - turned) };
+                p.rot = mul(rot_x(k * w.sin() + self.curl(s)), rot_z(k * (w * 0.7 + 1.0).cos()));
             }
         }
     }
@@ -181,28 +236,40 @@ impl Growths {
         Growths { creature, all: [None; MOST], clock: 0.0, spawn: 0.0, hit: 0.0 }
     }
 
-    /// How many tentacles are out.
+    /// How many tentacles are out, dead ones lying about included.
     pub fn count(&self) -> usize {
         self.all.iter().flatten().count()
     }
 
+    /// How many are alive.
+    pub fn living(&self) -> usize {
+        self.all.iter().flatten().filter(|a| a.alive()).count()
+    }
+
     /// `dt` seconds pass with the player at `cam`, and `wanted` (0..1) of the most there can be
-    /// called for; with none called for they wither. Whether one has hurt the player.
-    pub fn update(&mut self, scene: &Scene, cam: &Camera, wanted: f32, dt: f32, rng: &mut Rng) -> bool {
+    /// called for; with none called for they wither. The lash that reached the player, if one did.
+    pub fn update(&mut self, scene: &Scene, cam: &Camera, wanted: f32, dt: f32, rng: &mut Rng) -> Option<Lash> {
         if self.creature.parts.is_empty() {
-            return false;
+            return None;
         }
         self.clock += dt;
         self.spawn -= dt;
         self.hit -= dt;
         let eye = cam.pos.map(|c| c as f32);
         let chest = [eye[0], eye[1] + CHEST, eye[2]];
-        if self.spawn <= 0.0 && wanted > 0.0 && self.count() < (wanted * MOST as f32).ceil() as usize {
+        if self.spawn <= 0.0 && wanted > 0.0 && self.living() < (wanted * MOST as f32).ceil() as usize {
             self.spawn = SPAWN_SECS;
             self.sprout(scene, cam, rng);
         }
         for slot in &mut self.all {
             let Some(a) = slot else { continue };
+            if let Some(t) = &mut a.dead {
+                *t += dt;
+                if *t > WILT + LIE {
+                    a.grown = (a.grown - dt / WITHER_SECS).max(0.0);
+                }
+                continue;
+            }
             a.life -= dt;
             if wanted <= 0.0 || distance(a.root, eye) > LEFT_BEHIND * TF {
                 a.life = a.life.min(0.0);
@@ -220,9 +287,9 @@ impl Growths {
             match &mut a.lash {
                 Some(t) => {
                     *t += dt;
-                    if *t >= WINDUP + LUNGE + SLACK {
+                    if *t >= WINDUP + CRACK + SLACK {
                         a.lash = None;
-                        a.rest = REST;
+                        a.rest = a.rest.max(REST);
                     }
                 }
                 None if a.grown >= 1.0 && a.rest <= 0.0 => {
@@ -245,30 +312,72 @@ impl Growths {
                 None => parts.iter_mut().for_each(|p| p.half = [0.0; 3]),
             }
         }
-        let touched = self.hit <= 0.0 && self.touches(chest);
-        if touched {
+        let touched = if self.hit <= 0.0 { self.touches(chest) } else { None };
+        if touched.is_some() {
             self.hit = HIT_EVERY;
         }
         for slot in &mut self.all {
-            if slot.is_some_and(|a| a.life <= 0.0 && a.grown <= 0.0) {
+            if slot.is_some_and(|a| (a.life <= 0.0 || a.dead.is_some()) && a.grown <= 0.0) {
                 *slot = None;
             }
         }
         touched
     }
 
-    /// Whether a lunging tentacle is at `chest`.
-    fn touches(&self, chest: [f32; 3]) -> bool {
+    /// The segments of tentacle `i` as they stand: (from, to) each.
+    fn segments(&self, i: usize) -> Vec<([f32; 3], [f32; 3])> {
         let placed = self.creature.pose();
-        self.all.iter().enumerate().any(|(i, slot)| {
-            slot.is_some_and(|a| {
-                a.lunging()
-                    && (i * SEGMENTS..(i + 1) * SEGMENTS).any(|s| {
-                        let end = [0, 1, 2].map(|c| 2.0 * placed[s].centre[c] - placed[s].joint[c]);
-                        to_segment(chest, placed[s].joint, end) < TOUCH * TF + a.girth
-                    })
-            })
+        (i * SEGMENTS..(i + 1) * SEGMENTS).map(|s| (placed[s].joint, [0, 1, 2].map(|c| 2.0 * placed[s].centre[c] - placed[s].joint[c]))).collect()
+    }
+
+    /// The cracking tentacle at `chest`, if one is.
+    fn touches(&self, chest: [f32; 3]) -> Option<Lash> {
+        self.all.iter().enumerate().find_map(|(i, slot)| {
+            let a = slot.as_ref()?;
+            let near = a.cracking() && self.segments(i).iter().any(|&(from, to)| to_segment(chest, from, to) < TOUCH * TF + a.girth);
+            near.then_some(Lash { which: i, root: a.root })
         })
+    }
+
+    /// Tentacle `which` is thrown off its lash (a shield took it): it goes slack and rests.
+    pub fn recoil(&mut self, which: usize) {
+        if let Some(Some(a)) = self.all.get_mut(which) {
+            if a.lash.is_some_and(|t| t < WINDUP + CRACK) {
+                a.lash = Some(WINDUP + CRACK);
+            }
+            a.rest = REST + THROWN_OFF;
+        }
+    }
+
+    /// A blow of `damage` from `chest`, facing `ahead` (x, z), reaching `reach` and `arc`
+    /// radians either side: the nearest living tentacle it finds takes it, and is thrown off its
+    /// lash or killed. None if it found none, else whether it killed it.
+    pub fn strike(&mut self, chest: [f32; 3], ahead: [f32; 2], reach: f32, arc: f32, damage: i32) -> Option<bool> {
+        let facing = |p: [f32; 3]| {
+            let d = sub(p, chest);
+            let flat = d[0].hypot(d[2]);
+            flat < 0.15 * TF || ((d[0] * ahead[0] + d[2] * ahead[1]) / flat).clamp(-1.0, 1.0).acos() < arc
+        };
+        let (i, _) = (0..MOST)
+            .filter(|&i| self.all[i].is_some_and(|a| a.alive() && a.grown > 0.5))
+            .filter_map(|i| {
+                let near = self.segments(i).iter().flat_map(|&(from, to)| [from, [0, 1, 2].map(|c| (from[c] + to[c]) / 2.0), to]).filter(|&p| facing(p)).map(|p| distance(p, chest)).fold(f32::INFINITY, f32::min);
+                (near < reach).then_some((i, near))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        let a = self.all[i].as_mut()?;
+        a.hp -= damage;
+        if a.hp > 0 {
+            self.recoil(i);
+            return Some(false);
+        }
+        // It flops down from however it stood.
+        let turned = a.turned();
+        a.out = norm([0, 1, 2].map(|c| a.out[c] + (a.aim[c] - a.out[c]) * turned));
+        a.aim = norm([0, 1, 2].map(|c| DOWN[c] + 0.15 * a.out[c]));
+        a.lash = None;
+        a.dead = Some(0.0);
+        Some(true)
     }
 
     /// Start one in a free slot, on a wall or ceiling the player is looking at.
@@ -308,6 +417,8 @@ impl Growths {
                 life: rng.fr(LIFE.0, LIFE.1),
                 lash: None,
                 rest: 0.0,
+                hp: HP,
+                dead: None,
             });
             return;
         }
@@ -333,7 +444,7 @@ mod tests {
     /// One fully grown tentacle pointing at nothing, `away` tiles from the camera along +x.
     fn one_at(g: &mut Growths, cam: &Camera, away: f32) -> [f32; 3] {
         let root = [cam.pos[0] as f32 + away * TF, cam.pos[1] as f32, cam.pos[2] as f32];
-        g.all[0] = Some(Tentacle { root, out: [-1.0, 0.0, 0.0], aim: [-1.0, 0.0, 0.0], half: 0.2 * TF, girth: 0.07 * TF, phase: 0.0, grown: 1.0, life: 100.0, lash: None, rest: 0.0 });
+        g.all[0] = Some(Tentacle { root, out: [-1.0, 0.0, 0.0], aim: [-1.0, 0.0, 0.0], half: 0.2 * TF, girth: 0.07 * TF, phase: 0.0, grown: 1.0, life: 100.0, lash: None, rest: 0.0, hp: HP, dead: None });
         root
     }
 
@@ -369,7 +480,7 @@ mod tests {
         g.all[0].as_mut().unwrap().aim = norm(sub([cam.pos[0] as f32, (cam.pos[1] as f32) + CHEST, cam.pos[2] as f32], g.all[0].unwrap().root));
         let mut hits = 0;
         for _ in 0..3 {
-            hits += g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng) as i32;
+            hits += g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng).is_some() as i32;
         }
         assert_eq!(hits, 1);
     }
@@ -382,7 +493,7 @@ mod tests {
         one_at(&mut g, &cam, 0.5);
         g.all[0].as_mut().unwrap().rest = 100.0;
         for _ in 0..60 {
-            assert!(!g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng));
+            assert!(g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng).is_none());
         }
     }
 
@@ -394,9 +505,77 @@ mod tests {
         one_at(&mut g, &cam, 1.0);
         g.all[0].as_mut().unwrap().lash = Some(WINDUP);
         for _ in 0..(WITHER_SECS * 30.0) as i32 + 2 {
-            assert!(!g.update(&scene, &cam, 0.0, 1.0 / 30.0, &mut rng));
+            assert!(g.update(&scene, &cam, 0.0, 1.0 / 30.0, &mut rng).is_none());
         }
         assert_eq!(g.count(), 0);
         assert!(g.creature.parts.iter().all(|p| p.half == [0.0; 3]));
+    }
+
+    /// The camera's chest, and which way (x, z) it faces.
+    fn chest_and_ahead(cam: &Camera) -> ([f32; 3], [f32; 2]) {
+        let eye = cam.pos.map(|c| c as f32);
+        let m = view_matrix(cam);
+        let r = |i: usize, j: usize| m.m[i][j] as f32 / 4096.0;
+        let f = [r(2, 0), r(2, 2)];
+        let l = f[0].hypot(f[1]);
+        ([eye[0], eye[1] + CHEST, eye[2]], [f[0] / l, f[1] / l])
+    }
+
+    /// A tentacle a tile ahead of the camera, pointing back at it.
+    fn one_ahead(g: &mut Growths, cam: &Camera) {
+        let (chest, ahead) = chest_and_ahead(cam);
+        let root = [chest[0] + ahead[0] * TF, chest[1], chest[2] + ahead[1] * TF];
+        let out = norm(sub(chest, root));
+        g.all[0] = Some(Tentacle { root, out, aim: out, half: 0.2 * TF, girth: 0.07 * TF, phase: 0.0, grown: 1.0, life: 100.0, lash: None, rest: 100.0, hp: HP, dead: None });
+    }
+
+    #[test]
+    fn a_whip_rears_back_then_cracks_through_tip_last() {
+        let t = Tentacle { root: [0.0; 3], out: DOWN, aim: DOWN, half: 1.0, girth: 1.0, phase: 0.0, grown: 1.0, life: 1.0, lash: Some(WINDUP), rest: 0.0, hp: HP, dead: None };
+        assert!((1..SEGMENTS).all(|s| (t.curl(s) + REAR).abs() < 1e-4), "reared back at the start of the crack");
+        let mid = Tentacle { lash: Some(WINDUP + CRACK * 0.5), ..t };
+        assert!((2..SEGMENTS).all(|s| mid.curl(s) < mid.curl(s - 1)), "the tip follows through last");
+        let end = Tentacle { lash: Some(WINDUP + CRACK - 1e-4), ..t };
+        assert!((1..SEGMENTS).all(|s| (end.curl(s) - FOLLOW).abs() < 0.02), "through past straight at the end");
+    }
+
+    #[test]
+    fn a_thrown_off_lash_goes_slack_and_waits_longer() {
+        let (scene, cam) = scene_and_camera(1);
+        let mut g = Growths::new(&scene);
+        one_ahead(&mut g, &cam);
+        g.all[0].as_mut().unwrap().lash = Some(WINDUP + 0.05);
+        g.recoil(0);
+        let a = g.all[0].unwrap();
+        assert!(!a.cracking());
+        assert_eq!(a.rest, REST + THROWN_OFF);
+    }
+
+    #[test]
+    fn blows_hurt_then_kill_and_the_dead_flop_down_and_wither() {
+        let (scene, cam) = scene_and_camera(1);
+        let mut g = Growths::new(&scene);
+        let mut rng = Rng::new(1);
+        one_ahead(&mut g, &cam);
+        g.spawn = 1e9; // no others
+        g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng);
+        let (chest, ahead) = chest_and_ahead(&cam);
+        let behind = [-ahead[0], -ahead[1]];
+        assert_eq!(g.strike(chest, behind, 1.1 * TF, 1.0, 4), None, "a blow the other way misses");
+        assert_eq!(g.strike(chest, ahead, 0.1 * TF, 1.0, 4), None, "out of reach");
+        assert_eq!(g.strike(chest, ahead, 1.1 * TF, 1.0, 4), Some(false));
+        assert_eq!(g.strike(chest, ahead, 1.1 * TF, 1.0, 4), Some(true));
+        assert_eq!(g.living(), 0);
+        assert_eq!(g.strike(chest, ahead, 1.1 * TF, 1.0, 4), None, "the dead take no more blows");
+        let tip = |g: &Growths| g.segments(0)[SEGMENTS - 1].1;
+        let before = tip(&g)[1];
+        for _ in 0..(WILT * 30.0) as i32 + 1 {
+            assert!(g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng).is_none(), "the dead don't lash");
+        }
+        assert!(tip(&g)[1] > before + 0.2 * TF, "the tip has fallen (y is down): {} -> {}", before, tip(&g)[1]);
+        for _ in 0..((LIE + WITHER_SECS) * 30.0) as i32 + 2 {
+            g.update(&scene, &cam, 1.0, 1.0 / 30.0, &mut rng);
+        }
+        assert!(g.all[0].is_none(), "withered away");
     }
 }

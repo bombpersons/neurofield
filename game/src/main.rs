@@ -16,6 +16,7 @@
 //!     `--view raster` (or `both`) starts on the rasteriser instead of the network.
 //!     `--strangeness 0.7` sets how strange each level is (otherwise random).
 //!     `--affliction 0.7` starts the player that afflicted, to try how it looks.
+//!     `--peaceful`: the creatures' blows and spells do nothing (for trying other things).
 //!     `--level-file levels/x.ron` plays a hand-built level (see `engine::world::level`) from its
 //!     player start, or from `--start x,y,z,yaw` (world units, yaw in radians); N reloads it.
 //!     E (or circle) opens and closes the door in front, pulls the lever, or opens the chest
@@ -101,9 +102,13 @@ const FEEL_SECS: f32 = 2.0;
 const CALM_SECS: f32 = 1.5;
 /// Seconds the network's calm picture takes to fade to the plain one, and back.
 const FADE_SECS: f32 = 0.8;
-/// What a tentacle's lash does: health lost and affliction added.
+/// What a tentacle's lash does: health lost and affliction added, and the stamina it costs
+/// to block.
 const LASH_HP: i32 = 4;
 const LASH_AFFLICTION: f32 = 0.01;
+const LASH_BLOCK: f32 = 7.0;
+/// Stamina sprinting uses a second (none comes back meanwhile).
+const SPRINT_TIRE: f32 = 3.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -176,6 +181,8 @@ struct Sim {
     /// last tick, and the attack of the blades that swept through since then.
     foes: foes::Foes,
     cues: Vec<(usize, engine::world::animate::Cue)>,
+    /// `--peaceful`: the creatures do no harm.
+    peaceful: bool,
     struck: Option<i32>,
     /// Whether the controller was the last thing used, for the shape of the hotbar.
     on_pad: bool,
@@ -388,7 +395,10 @@ impl Sim {
     /// The creatures come for the player, and the sword finds them. Holding up a shield
     /// tires the player, and it comes down when they're spent.
     fn fight(&mut self) {
-        let cues = std::mem::take(&mut self.cues);
+        let mut cues = std::mem::take(&mut self.cues);
+        if self.peaceful {
+            cues.clear();
+        }
         let struck = std::mem::take(&mut self.struck);
         if self.auto_walk {
             return;
@@ -401,6 +411,15 @@ impl Sim {
             }
         }
         let (feet, yaw) = self.feet();
+        // A blow finds a tentacle in its way before any creature.
+        let mut struck = struck;
+        if let (Some(attack), Some(g)) = (struck, &mut self.growths) {
+            let chest = [feet[0], feet[1] - 0.6 * walker::EYE, feet[2]];
+            if let Some(killed) = g.strike(chest, [-yaw.sin(), yaw.cos()], foes::SWORD_REACH, foes::SWORD_ARC, attack) {
+                self.say(if killed { "the tentacle falls limp" } else { "you cut the tentacle" }.to_string());
+                struck = None;
+            }
+        }
         let stats = self.player.stats();
         let target = foes::Target { feet, yaw, guarding: self.hands.guarding(), stamina: self.player.stamina, struck, defence: stats.defence };
         let out = self.foes.tick(self.version, self.herd.animators(), &self.level.scene.creatures, &cues, &target, dt, &mut self.rng);
@@ -414,6 +433,37 @@ impl Sim {
         }
         if let Some(what) = out.said {
             self.say(what);
+        }
+    }
+
+    /// Start running, if there is stamina to run on (`walk` uses it up).
+    fn sprint(&mut self) {
+        if self.player.stamina > 0.0 {
+            self.level.walker.start_sprint();
+        }
+    }
+
+    /// A tentacle's lash reached the player: a raised shield facing it takes the blow (and
+    /// throws the tentacle off), as it does a creature's.
+    fn lashed(&mut self, lash: engine::world::growths::Lash) {
+        let (feet, yaw) = self.feet();
+        if self.hands.guarding() && foes::off_ahead(feet, yaw, lash.root) < foes::SHIELD_ARC {
+            self.player.tire(LASH_BLOCK);
+            if let Some(g) = &mut self.growths {
+                g.recoil(lash.which);
+            }
+            if self.player.stamina <= 0.0 {
+                self.hands.break_guard();
+                self.say("your guard is broken".to_string());
+            } else {
+                self.hands.knock();
+                self.say("your shield takes the lash".to_string());
+            }
+        } else {
+            self.player.hurt(LASH_HP);
+            self.player.afflict(LASH_AFFLICTION + foes::HIT_AFFLICTION);
+            self.player.tire(foes::HIT_TIRE);
+            self.say("something lashes you".to_string());
         }
     }
 
@@ -532,6 +582,7 @@ fn main() {
         had
     };
     let (mcp, headless, software) = (flag("--mcp"), flag("--headless"), flag("--software"));
+    let peaceful = flag("--peaceful");
     if mcp && !cfg!(feature = "dev-mcp") {
         eprintln!("--mcp needs a developer build: cargo run -p game --features dev-mcp -- --mcp");
         std::process::exit(2);
@@ -656,6 +707,7 @@ fn main() {
             herd: Default::default(),
             foes: Default::default(),
             cues: Vec::new(),
+            peaceful,
             struck: None,
             tris: 0,
             width: W,
@@ -839,7 +891,7 @@ fn keys(
             sim.jump();
         }
         if sprint {
-            sim.level.walker.start_sprint();
+            sim.sprint();
         }
         for (slot, k) in [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4].into_iter().enumerate() {
             if key.just_pressed(k) {
@@ -978,7 +1030,7 @@ fn debug_chords(pad: &ControllerState, sim: &mut Sim) {
         sim.auto_walk = !sim.auto_walk;
     }
     if pad.pressed(Button::L2) {
-        sim.level.walker.start_sprint();
+        sim.sprint();
     }
     if pad.pressed(Button::Circle) {
         sim.debug_hurt();
@@ -1142,8 +1194,8 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
         return;
     }
     let clear = sim.player.clarity > 0.0;
-    let guarding = sim.hands.guarding();
-    sim.player.update(1.0 / TICK as f32, guarding);
+    let straining = sim.hands.guarding() || sim.level.walker.sprinting();
+    sim.player.update(1.0 / TICK as f32, straining);
     if clear && sim.player.clarity == 0.0 {
         sim.say("the dream returns".to_string());
     }
@@ -1153,10 +1205,10 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
     let wanted = effects::growth(sim.showing());
     if let Some(growths) = &mut sim.growths {
         let cam = sim.level.walker.camera();
-        if growths.update(&sim.level.scene, &cam, wanted, 1.0 / TICK as f32, &mut sim.rng) && !sim.auto_walk {
-            sim.player.hurt(LASH_HP);
-            sim.player.afflict(LASH_AFFLICTION);
-            sim.said = Some(("something lashes you".to_string(), 3.0));
+        if let Some(lash) = growths.update(&sim.level.scene, &cam, wanted, 1.0 / TICK as f32, &mut sim.rng) {
+            if !sim.auto_walk {
+                sim.lashed(lash);
+            }
         }
     }
     sim.fight();
@@ -1202,6 +1254,12 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
     // The pitch is the mouse's: passing it as the target leaves it where it is.
     let look = level.walker.pitch;
     level.walker.drive(&level.scene, forward / len, strafe / len, turn, look);
+    if level.walker.sprinting() {
+        sim.player.tire(SPRINT_TIRE / TICK as f32);
+        if sim.player.stamina <= 0.0 {
+            level.walker.stop_sprint();
+        }
+    }
 }
 
 /// RGB floats (roughly 0..1, the network's) into an RGBA8 image.

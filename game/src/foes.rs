@@ -22,15 +22,15 @@ const PLAYER_R: f32 = 0.3 * TF;
 /// How far past its reach a strike still lands, the player having stepped back.
 const GRAZE: f32 = 0.25 * TF;
 /// How far the sword reaches past the player, and how far either side of straight ahead.
-const SWORD_REACH: f32 = 1.1 * TF;
-const SWORD_ARC: f32 = 1.0;
+pub const SWORD_REACH: f32 = 1.1 * TF;
+pub const SWORD_ARC: f32 = 1.0;
 /// Casters cast between these distances, now and then.
 const CAST_NEAR: f32 = 1.5 * TF;
 const CAST_FAR: f32 = 5.0 * TF;
 const CAST_CHANCE: f32 = 0.6;
 const CASTERS: f32 = 0.3;
 /// How far either side of straight ahead (radians) a raised shield blocks.
-const SHIELD_ARC: f32 = 1.2;
+pub const SHIELD_ARC: f32 = 1.2;
 
 /// What a strike does to the player: health lost, affliction added, how it's told, and the
 /// stamina it costs to block.
@@ -48,8 +48,17 @@ fn harm(s: Strike) -> (i32, f32, &'static str, f32) {
 const SPELL_HP: i32 = 2;
 const SPELL_AFFLICTION: f32 = 0.05;
 const SPELL_BLOCK: f32 = 6.0;
-/// The stamina a blow or spell that gets through knocks out of the player.
-const HIT_TIRE: f32 = 6.0;
+/// The stamina a blow or spell that gets through knocks out of the player, and the
+/// affliction any blow that lands adds, on top of its own.
+pub const HIT_TIRE: f32 = 6.0;
+pub const HIT_AFFLICTION: f32 = 0.01;
+
+/// How far `at` is from straight ahead of a player at `feet` facing `yaw` (radians), level.
+pub fn off_ahead(feet: [f32; 3], yaw: f32, at: [f32; 3]) -> f32 {
+    let d = [at[0] - feet[0], at[2] - feet[2]];
+    let far = d[0].hypot(d[1]).max(1.0);
+    ((-yaw.sin() * d[0] + yaw.cos() * d[1]) / far).clamp(-1.0, 1.0).acos()
+}
 
 struct Foe {
     hp: i32,
@@ -132,7 +141,7 @@ impl Foes {
                 out.said = Some(if out.broken { "your guard is broken" } else { "your shield takes the blow" }.to_string());
             } else {
                 out.hurt += (hp - player.defence / 2).max(1);
-                out.afflict += affliction;
+                out.afflict += affliction + HIT_AFFLICTION;
                 out.tired += HIT_TIRE;
                 out.said = Some(what.to_string());
             }

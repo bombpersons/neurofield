@@ -349,10 +349,10 @@ impl Player {
     }
 
     /// `dt` seconds pass: clarity runs out, affliction creeps up and stamina comes back,
-    /// unless a shield is held up (`guarding`).
-    pub fn update(&mut self, dt: f32, guarding: bool) {
+    /// unless a shield is held up or the player sprints (`straining`).
+    pub fn update(&mut self, dt: f32, straining: bool) {
         self.clarity = (self.clarity - dt).max(0.0);
-        if !guarding {
+        if !straining {
             self.stamina = (self.stamina + RECOVER * dt).min(STAMINA);
         }
         self.afflict(AFFLICTION_RISE * dt);
