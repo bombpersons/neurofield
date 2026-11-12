@@ -23,7 +23,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use crate::world::scene::{Camera as PsxCamera, Scene, Tri, T};
 use crate::world::tex;
-use psx_bevy::psx::{PsxMaterial, PsxView};
+use psx_bevy::psx::{PsxBeyond, PsxMaterial, PsxView};
 use std::collections::HashMap;
 
 pub use flesh::{DreamCreatures, FleshLayers, FleshTarget};
@@ -369,8 +369,9 @@ pub fn prepare(scene: &Scene) -> Prepared {
     }
     let mut ids: Vec<_> = groups.keys().copied().collect();
     ids.sort();
+    let corners = Corners::of(&scene.tris);
     Prepared(ids.into_iter().map(|id| {
-        let (mesh, part) = make_part(&groups[&id], &Torch::default());
+        let (mesh, part) = make_part(&groups[&id], &Torch::default(), &corners);
         (id, mesh, part)
     }).collect())
 }
@@ -428,7 +429,7 @@ pub fn spawn_own(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, level: &
     out
 }
 
-/// A mesh's material in the walked level's fog, and out of it for drawing a level beside it.
+/// A mesh's material in the walked level's fog, and in its own for drawing a level beside it.
 #[derive(Component, Clone)]
 pub struct Fogs {
     fogged: Handle<PsxMaterial>,
@@ -443,13 +444,21 @@ impl Fogs {
 }
 
 /// One of a level's meshes drawn beside the level being walked, where it stands against it
-/// (its transform), as through a doorway into it: by its own light, with no torch, out of
-/// the walked level's fog, and only where `clip`'s planes (`PsxMaterial::clip`; those of the
-/// doorway it's seen through, `view_plane`s of `link::Doorway::portal`) let it be seen.
-/// Taking it away has the mesh drawn as the walked level's again.
+/// (its transform), as through a doorway into it: by its own light, with no torch, and only
+/// where `clip`'s planes (`PsxMaterial::clip`; those of the doorway it's seen through,
+/// `view_plane`s of `link::Doorway::portal`) let it be seen. Fogged as in its own air past
+/// the doorway (`fog`, see `PsxBeyond`), else not at all. Taking it away has the mesh drawn
+/// as the walked level's again.
 #[derive(Component, Clone, Default, PartialEq)]
 pub struct Placed {
     pub clip: Vec<Vec4>,
+    pub fog: Option<PsxBeyond>,
+}
+
+/// The fog of a level beside the walked one, past the doorway's edge `plane` (world units,
+/// `link::Doorway::edge`): its own camera's far end and colour.
+pub fn beyond(plane: [f32; 4], cam: &PsxCamera, colour: [f32; 3]) -> PsxBeyond {
+    PsxBeyond { plane: view_plane(plane), far: cam.fog_far as f32 / TF, color: Color::srgb(colour[0], colour[1], colour[2]) }
 }
 
 /// A plane in world units (`link::Doorway::portal`'s) as the view's world has it.
@@ -476,7 +485,8 @@ pub fn spawn_placed(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, at: T
 }
 
 /// Meshes newly `Placed` take their clear materials and lose the torch; those no longer
-/// placed take the walked level's fog and torch again. The clear materials follow `clip`.
+/// placed take the walked level's fog and torch again. The clear materials follow `clip`
+/// and `fog`.
 fn place_parts(
     torch: Res<Torch>,
     changed: Query<(), Changed<Placed>>,
@@ -506,9 +516,11 @@ fn place_parts(
     }
     for (fogs, mut m, part, placed) in &mut parts {
         let Some(placed) = placed.filter(|p| p.is_changed()) else { continue };
-        if materials.get(&fogs.clear).is_some_and(|c| c.clip != placed.clip) {
+        if materials.get(&fogs.clear).is_some_and(|c| c.clip != placed.clip || c.beyond != placed.fog) {
             if let Some(mut c) = materials.get_mut(&fogs.clear) {
                 c.clip = placed.clip.clone();
+                c.beyond = placed.fog;
+                c.fog = placed.fog.is_some();
             }
         }
         if m.0 != fogs.clear {
@@ -622,13 +634,16 @@ fn spawn_part(
     m: Handle<PsxMaterial>,
     torch: &Torch,
 ) -> (Entity, Handle<Mesh>) {
-    let (mesh, part) = make_part(tris, torch);
+    let (mesh, part) = make_part(tris, torch, &Corners::of(&[]));
     let mesh = meshes.add(mesh);
     (commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(m), part)).id(), mesh)
 }
 
-/// A mesh of `tris`, lit by `torch`, and what relights it.
-fn make_part(tris: &[&Tri], torch: &Torch) -> (Mesh, LevelPart) {
+/// A mesh of `tris`, lit by `torch`, and what relights it. Each triangle is split first
+/// wherever one of `corners` (the whole level's) lies along an edge of it, so that no
+/// corner of a neighbour, of whatever texture, sits partway along an edge (a T-junction,
+/// where the two sides' pixels needn't meet, and what's behind shows through in specks).
+fn make_part(tris: &[&Tri], torch: &Torch, corners: &Corners) -> (Mesh, LevelPart) {
     let (mut pos, mut uv, mut verts) = (Vec::new(), Vec::new(), Vec::new());
     for t in tris {
         let p = t.v.map(|v| v.p.map(|c| c as f32));
@@ -644,12 +659,14 @@ fn make_part(tris: &[&Tri], torch: &Torch) -> (Mesh, LevelPart) {
             let uv = [(v.uv[0] - u0) as f32 / 63.0, (v.uv[1] - v0) as f32 / 63.0];
             (PartVert { p: p[k], n: normal, col: v.col.map(|c| c as f32), alb: v.alb.map(|c| c as f32) }, uv)
         };
-        split([corner(0), corner(1), corner(2)], &mut |c| {
-            for (v, tc) in c {
-                pos.push(to_view(v.p).to_array());
-                uv.push(tc);
-                verts.push(v);
-            }
+        corners.split(t.v.map(|v| v.p), [corner(0), corner(1), corner(2)], &mut |c| {
+            split(c, &mut |c| {
+                for (v, tc) in c {
+                    pos.push(to_view(v.p).to_array());
+                    uv.push(tc);
+                    verts.push(v);
+                }
+            })
         });
     }
     let n = verts.len();
@@ -665,28 +682,119 @@ fn make_part(tris: &[&Tri], torch: &Torch) -> (Mesh, LevelPart) {
 
 type Corner = (PartVert, [f32; 2]);
 
-/// Split a triangle into four at its edges' midpoints until no edge is longer
-/// than `MAX_EDGE`, handing on each piece.
+/// Split a triangle in two at the middle of its longest edge until no edge is longer than
+/// `MAX_EDGE`, handing on each piece. An edge is split only for being too long, always at
+/// its middle, so neighbours sharing it whole split it at the same points.
 fn split(c: [Corner; 3], out: &mut impl FnMut([Corner; 3])) {
     let d = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
-    let longest = (0..3).map(|i| d(c[i].0.p, c[(i + 1) % 3].0.p)).fold(0.0, f32::max);
+    let (i, longest) = (0..3).map(|i| (i, d(c[i].0.p, c[(i + 1) % 3].0.p))).fold((0, 0.0), |m, e| if e.1 > m.1 { e } else { m });
     if longest <= MAX_EDGE {
         out(c);
         return;
     }
-    let mid = |a: &Corner, b: &Corner| -> Corner {
-        let h = |x: [f32; 3], y: [f32; 3]| [0, 1, 2].map(|k| (x[k] + y[k]) / 2.0);
-        (
-            PartVert { p: h(a.0.p, b.0.p), n: a.0.n, col: h(a.0.col, b.0.col), alb: h(a.0.alb, b.0.alb) },
-            [(a.1[0] + b.1[0]) / 2.0, (a.1[1] + b.1[1]) / 2.0],
-        )
-    };
-    let [a, b, cc] = c;
-    let (ab, bc, ca) = (mid(&a, &b), mid(&b, &cc), mid(&cc, &a));
-    split([a, ab.clone(), ca.clone()], out);
-    split([ab.clone(), b, bc.clone()], out);
-    split([ca.clone(), bc.clone(), cc], out);
-    split([ab, bc, ca], out);
+    let (a, b, cc) = (c[i].clone(), c[(i + 1) % 3].clone(), c[(i + 2) % 3].clone());
+    let m = between(&a, &b, 0.5);
+    split([a, m.clone(), cc.clone()], out);
+    split([m, b, cc], out);
+}
+
+/// The corner `f` of the way from `a` to `b`.
+fn between(a: &Corner, b: &Corner, f: f32) -> Corner {
+    let h = |x: [f32; 3], y: [f32; 3]| [0, 1, 2].map(|k| if f == 0.5 { (x[k] + y[k]) / 2.0 } else { x[k] + (y[k] - x[k]) * f });
+    (
+        PartVert { p: h(a.0.p, b.0.p), n: a.0.n, col: h(a.0.col, b.0.col), alb: h(a.0.alb, b.0.alb) },
+        [a.1[0] + (b.1[0] - a.1[0]) * f, a.1[1] + (b.1[1] - a.1[1]) * f],
+    )
+}
+
+/// A level's triangles' corners (world units), for splitting at T-junctions: sorted, those
+/// within a unit or two of another (sloping faces' corners, rounded to whole units, that
+/// should meet) as one.
+struct Corners {
+    corners: Vec<[i32; 3]>,
+    welded: HashMap<[i32; 3], [i32; 3]>,
+}
+
+impl Corners {
+    /// How near two corners are taken as one.
+    const WELD: i32 = 2;
+
+    fn of(tris: &[Tri]) -> Corners {
+        let mut all: Vec<[i32; 3]> = tris.iter().flat_map(|t| t.v.map(|v| v.p)).collect();
+        all.sort_unstable();
+        all.dedup();
+        let (mut corners, mut welded): (Vec<[i32; 3]>, HashMap<_, _>) = (Vec::new(), HashMap::new());
+        for c in all {
+            // The kept ones are in order of x, so only the last few can be near.
+            let near = corners.iter().rev().take_while(|k| c[0] - k[0] <= Self::WELD).find(|k| (0..3).all(|i| (c[i] - k[i]).abs() <= Self::WELD));
+            match near {
+                Some(&k) => {
+                    welded.insert(c, k);
+                }
+                None => corners.push(c),
+            }
+        }
+        corners.sort_unstable();
+        Corners { corners, welded }
+    }
+
+    fn weld(&self, p: [i32; 3]) -> [i32; 3] {
+        self.welded.get(&p).copied().unwrap_or(p)
+    }
+
+    /// A corner strictly between `a` and `b`, within a unit or so of the line through them.
+    fn along(&self, a: [i32; 3], b: [i32; 3]) -> Option<[i32; 3]> {
+        let (lo, hi) = (a[0].min(b[0]) - 1, a[0].max(b[0]) + 1);
+        let from = self.corners.partition_point(|c| c[0] < lo);
+        let to = self.corners.partition_point(|c| c[0] <= hi);
+        let ab = [0, 1, 2].map(|k| (b[k] - a[k]) as f64);
+        let len2 = ab.iter().map(|x| x * x).sum::<f64>();
+        self.corners[from..to].iter().copied().find(|&c| {
+            let ac = [0, 1, 2].map(|k| (c[k] - a[k]) as f64);
+            let d = (0..3).map(|k| ac[k] * ab[k]).sum::<f64>();
+            let off = (0..3).map(|k| (ac[k] - ab[k] * d / len2).powi(2)).sum::<f64>();
+            let ends = Self::WELD as f64 * len2.sqrt();
+            d > ends && d < len2 - ends && off <= 1.5 * 1.5
+        })
+    }
+
+    /// Hand on the pieces of the triangle at `p` (its corners `c`) split at every corner
+    /// that lies along one of its edges.
+    fn split(&self, p: [[i32; 3]; 3], c: [Corner; 3], out: &mut impl FnMut([Corner; 3])) {
+        // However the corners lie, one triangle doesn't become more pieces than this.
+        const MAX_PIECES: usize = 256;
+        let p = p.map(|q| self.weld(q));
+        let mut c = c;
+        for k in 0..3 {
+            c[k].0.p = p[k].map(|v| v as f32);
+        }
+        let mut todo = vec![(p, c)];
+        let mut pieces = 1;
+        while let Some((p, c)) = todo.pop() {
+            let found = if pieces < MAX_PIECES { (0..3).find_map(|i| self.along(p[i], p[(i + 1) % 3]).map(|m| (i, m))) } else { None };
+            let Some((i, m)) = found else {
+                out(c);
+                continue;
+            };
+            pieces += 1;
+            let j = (i + 1) % 3;
+            let ab = [0, 1, 2].map(|k| (p[j][k] - p[i][k]) as f32);
+            let am = [0, 1, 2].map(|k| (m[k] - p[i][k]) as f32);
+            let f = (0..3).map(|k| ab[k] * am[k]).sum::<f32>() / (0..3).map(|k| ab[k] * ab[k]).sum::<f32>();
+            // At the corner itself, not on the line, so the two sides meet exactly.
+            let mut mid = between(&c[i], &c[j], f);
+            mid.0.p = m.map(|v| v as f32);
+            // Both halves keep the winding: the middle stands in for one end of the edge each.
+            let (mut p1, mut c1) = (p, c.clone());
+            p1[j] = m;
+            c1[j] = mid.clone();
+            let (mut p2, mut c2) = (p, c);
+            p2[i] = m;
+            c2[i] = mid;
+            todo.push((p2, c2));
+            todo.push((p1, c1));
+        }
+    }
 }
 
 impl LevelPart {
@@ -778,5 +886,36 @@ impl Plugin for LevelGfxPlugin {
             .add_systems(Startup, spawn_camera)
             .add_systems(PostUpdate, (apply_view, place_parts, apply_torch, sky::follow).chain().before(bevy::camera::CameraUpdateSystems));
         flesh::plugin(app);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No corner of a level lies partway along an edge of its meshes' triangles once split
+    /// (`Corners::split`), so neighbours meet edge to edge; `split` then halves each edge too
+    /// long alike on both sides. So nothing shows through between them.
+    #[test]
+    fn level_meshes_have_no_t_junctions() {
+        for name in ["dungeon1.ron", "castle_inside.ron", "castle.ron"] {
+            let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../levels").join(name);
+            let scene = crate::world::level::Level::load(&file).unwrap().to_scene();
+            let corners = Corners::of(&scene.tris);
+            let (mut pieces, mut junctions, mut before) = (0, 0, 0);
+            let corner = |p: [i32; 3]| (PartVert { p: p.map(|c| c as f32), n: [0.0; 3], col: [0.0; 3], alb: [0.0; 3] }, [0.0; 2]);
+            for t in &scene.tris {
+                let p = t.v.map(|v| v.p);
+                before += (0..3).filter(|&i| corners.along(p[i], p[(i + 1) % 3]).is_some()).count();
+                corners.split(p, p.map(corner), &mut |c| {
+                    pieces += 1;
+                    let q = c.map(|v| v.0.p.map(|x| x.round() as i32));
+                    assert!(q.iter().all(|q| corners.weld(*q) == *q));
+                    junctions += (0..3).filter(|&i| corners.along(q[i], q[(i + 1) % 3]).is_some()).count();
+                });
+            }
+            println!("{name}: {} triangles, {before} T-junctions, {pieces} pieces, {junctions} left", scene.tris.len());
+            assert!(before > 0 && junctions == 0, "{name}");
+        }
     }
 }

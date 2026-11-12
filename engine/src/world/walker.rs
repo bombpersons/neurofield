@@ -195,10 +195,15 @@ impl Walker {
     }
 
     /// Daylight: fog from `near` to `far` (tiles) and no torch, for the waking world.
-    pub fn daylight(&mut self, (near, far): (f32, f32)) {
+    pub fn daylight(&mut self, fog: (f32, f32)) {
+        self.set_fog(fog);
+        self.torch = [0.0; 3];
+    }
+
+    /// Fog from `near` to `far` (tiles).
+    pub fn set_fog(&mut self, (near, far): (f32, f32)) {
         self.fog_near = (near * TF) as i32;
         self.fog_far = (far.max(near + 0.5) * TF) as i32;
-        self.torch = [0.0; 3];
     }
 
     /// Choose a destination (biased toward far cells) and the cell path to it.

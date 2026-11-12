@@ -529,6 +529,22 @@ impl Sim {
         }
     }
 
+    /// How the level beside, `b`, is drawn through its doorway: clipped to it (`portal`), and
+    /// fogged as in its own air past the doorway's edge. Fog is the air's, not the eye's: each
+    /// stretch of a line of sight counts by the fog of the level it passes through, so it
+    /// is the same from either side of the edge (where the two levels' fogs are alike in shape,
+    /// start over end), and nothing changes as the player crosses.
+    fn placed(&self, b: &links::Beside) -> engine::render::Placed {
+        let clip = self.portal(b).into_iter().map(engine::render::view_plane).collect();
+        let door = self.level.scene.doorways.iter().find(|d| d.link.id == b.through);
+        let back = b.loaded.links.iter().find(|l| l.id == b.back);
+        let fog = door.zip(back).map(|(d, back)| {
+            let colour = b.loaded.level.scene.fog_colour(back.pos.map(|c| c as i32));
+            engine::render::beyond(d.edge(), &b.loaded.level.walker.camera(), colour)
+        });
+        engine::render::Placed { clip, fog }
+    }
+
     /// Step through a link the feet have come through, if they have.
     fn through_links(&mut self) {
         let (feet, _) = self.feet();
@@ -966,8 +982,8 @@ struct LevelParts {
     /// Where it's placed (None walked), once it has been, and whether its people show.
     placed: Option<Option<engine::world::link::Placement>>,
     people: Option<bool>,
-    /// The planes it's seen through, beside the walked level.
-    clip: Vec<Vec4>,
+    /// How it's seen through its doorway, beside the walked level.
+    look: engine::render::Placed,
 }
 
 /// Which loaded level a mesh is of (`Parts`).
@@ -1239,6 +1255,9 @@ fn main() {
     }
     app.add_plugins(plugins)
     // The rasteriser: the network's own size and shape, so the two compare pixel for pixel.
+    // Vertices where they fall, not snapped to whole pixels (the display settings can turn
+    // the snapping back on).
+    .insert_resource(psx_bevy::psx::PsxLook { vertex_snap: false, ..default() })
     .add_plugins(PsxPlugin { screen: PsxScreen { width: W, height: H, ..default() } })
     .add_plugins(ShellPlugin { tick: TickRate { hz: TICK } })
     .add_plugins(engine::render::LevelGfxPlugin)
@@ -1863,17 +1882,22 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
 }
 
 /// The walked level's camera `cam` as the level beside it, `b`, has it, looking in through
-/// the doorway at `door` (world units, the walked level's): its fog starts from the doorway,
-/// as it would for someone standing in it, so the far side isn't lost in it from afar.
+/// the doorway at `door` (world units, the walked level's). Its fog is as the PS1 renderer's
+/// for what's past a doorway (`Sim::placed`): the way to the doorway counts by the walked
+/// level's fog, the rest by the level beside's, which, the doorway being about as far for
+/// every pixel through it, is linear fog over the distance from the eye with both ends moved.
 fn camera_in(b: &links::Beside, cam: &engine::world::scene::Camera, door: [f32; 3]) -> engine::world::scene::Camera {
     let back = b.place.inverse();
     let own = b.loaded.level.walker.camera();
-    let away = (0..3).map(|k| (cam.pos[k] as f32 - door[k]).powi(2)).sum::<f32>().sqrt() as i32;
+    let away = (0..3).map(|k| (cam.pos[k] as f32 - door[k]).powi(2)).sum::<f32>().sqrt();
+    let (near, far) = (cam.fog_near as f32, cam.fog_far.max(1) as f32);
+    let there = own.fog_far as f32;
+    let shift = away * (1.0 - there / far);
     engine::world::scene::Camera {
         pos: back.point(cam.pos.map(|c| c as f32)).map(|v| v.round() as i32),
         yaw: cam.yaw + back.turn * 1024,
-        fog_near: own.fog_near + away,
-        fog_far: own.fog_far + away,
+        fog_near: (shift + near / far * there) as i32,
+        fog_far: (shift + there) as i32,
         torch: [0.0; 3],
         ..*cam
     }
@@ -2076,7 +2100,7 @@ fn build_scene(mut commands: Commands, mut sim: ResMut<Sim>, mut parts: ResMut<P
     for i in 0..wanted.len() {
         let id = wanted[i];
         // Seen only through the doorway it's joined at.
-        let clip = if i > 0 { sim.portal(&sim.beside[i - 1]).into_iter().map(engine::render::view_plane).collect() } else { Vec::new() };
+        let look = if i > 0 { sim.placed(&sim.beside[i - 1]) } else { Default::default() };
         let (scene, at, prepared) = match i {
             0 => (&sim.level.scene, None, None),
             _ => {
@@ -2103,18 +2127,18 @@ fn build_scene(mut commands: Commands, mut sim: ResMut<Sim>, mut parts: ResMut<P
                 commands.entity(*e).insert(Of(id));
             }
             let things = scene.things.parts.iter().map(|p| p.version).collect();
-            parts.levels.insert(id, LevelParts { lit, meshes, things, placed: None, people: None, clip: Vec::new() });
+            parts.levels.insert(id, LevelParts { lit, meshes, things, placed: None, people: None, look: Default::default() });
         }
         let Some(p) = parts.levels.get_mut(&id) else { continue };
-        if p.placed != Some(at) || (at.is_some() && p.clip != clip) {
+        if p.placed != Some(at) || (at.is_some() && p.look != look) {
             for &e in p.meshes.parts.iter().chain(&p.meshes.people) {
                 match &at {
-                    Some(place) => commands.entity(e).insert((engine::render::placed_transform(place), engine::render::Placed { clip: clip.clone() })),
+                    Some(place) => commands.entity(e).insert((engine::render::placed_transform(place), look.clone())),
                     None => commands.entity(e).insert(Transform::IDENTITY).remove::<engine::render::Placed>(),
                 };
             }
             p.placed = Some(at);
-            p.clip = clip;
+            p.look = look;
         }
         // The walked level's people are drawn as they move, when something moves them.
         let people = at.is_some() || !scene.creatures_move;

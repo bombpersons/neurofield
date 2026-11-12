@@ -70,6 +70,7 @@ pub(super) const OPAQUE_ONLY: u32 = 128;
 pub(super) const PALETTE: u32 = 256;
 const DEPTH_CUE: u32 = 512;
 const CLIP: u32 = 1024;
+const BEYOND: u32 = 2048;
 /// The most clipping planes a [`PsxMaterial`] takes.
 pub const MAX_CLIPS: usize = 6;
 /// Bits 12-14: the blend mode, as [`blend_code`].
@@ -227,6 +228,8 @@ pub struct PsxMaterial {
     /// Draw only where the world position `p` has `c.xyz · p + c.w >= 0` for each plane `c`
     /// (up to [`MAX_CLIPS`]; more are ignored): what's seen through a doorway, say.
     pub clip: Vec<Vec4>,
+    /// With `fog`, a surface standing in air other than the camera's: see [`PsxBeyond`].
+    pub beyond: Option<PsxBeyond>,
     /// Dither this surface when [`PsxLook::dither`] is on. The GPU dithers
     /// shaded and texture-modulated polygons; raw-textured ones were not.
     pub dither: bool,
@@ -262,6 +265,7 @@ impl Default for PsxMaterial {
             fog: true,
             depth_cue: None,
             clip: Vec::new(),
+            beyond: None,
             dither: true,
             double_sided: false,
             cutout: true,
@@ -282,6 +286,21 @@ impl PsxMaterial {
     }
 }
 
+/// Fog for a surface past a doorway into other air (another level's, say), for a camera
+/// whose `DistanceFog` is linear. Each stretch of the line from the camera counts by its own
+/// air's fog end: the part on the camera's side of `plane` by the camera's, the part past it
+/// (where `c.xyz · p + c.w >= 0`) by `far`. Summed, the camera's fog curve takes them (its
+/// start as a share of its end); the colour is each air's, by its share. Where both airs fog
+/// alike in shape (start over end), it doesn't matter which side the camera stands.
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+pub struct PsxBeyond {
+    pub plane: Vec4,
+    /// Where the fog past the plane is full, in scene units.
+    pub far: f32,
+    /// What fog fades to past the plane (sRGB, like `DistanceFog`'s).
+    pub color: Color,
+}
+
 #[derive(Clone, Default, ShaderType)]
 pub struct PsxUniform {
     pub color: Vec4,
@@ -290,6 +309,9 @@ pub struct PsxUniform {
     pub far_color: Vec4,
     pub clip: [Vec4; MAX_CLIPS],
     pub clip_count: u32,
+    pub beyond_plane: Vec4,
+    /// rgb (sRGB) and the fog's far end.
+    pub beyond_fog: Vec4,
     pub light_dirs: [Vec4; MAX_LIGHTS],
     pub light_colors: [Vec4; MAX_LIGHTS],
     pub light_count: u32,
@@ -312,6 +334,11 @@ impl AsBindGroupShaderType<PsxUniform> for PsxMaterial {
             far_color,
             clip: std::array::from_fn(|i| self.clip.get(i).copied().unwrap_or(Vec4::ZERO)),
             clip_count: self.clip.len().min(MAX_CLIPS) as u32,
+            beyond_plane: self.beyond.map_or(Vec4::ZERO, |b| b.plane),
+            beyond_fog: self.beyond.map_or(Vec4::ZERO, |b| {
+                let c = b.color.to_srgba();
+                Vec4::new(c.red, c.green, c.blue, b.far.max(1e-4))
+            }),
             light_dirs: self.lighting.directions.map(|d| d.extend(0.0)),
             light_colors: self.lighting.colors.map(|c| c.extend(0.0)),
             light_count: self.lighting.count,
@@ -320,6 +347,7 @@ impl AsBindGroupShaderType<PsxUniform> for PsxMaterial {
                 | flag(self.fog && depth_cue.is_none(), FOG)
                 | flag(depth_cue.is_some(), DEPTH_CUE)
                 | flag(!self.clip.is_empty(), CLIP)
+                | flag(self.beyond.is_some(), BEYOND)
                 | flag(self.look.dither && self.dither, DITHER)
                 | flag(self.look.vertex_snap, SNAP)
                 | flag(self.cutout, CUTOUT)

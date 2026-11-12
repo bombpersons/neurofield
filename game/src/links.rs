@@ -48,7 +48,9 @@ pub fn joins(from: &Path, l: &LinkAt) -> PathBuf {
 pub fn load(file: &Path, start: Option<([f32; 3], f32)>, respawn: bool, rng: &mut Rng) -> Result<Loaded, String> {
     let level = engine::world::level::Level::load(file)?;
     let start = start.or_else(|| if respawn { level.respawn() } else { None });
-    let built = Level::from_file(&level, start, rng).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut built = Level::from_file(&level, start, rng).map_err(|e| format!("{}: {e}", file.display()))?;
+    // The level's own fog, so levels that join fog alike (see `Sim::beyond`).
+    built.walker.set_fog(level.fog);
     let lying = drops::of_level(&built.scene, &level);
     Ok(Loaded { file: whole(file), lying, links: level.links(), level: built, meshes: meshes(), prepared: None })
 }
@@ -229,6 +231,11 @@ mod tests {
                 let strip = l.strip();
                 let theirs = b.place.point([(back.doorway().0 as f32 + 0.5) * 256.0, back.pos[1], (back.doorway().1 as f32 + 0.5) * 256.0]);
                 assert_eq!(((theirs[0] / 256.0).floor() as i32, (theirs[2] / 256.0).floor() as i32), strip, "{name}'s {}", l.name);
+                // The holes are alike, else one side sees past the other's into what's solid.
+                let hole = |scene: &engine::world::scene::Scene, id: u32| scene.doorways.iter().find(|d| d.link.id == id).map(|d| (d.floor, d.ceiling)).unwrap();
+                let (mine, far) = (hole(&here.level.scene, l.id), hole(&b.loaded.level.scene, back.id));
+                let up = b.place.point([0.0; 3])[1];
+                assert!((mine.0 - far.0 - up).abs() < 1.0 && (mine.1 - far.1 - up).abs() < 1.0, "{name}'s {} is {mine:?} high, the far side's {far:?}", l.name);
             }
         }
     }

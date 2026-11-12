@@ -27,6 +27,8 @@ struct PsxUniform {
     far_color: vec4<f32>,
     clip: array<vec4<f32>, MAX_CLIPS>,
     clip_count: u32,
+    beyond_plane: vec4<f32>,
+    beyond_fog: vec4<f32>,
     light_dirs: array<vec4<f32>, MAX_LIGHTS>,
     light_colors: array<vec4<f32>, MAX_LIGHTS>,
     light_count: u32,
@@ -43,6 +45,7 @@ const FLAG_STP_TEXEL: u32 = 64u;
 const FLAG_OPAQUE_ONLY: u32 = 128u;
 const FLAG_DEPTH_CUE: u32 = 512u;
 const FLAG_CLIP: u32 = 1024u;
+const FLAG_BEYOND: u32 = 2048u;
 const BLEND_SHIFT: u32 = 12u;
 const BLEND_HALF: u32 = 1u;
 const BLEND_ADD: u32 = 2u;
@@ -203,14 +206,34 @@ fn fragment(in: PsxVarying) -> @location(0) vec4<f32> {
     if has(FLAG_FOG) {
         let distance = length(in.world - view.world_position);
         var f = 0.0;
-        if fog.mode == 1u {
+        var fog_rgb = linear_to_srgb(fog.base_color.rgb);
+        if fog.mode == 1u && has(FLAG_BEYOND) {
+            // The stretch of the line past the plane, in the other air (`PsxBeyond`).
+            let p = material.beyond_plane;
+            let se = dot(p.xyz, view.world_position) + p.w;
+            let sf = dot(p.xyz, in.world) + p.w;
+            var there = 0.0;
+            if se >= 0.0 && sf >= 0.0 {
+                there = distance;
+            } else if se < 0.0 && sf >= 0.0 {
+                there = distance * sf / (sf - se);
+            } else if se >= 0.0 && sf < 0.0 {
+                there = distance * se / (se - sf);
+            }
+            let end = max(fog.be.y, 0.0001);
+            let u_there = there / material.beyond_fog.w;
+            let u = (distance - there) / end + u_there;
+            let start = min(fog.be.x / end, 0.99);
+            f = saturate((u - start) / (1.0 - start));
+            fog_rgb = mix(fog_rgb, material.beyond_fog.rgb, u_there / max(u, 0.0001));
+        } else if fog.mode == 1u {
             f = saturate((distance - fog.be.x) / max(fog.be.y - fog.be.x, 0.0001));
         } else if fog.mode == 2u {
             f = 1.0 - exp(-fog.be.x * distance);
         } else if fog.mode == 3u {
             f = 1.0 - exp(-pow(fog.be.x * distance, 2.0));
         }
-        rgb = mix(rgb, linear_to_srgb(fog.base_color.rgb), f);
+        rgb = mix(rgb, fog_rgb, f);
     }
 
     // 15-bit colour at 8-bit precision, dithered like the GPU.

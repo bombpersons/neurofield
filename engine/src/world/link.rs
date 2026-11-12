@@ -92,6 +92,12 @@ impl Doorway {
         [at(-1.0, self.floor), at(1.0, self.floor), at(1.0, self.ceiling), at(-1.0, self.ceiling)]
     }
 
+    /// The plane of the doorway's edge, positive past it.
+    pub fn edge(&self) -> [f32; 4] {
+        let f = self.link.facing();
+        [f[0], 0.0, f[1], -(f[0] * self.link.pos[0] + f[1] * self.link.pos[2])]
+    }
+
     /// Planes (x, y, z, d: a point p is kept where n · p + d >= 0, world units) that keep
     /// only what an eye at `eye` sees through the hole: past the edge, and inside the lines
     /// of sight past its sides. With the eye in the hole itself, past the edge alone.
