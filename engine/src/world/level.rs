@@ -306,13 +306,16 @@ pub enum EntityKind {
         count: u32,
     },
     Creature { kind: Kind, size: f32, seed: u64 },
-    /// Someone: as `look` says, or else as `seed` makes them up.
+    /// Someone: as `look` says, or else as `seed` makes them up, and wearing `wear` over it
+    /// (a guard's armour, say).
     Person {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         look: Option<crate::world::person::Look>,
         seed: u64,
         #[serde(default)]
         role: crate::world::person::Role,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wear: Vec<crate::world::clothes::Wear>,
     },
     /// `size` is (width, height, depth) in world units.
     Prop { shape: PropShape, size: [f32; 3], tex: u8, tint: [f32; 3] },
@@ -715,8 +718,9 @@ impl Level {
                     scene.add_box([x, floor, z], crate::world::things::CHEST, crate::world::things::CHEST_BODY, e.yaw, 2, [0.7, 0.55, 0.4]);
                     scene.span_mut(n).blocked = true;
                 }
-                EntityKind::Person { look, seed, role } => {
-                    let look = look.unwrap_or_else(|| crate::world::person::Look::random(*seed));
+                EntityKind::Person { look, seed, role, wear } => {
+                    let mut look = look.clone().unwrap_or_else(|| crate::world::person::Look::random(*seed));
+                    look.clothes.extend(wear.iter().copied());
                     scene.add_person(look, *role, [x, floor, z], e.yaw, *seed);
                 }
                 // Items are the game's to draw and pick up.

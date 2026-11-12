@@ -10,6 +10,7 @@
 
 use crate::world::animate::{Animator, Fidget};
 use crate::world::creature::{scale, sub, Creature, Part, Placed, Shape, Skin};
+use crate::world::clothes::{self, Bone, Cover, Wear};
 use crate::world::face::{self, Features, Mouth};
 use crate::world::hair::{self, Hair, HairTri};
 use crate::world::rng::Rng;
@@ -48,7 +49,7 @@ const HEAD_ALONG: usize = 9;
 const FACE_FROM: f32 = 0.2;
 
 /// What someone looks like.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Look {
     /// Head to foot, in tiles (the player's eyes are at 0.62).
     pub height: f32,
@@ -61,6 +62,9 @@ pub struct Look {
     pub skin: [f32; 3],
     pub face: Features,
     pub hair: Hair,
+    /// What they wear, over the bare body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clothes: Vec<Wear>,
 }
 
 impl Look {
@@ -75,7 +79,8 @@ impl Look {
             [0.44, 0.3, 0.22],
         ]);
         let hair = Hair::random(&mut rng);
-        Look { height: rng.fr(0.62, 0.74), build: rng.f(), chibi: 0.0, skin, face: Features::random(&mut rng, hair.colour), hair }
+        let face = Features::random(&mut rng, hair.colour);
+        Look { height: rng.fr(0.62, 0.74), build: rng.f(), chibi: 0.0, skin, face, hair, clothes: clothes::outfit(&mut rng) }
     }
 }
 
@@ -106,6 +111,24 @@ pub struct Bones {
     pub thighs: [usize; 2],
     pub shins: [usize; 2],
     pub feet: [usize; 2],
+}
+
+impl Bones {
+    /// The parts that are `bone`.
+    pub fn of(&self, bone: Bone) -> Vec<usize> {
+        match bone {
+            Bone::Pelvis => vec![self.pelvis],
+            Bone::Torso => vec![self.torso],
+            Bone::Neck => vec![self.neck],
+            Bone::Head => vec![self.head],
+            Bone::UpperArm => self.upper_arms.to_vec(),
+            Bone::Forearm => self.forearms.to_vec(),
+            Bone::Hand => self.hands.to_vec(),
+            Bone::Thigh => self.thighs.to_vec(),
+            Bone::Shin => self.shins.to_vec(),
+            Bone::Foot => self.feet.to_vec(),
+        }
+    }
 }
 
 /// Someone in a scene.
@@ -259,7 +282,7 @@ pub fn body(look: &Look, base: [f32; 3], yaw: f32) -> (Creature, Bones) {
         .bulge(0.06 * look.build + 0.12 * k);
     let torso = add(torso);
     let neck = add(Part::new(Shape::Capsule, [m(0.019, 0.024), m(0.035, 0.02), m(0.019, 0.024)], 0).on(torso, 0.88 + 0.04 * k, 0.0, 0.0));
-    let head = add(Part::new(Shape::Ellipsoid, [m(0.07, 0.15), m(0.083, 0.15), m(0.075, 0.14)], 0).on(neck, 0.8, 0.0, 0.0).pivot([0.0, -0.75 - 0.1 * k, -0.08 + 0.03 * k]));
+    let head = add(Part::new(Shape::Ellipsoid, [m(0.078, 0.15), m(0.092, 0.15), m(0.083, 0.14)], 0).on(neck, 0.8, 0.0, 0.0).pivot([0.0, -0.75 - 0.1 * k, -0.08 + 0.03 * k]));
     let mut ears = [0; 2];
     for (i, around) in [0.0, 0.5].into_iter().enumerate() {
         ears[i] = add(Part::new(Shape::Ellipsoid, [m(0.008, 0.012), m(0.017, 0.024), m(0.011, 0.016)], 0).on(head, -0.1 * k, around, 0.95).pivot([0.0; 3]));
@@ -369,10 +392,29 @@ impl Scene {
             let c = &person.body;
             let skin = &c.skins[0];
             let placed = c.pose();
+            // The clothes, inside out; what they cover end to end isn't drawn, and a covered
+            // head keeps only the hair that hangs below the cover's rim.
+            let mut hidden = vec![false; c.parts.len()];
+            let mut rim = f32::MAX;
+            let mut worn: Vec<_> = person.look.clothes.iter().map(|w| (w, w.kind.garment())).collect();
+            worn.sort_by_key(|(_, g)| g.layer);
+            for (wear, g) in &worn {
+                let tint = wear.colour.unwrap_or(g.colour);
+                for cover in &g.covers {
+                    for k in person.bones.of(cover.bone) {
+                        let puff = cover.puff + 0.06 * g.layer as f32;
+                        self.cover_tris(&c.parts[k], &placed[k], c.base[1], cover, puff, g.cloth.tex(), tint, &mut out);
+                        hidden[k] |= cover.from <= -1.0 && cover.to >= 1.0 && cover.flare == 0.0 && k != person.bones.head;
+                        if k == person.bones.head {
+                            rim = rim.min(cover.from);
+                        }
+                    }
+                }
+            }
             for (k, (p, at)) in c.parts.iter().zip(&placed).enumerate() {
                 if k == person.bones.head {
                     self.head_tris(p, at, skin, Scene::face_tex_id(i), &mut out);
-                } else {
+                } else if !hidden[k] {
                     self.low_poly_part(p, at, skin, tex::PERSON_SKIN, BODY_SIDES, &mut out);
                 }
             }
@@ -380,7 +422,7 @@ impl Scene {
             let half = c.parts[person.bones.head].half;
             let tint = person.look.hair.colour;
             let alb = tint.map(|c| (c * 128.0).clamp(0.0, 255.0) as u8);
-            for t in &person.hair {
+            for t in person.hair.iter().filter(|t| t.p.iter().all(|p| p[1] < rim)) {
                 let pos = t.p.map(|q| at.world([q[0] * half[0], q[1] * half[1], q[2] * half[2]]));
                 let nrm = t.n.map(|n| norm(apply(at.axes, [n[0] / half[0], n[1] / half[1], n[2] / half[2]])));
                 let uv = |k: usize| t.uv[k].map(|c| (c.clamp(0.0, 1.0) * 63.0).round() as u8);
@@ -388,6 +430,51 @@ impl Scene {
             }
         }
         out
+    }
+
+    /// A garment's shell over one part: rings round its axis from `cover.from` to `cover.to`,
+    /// `puff` off its surface and flaring toward the far end, never down through the `floor`.
+    #[allow(clippy::too_many_arguments)]
+    fn cover_tris(&self, p: &Part, at: &Placed, floor: f32, cover: &Cover, puff: f32, tex: u8, tint: [f32; 3], out: &mut Vec<Tri>) {
+        const SIDES: usize = 8;
+        let widest = p.widest();
+        // A cover running on past the part (a skirt) keeps to above the floor.
+        let down = at.axes[1][1];
+        let to = if cover.to > 1.0 && down > 0.3 { cover.to.min((floor - 3.0 - at.centre[1]) / (p.half[1] * down)) } else { cover.to };
+        // Rings where the body's own rows are (so the shell stays outside it), at the ends,
+        // and every half-length past the part's end.
+        let mut ts = vec![cover.from];
+        let body = (0..=BODY_SIDES.1).map(|k| k as f32 / BODY_SIDES.1 as f32 * 2.0 - 1.0);
+        ts.extend(body.chain((1..20).map(|k| 1.0 + k as f32 * 0.5)).filter(|&t| t > cover.from + 0.05 && t < to - 0.05));
+        ts.push(to);
+        let rows = ts.len() - 1;
+        let ring = |t: f32| {
+            let past = cover.to > 1.0 && t > 0.0;
+            let r = if past { widest } else { p.profile(t.clamp(-1.0, 1.0)) };
+            r * (1.0 + puff) + cover.flare * widest * ((t - cover.from) / (to - cover.from)).max(0.0)
+        };
+        let (mut pos, mut nrm) = (Vec::with_capacity((rows + 1) * (SIDES + 1)), Vec::with_capacity((rows + 1) * (SIDES + 1)));
+        for &t in &ts {
+            let r = ring(t);
+            for j in 0..=SIDES {
+                let a = j as f32 / SIDES as f32 * std::f32::consts::TAU;
+                pos.push(at.world([r * p.half[0] * a.cos(), t * p.half[1], r * p.half[2] * a.sin()]));
+                nrm.push(norm(apply(at.axes, [a.cos() / p.half[0], 0.0, a.sin() / p.half[2]])));
+            }
+        }
+        let cols: Vec<[u8; 3]> = pos.iter().zip(&nrm).map(|(q, &n)| self.shade(q.map(|c| c.round() as i32), n, tint)).collect();
+        let alb = tint.map(|c| (c * 128.0).clamp(0.0, 255.0) as u8);
+        // The cloth twice round, once down.
+        const HALF: usize = SIDES / 2;
+        for k in 0..rows {
+            for j in 0..SIDES {
+                let v = |kk: usize, jj: usize| (kk * (SIDES + 1) + jj, [(63 * (jj - j / HALF * HALF) / HALF) as u8, (63 * kk / rows) as u8]);
+                let q = [v(k, j), v(k, j + 1), v(k + 1, j), v(k + 1, j + 1)];
+                for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
+                    out.extend(self.creature_tri_of([q[a], q[b], q[c]], &pos, &nrm, Some(&cols), tex, tint, alb));
+                }
+            }
+        }
     }
 
     /// A head, `HEAD_AROUND` by `HEAD_ALONG`: its front wears the face (`face_tex`) laid flat

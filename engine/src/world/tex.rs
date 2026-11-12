@@ -26,11 +26,13 @@ pub const STRANGE_STEPS: usize = 8;
 /// First texture id of the baked strange steps: step k (1..) of slot s is
 /// `STRANGE_BASE + (k - 1) * STRANGE_SLOTS + s`.
 pub const STRANGE_BASE: u8 = 64;
-/// People's textures (`person`), each its own image: the body's skin, the hair, then each
-/// person's face, `FACE_BASE + i` for the scene's person i.
+/// People's textures (`person`), each its own image: the body's skin, the hair, the clothes'
+/// cloths, then each person's face, `FACE_BASE + i` for the scene's person i.
 pub const PERSON_SKIN: u8 = 128;
 pub const PERSON_HAIR: u8 = 129;
-pub const FACE_BASE: u8 = 130;
+/// Clothes' cloths (`clothes::CLOTHS`).
+pub const CLOTH_BASE: u8 = 130;
+pub const FACE_BASE: u8 = 140;
 
 /// Dark and light ends of each texture's 16-step palette.
 const PALETTES: [([u8; 3], [u8; 3]); N] = [

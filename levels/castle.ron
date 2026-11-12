@@ -1028,7 +1028,7 @@ Level(
         Entity(id: 50, kind: Person(seed: 11, role: Stand), pos: (2124.8, 0.0, 3072.0), yaw: -1.571),
         Entity(id: 51, kind: Person(seed: 25, role: Stand), pos: (2124.8, 0.0, 4224.0), yaw: -1.571),
         Entity(id: 52, kind: Person(seed: 37, role: Stand), pos: (6067.2, 0.0, 3200.0), yaw: 1.571),
-        Entity(id: 53, kind: Person(seed: 42, role: Guard), pos: (3737.6, 0.0, 1996.8), yaw: 0.000),
+        Entity(id: 53, kind: Person(seed: 42, role: Guard, wear: [Wear(kind: LeatherCap), Wear(kind: LeatherVest), Wear(kind: WorkGloves)]), pos: (3737.6, 0.0, 1996.8), yaw: 0.000),
         Entity(id: 54, kind: Person(seed: 5, role: Wander), pos: (3584.0, 0.0, 3328.0), yaw: 1.000),
         Entity(id: 55, kind: Person(seed: 8, role: Wander), pos: (4608.0, 0.0, 4352.0), yaw: 2.500),
         Entity(id: 56, kind: Person(seed: 19, role: Wander), pos: (3072.0, 0.0, 4864.0), yaw: -1.000),

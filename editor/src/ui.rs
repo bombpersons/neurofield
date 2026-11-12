@@ -1560,7 +1560,7 @@ fn entity_properties(
                 });
                 ui.end_row();
             }
-            EntityKind::Person { look, seed, role } => {
+            EntityKind::Person { look, seed, role, wear } => {
                 use engine::world::person::Role;
                 ui.label("role");
                 ui.horizontal(|ui| {
@@ -1580,6 +1580,21 @@ fn entity_properties(
                     let mut own = look.is_some();
                     if ui.checkbox(&mut own, "keep").changed() {
                         *look = own.then(|| engine::world::person::Look::random(*seed));
+                    }
+                });
+                ui.end_row();
+                // Armour over their clothes.
+                use engine::world::clothes::{Kind as Garment, Wear};
+                ui.label("wears");
+                ui.horizontal_wrapped(|ui| {
+                    for g in [Garment::LeatherCap, Garment::LeatherVest, Garment::WorkGloves, Garment::CopperRing] {
+                        let mut on = wear.iter().any(|w| w.kind == g);
+                        if ui.toggle_value(&mut on, format!("{g:?}")).changed() {
+                            wear.retain(|w| w.kind != g);
+                            if on {
+                                wear.push(Wear::of(g));
+                            }
+                        }
                     }
                 });
                 ui.end_row();

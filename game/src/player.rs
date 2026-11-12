@@ -503,6 +503,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn everything_worn_on_the_body_can_be_worn_by_people() {
+        // Armour and the like (not what's held) dress anyone, the player too (`clothes`).
+        for item in Item::ALL {
+            let worn = item.slot().is_some_and(|s| !s.hand());
+            assert_eq!(engine::world::clothes::Kind::for_item(item.name()).is_some(), worn, "{}", item.name());
+        }
+    }
+
+    #[test]
     fn levels_name_the_same_items() {
         let names: Vec<&str> = Item::ALL.iter().map(|i| i.name()).collect();
         assert_eq!(names, engine::world::level::ITEMS);

@@ -165,7 +165,7 @@ pub fn entity_kinds() -> Vec<(&'static str, EntityKind)> {
         ("Prop", EntityKind::Prop { shape: PropShape::Box, size: [80.0, 120.0, 80.0], tex: 2, tint: [0.8, 0.75, 0.7] }),
         ("Lever", EntityKind::Lever { targets: Vec::new() }),
         ("Item", EntityKind::Item { name: engine::world::level::ITEMS[0].into(), count: 1 }),
-        ("Person", EntityKind::Person { look: None, seed: 1, role: engine::world::person::Role::Wander }),
+        ("Person", EntityKind::Person { look: None, seed: 1, role: engine::world::person::Role::Wander, wear: Vec::new() }),
     ]
 }
 

@@ -389,6 +389,10 @@ fn spawn_people(
                     (tex::PERSON_SKIN, _) => (crate::world::person::skin_texture(), false),
                     // Hair is seen from inside where it falls.
                     (tex::PERSON_HAIR, _) => (crate::world::hair::texture(), true),
+                    (c, _) if (tex::CLOTH_BASE..tex::FACE_BASE).contains(&c) => {
+                        let Some(&cloth) = crate::world::clothes::CLOTHS.get((c - tex::CLOTH_BASE) as usize) else { continue };
+                        (crate::world::clothes::texture(cloth), false)
+                    }
                     (_, Some(p)) => (tex::Texture { idx: p.face_tex.idx.clone(), pal: p.face_tex.pal }, false),
                     _ => continue,
                 };
