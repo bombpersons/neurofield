@@ -139,7 +139,10 @@ pub fn check(l: &Level, scene: &Scene) -> (Vec<Issue>, Option<Budget>) {
             let solved = solve(l, scene, start, &gates);
             keys(l, scene, &solved, start, &gates, &mut out);
             places(l, scene, &solved, &gates, &mut out);
-            budget_views = budget(l, scene, &solved.reach);
+            // The network never draws the waking world.
+            if l.plain.is_none() {
+                budget_views = budget(l, scene, &solved.reach);
+            }
         }
     }
     creatures(l, scene, &mut out);

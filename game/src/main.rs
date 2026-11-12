@@ -141,6 +141,8 @@ struct Sim {
     panel: bool,
     net_ms: f32,
     herd: engine::world::animate::Herd,
+    /// The people's animators.
+    people: engine::world::person::People,
     tris: usize,
     /// The network's frame width, following the window's shape (`layout`).
     width: u32,
@@ -212,9 +214,15 @@ impl Sim {
         self.look += 1;
     }
 
+    /// Whether the level is of the waking world (the castle): only ever the PS1 picture,
+    /// never strange, its creatures moving and seen as they are.
+    fn plain(&self) -> bool {
+        self.level.scene.sky.is_some()
+    }
+
     /// What is on the screen, once any fade is over: with clarity, the dungeon as it is.
     fn shown(&self) -> Mode {
-        if self.veil >= 1.0 && self.mode == Mode::Network { Mode::Raster } else { self.mode }
+        if self.plain() || (self.veil >= 1.0 && self.mode == Mode::Network) { Mode::Raster } else { self.mode }
     }
 
     /// Whether the rasteriser is needed, showing through a fade as well.
@@ -225,7 +233,7 @@ impl Sim {
     /// Whether a clear seeing potion has the dream draining, gone, or coming back: then the
     /// creatures are seen as they really are, as PS1 models.
     fn seeing_clearly(&self) -> bool {
-        self.calm > 0.0
+        self.calm > 0.0 || self.plain()
     }
 
     /// Clarity drains the strangeness with the network still drawing, then fades to the
@@ -304,7 +312,7 @@ impl Sim {
             self.sculpted = Some(engine::world::dreamed::sculpt(&mut self.level.scene, self.rng.next() as u64, Some(dir)));
             self.strangeness = self.level.scene.strange.base;
         }
-        let moving = self.growths.is_some();
+        let moving = self.growths.is_some() || self.plain();
         self.level.scene.set_creatures_move(moving);
         self.relight();
         self.level.set_strange_amount(1.0 - self.calm);
@@ -673,7 +681,7 @@ fn main() {
     let strangeness = level.scene.strange.base;
     let growths = dream.is_some().then(|| Growths::new(&level.scene));
     // The herd walks the dream creatures about, so the rasteriser draws them as they stand.
-    level.scene.set_creatures_move(dream.is_some());
+    level.scene.set_creatures_move(dream.is_some() || level.scene.sky.is_some());
 
     let mut player = Player::new();
     if let Some(a) = opts.get("affliction") {
@@ -739,6 +747,7 @@ fn main() {
             panel: false,
             net_ms: 0.0,
             herd: Default::default(),
+            people: Default::default(),
             foes: Default::default(),
             cues: Vec::new(),
             peaceful,
@@ -774,7 +783,7 @@ fn main() {
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
-        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, pose_creatures, raster_camera, status, update_hud, auto_screenshot).chain())
+        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, pose_creatures, pose_people, raster_camera, status, update_hud, auto_screenshot).chain())
         .add_systems(Update, egui_on_display)
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
@@ -1238,7 +1247,8 @@ fn walk(key: Res<ButtonInput<KeyCode>>, pad: Res<ControllerState>, mut sim: ResM
     let most = 1.0 / TICK as f32 / FEEL_SECS;
     sim.felt += (sim.player.affliction - sim.felt).clamp(-most, most);
     let wanted = effects::growth(sim.showing());
-    if let Some(growths) = &mut sim.growths {
+    let plain = sim.plain();
+    if let Some(growths) = sim.growths.as_mut().filter(|_| !plain) {
         let cam = sim.level.walker.camera();
         if let Some(lash) = growths.update(&sim.level.scene, &cam, wanted, 1.0 / TICK as f32, &mut sim.rng) {
             if !sim.auto_walk {
@@ -1333,11 +1343,14 @@ fn draw(
         let dt = time.delta_secs();
         sim.effects.iter_mut().flatten().for_each(|t| *t += dt);
         sim.dream_time += dt;
-        if dream.is_some() {
+        if dream.is_some() || sim.plain() {
             let sim = &mut *sim;
             sim.herd.player = (!sim.auto_walk).then(|| sim.feet().0);
             let cues = sim.herd.update(&mut sim.level.scene, sim.version, dt);
             sim.cues.extend(cues);
+            let eye = sim.level.walker.camera().pos.map(|c| c as f32);
+            let player = (!sim.auto_walk).then(|| (sim.feet().0, eye));
+            sim.people.update(&mut sim.level.scene, sim.version, player, dt);
         }
     }
     if sim.shown() != Mode::Raster {
@@ -1528,6 +1541,39 @@ fn pose_creatures(
     };
     let tris = scene.low_poly_creatures(in_view);
     *shown = gfx.spawn_creatures(&mut commands, scene, &tris, &mut skins.1);
+}
+
+/// The people as they stand this frame, through the PS1 pipeline, when they move.
+fn pose_people(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    mut shown: Local<Vec<Entity>>,
+    // Their materials, for the level `Sim::version`.
+    mut looks: Local<(u64, engine::render::PeopleLooks)>,
+    mut gfx: engine::render::Gfx,
+) {
+    for e in shown.drain(..) {
+        commands.entity(e).despawn();
+    }
+    let scene = &sim.level.scene;
+    if !scene.creatures_move || !sim.raster_on() || scene.people.is_empty() {
+        return;
+    }
+    if looks.0 != sim.version {
+        *looks = (sim.version, Default::default());
+    }
+    let cam = sim.level.walker.camera();
+    let eye = cam.pos.map(|c| c as f32);
+    let ahead = engine::world::view::view_matrix(&cam).m[2].map(|e| e as f32 / 4096.0);
+    let reach = cam.fog_far as f32 + CREATURE_REACH;
+    let in_view = |p: &engine::world::person::Person| {
+        let b = p.body.base;
+        let d = [b[0] - eye[0], b[1] - eye[1], b[2] - eye[2]];
+        let far = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        far < reach && d[0] * ahead[0] + d[1] * ahead[1] + d[2] * ahead[2] > -CREATURE_REACH
+    };
+    let tris = scene.people_tris(in_view);
+    *shown = gfx.spawn_people(&mut commands, scene, &tris, &mut looks.1);
 }
 
 /// The level camera follows the walker; it rests while only the network is shown.

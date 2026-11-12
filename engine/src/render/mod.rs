@@ -13,6 +13,7 @@
 
 pub mod flesh;
 pub mod headless;
+pub mod sky;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::system::SystemParam;
@@ -186,22 +187,26 @@ struct PartVert {
 #[derive(Resource)]
 pub struct LevelTextures {
     base: Vec<tex::Texture>,
-    materials: HashMap<u8, Handle<PsxMaterial>>,
+    /// The drawn textures, never photos, for the waking world (`Scene::sky`).
+    drawn: Vec<tex::Texture>,
+    /// By texture id, and whether drawn.
+    materials: HashMap<(u8, bool), Handle<PsxMaterial>>,
 }
 
 impl LevelTextures {
     /// For the level textures as loaded now (call after `tex::load_level` / `load_strange`).
     pub fn new() -> LevelTextures {
-        LevelTextures { base: tex::make_all(), materials: HashMap::new() }
+        LevelTextures { base: tex::make_all(), drawn: tex::make_drawn(), materials: HashMap::new() }
     }
 
-    fn material(&mut self, id: u8, images: &mut Assets<Image>, materials: &mut Assets<PsxMaterial>) -> Option<Handle<PsxMaterial>> {
-        if let Some(m) = self.materials.get(&id) {
+    /// Texture `id`'s material, from the drawn textures for the waking world (`plain`).
+    fn material(&mut self, id: u8, plain: bool, images: &mut Assets<Image>, materials: &mut Assets<PsxMaterial>) -> Option<Handle<PsxMaterial>> {
+        if let Some(m) = self.materials.get(&(id, plain)) {
             return Some(m.clone());
         }
-        let t = tex::level_texture(&self.base, id)?;
+        let t = tex::level_texture(if plain { &self.drawn } else { &self.base }, id)?;
         let m = materials.add(material(images.add(image(t))));
-        self.materials.insert(id, m.clone());
+        self.materials.insert((id, plain), m.clone());
         Some(m)
     }
 }
@@ -282,6 +287,13 @@ impl Gfx<'_> {
         out
     }
 
+    /// People as they are this frame (`Scene::people_tris`), one mesh per texture; `looks`
+    /// keeps their materials from frame to frame, redrawing a face's image when it changes,
+    /// and must be emptied for a new scene.
+    pub fn spawn_people(&mut self, commands: &mut Commands, scene: &Scene, tris: &[Tri], looks: &mut PeopleLooks) -> Vec<Entity> {
+        spawn_people(commands, &mut self.meshes, &mut self.images, &mut self.materials, &self.torch, scene, tris, looks)
+    }
+
     /// Triangles of `fl`'s that change every frame, drawn with the skins of `material`.
     pub fn spawn_moving_flesh(
         &mut self,
@@ -318,12 +330,78 @@ impl Gfx<'_> {
 pub fn spawn(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene) -> Vec<Entity> {
     let Gfx { meshes, images, materials, flesh, occluders, textures, torch, view, layers, .. } = gfx;
     let (mut out, level) = spawn_psx(commands, meshes, images, materials, textures, scene, torch);
+    if let Some(s) = &scene.sky {
+        out.push(sky::spawn(commands, meshes, images, materials, s, scene.strange.seed));
+    }
+    // People stand still unless something moves them (and draws them as they move).
+    if !scene.creatures_move {
+        let tris = scene.people_tris(|_| true);
+        out.extend(spawn_people(commands, meshes, images, materials, torch, scene, &tris, &mut PeopleLooks::default()));
+    }
     // Kept apart, the creatures are drawn whole: nothing of the level hides them.
     let level = if layers.0 { Vec::new() } else { level };
     let occluder = occluders.add(flesh::OccluderMaterial::default());
     out.extend(flesh::spawn(commands, meshes, images, flesh, occluder, &level, scene, view));
     for i in 0..scene.things.parts.len() {
         out.extend(spawn_thing(commands, gfx, scene, i));
+    }
+    out
+}
+
+/// People's materials (`Gfx::spawn_people`): each texture's, and each face's image with the
+/// `Person::face_version` it shows.
+#[derive(Default)]
+pub struct PeopleLooks {
+    materials: HashMap<u8, Handle<PsxMaterial>>,
+    faces: HashMap<u8, (Handle<Image>, u32)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_people(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<PsxMaterial>,
+    torch: &Torch,
+    scene: &Scene,
+    tris: &[Tri],
+    looks: &mut PeopleLooks,
+) -> Vec<Entity> {
+    let mut by_tex: HashMap<u8, Vec<&Tri>> = HashMap::new();
+    for t in tris {
+        by_tex.entry(t.tex).or_default().push(t);
+    }
+    let mut out = Vec::new();
+    for (id, tris) in by_tex {
+        let person = id.checked_sub(tex::FACE_BASE).map(usize::from).and_then(|i| scene.people.get(i));
+        if let (Some(p), Some((image, shown))) = (person, looks.faces.get_mut(&id)) {
+            if *shown != p.face_version {
+                if let Some(mut im) = images.get_mut(&*image) {
+                    im.data = Some(p.face_tex.rgba());
+                }
+                *shown = p.face_version;
+            }
+        }
+        let m = match looks.materials.get(&id) {
+            Some(m) => m.clone(),
+            None => {
+                let (texture, double_sided) = match (id, person) {
+                    (tex::PERSON_SKIN, _) => (crate::world::person::skin_texture(), false),
+                    // Hair is seen from inside where it falls.
+                    (tex::PERSON_HAIR, _) => (crate::world::hair::texture(), true),
+                    (_, Some(p)) => (tex::Texture { idx: p.face_tex.idx.clone(), pal: p.face_tex.pal }, false),
+                    _ => continue,
+                };
+                let image = images.add(image(&texture));
+                if let Some(p) = person {
+                    looks.faces.insert(id, (image.clone(), p.face_version));
+                }
+                let m = materials.add(PsxMaterial { double_sided, ..material(image) });
+                looks.materials.insert(id, m.clone());
+                m
+            }
+        };
+        out.push(spawn_part(commands, meshes, &tris, m, torch).0);
     }
     out
 }
@@ -344,7 +422,7 @@ pub fn spawn_thing(commands: &mut Commands, gfx: &mut Gfx, scene: &Scene, i: usi
     }
     let mut out = Vec::new();
     for (id, tris) in groups {
-        let Some(m) = textures.material(id, images, materials) else { continue };
+        let Some(m) = textures.material(id, scene.sky.is_some(), images, materials) else { continue };
         let (e, mesh) = spawn_part(commands, meshes, &tris, m, torch);
         commands.entity(e).insert(ThingPart(i));
         out.push(e);
@@ -378,7 +456,7 @@ fn spawn_psx(
     let mut ids: Vec<_> = groups.keys().copied().collect();
     ids.sort();
     for id in ids {
-        let Some(m) = textures.material(id, images, materials) else { continue };
+        let Some(m) = textures.material(id, scene.sky.is_some(), images, materials) else { continue };
         let (e, mesh) = spawn_part(commands, meshes, &groups[&id], m, torch);
         out.push(e);
         level.push(mesh);
@@ -510,7 +588,7 @@ impl Plugin for LevelGfxPlugin {
             .init_resource::<View>()
             .init_resource::<LevelTextures>()
             .add_systems(Startup, spawn_camera)
-            .add_systems(PostUpdate, (apply_view, apply_torch).chain().before(bevy::camera::CameraUpdateSystems));
+            .add_systems(PostUpdate, (apply_view, apply_torch, sky::follow).chain().before(bevy::camera::CameraUpdateSystems));
         flesh::plugin(app);
     }
 }

@@ -175,6 +175,29 @@ pub struct Sun {
     pub colour: [f32; 3],
 }
 
+/// A solid column's height in tiles and its walls' texture (`Level::blocks`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Block {
+    pub height: i32,
+    pub tex: u8,
+}
+
+/// The sky over a level of the waking world (`Level::plain`): a gradient from `top` overhead
+/// to `horizon`, where the fog fades to the same colour, with `clouds` (0..1) of `cloud`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sky {
+    pub top: [f32; 3],
+    pub horizon: [f32; 3],
+    pub clouds: f32,
+    pub cloud: [f32; 3],
+}
+
+impl Default for Sky {
+    fn default() -> Self {
+        Sky { top: [0.25, 0.42, 0.78], horizon: [0.72, 0.8, 0.86], clouds: 0.35, cloud: [0.95, 0.95, 0.92] }
+    }
+}
+
 /// How strange each place is: a curve over depth, noise, and painted points
 /// (`Level::strange_points`), and what strangeness looks like.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -283,6 +306,14 @@ pub enum EntityKind {
         count: u32,
     },
     Creature { kind: Kind, size: f32, seed: u64 },
+    /// Someone: as `look` says, or else as `seed` makes them up.
+    Person {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        look: Option<crate::world::person::Look>,
+        seed: u64,
+        #[serde(default)]
+        role: crate::world::person::Role,
+    },
     /// `size` is (width, height, depth) in world units.
     Prop { shape: PropShape, size: [f32; 3], tex: u8, tint: [f32; 3] },
     Lever { targets: Vec<u32> },
@@ -310,11 +341,20 @@ pub struct Level {
     pub sun: Option<Sun>,
     /// Fog near and far, in tiles.
     pub fog: (f32, f32),
+    /// A level of the waking world (the castle): drawn only by the PS1 renderer with the drawn
+    /// textures, never strange, lit by day with no torch, under this sky, its fog the sky's
+    /// horizon at `fog`'s distances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plain: Option<Sky>,
     /// Paint and tint wherever no area or face paint says otherwise.
     pub surface: Surface,
     pub strangeness: Strangeness,
     /// Open runs of each column (x, z), bottom first.
     pub columns: BTreeMap<(i32, i32), Vec<Run>>,
+    /// Solid columns (x, z) under the sky that stand to their own height (tiles) and wear
+    /// their own texture: houses and walls. Others rise one tile past the level's top.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blocks: BTreeMap<(i32, i32), Block>,
     /// Texture slot of single faces, keyed by cell (x, layer, z).
     #[serde(default)]
     pub paint: BTreeMap<((i32, i32, i32), Face), u8>,
@@ -338,7 +378,9 @@ impl Level {
             ambient: [0.22, 0.2, 0.2],
             sun: None,
             fog: (2.0, 7.0),
+            plain: None,
             surface: Surface::default(),
+            blocks: BTreeMap::new(),
             strangeness: Strangeness::default(),
             columns: BTreeMap::new(),
             paint: BTreeMap::new(),
@@ -630,11 +672,20 @@ impl Level {
             None => ([0.0, 1.0, 0.0], [0.0; 3]),
         };
         let mut scene = Scene::empty(w, d, rooms, cols, Rock { height: top / 4 + 1, tex: self.surface.wall });
+        for (&(x, z), b) in &self.blocks {
+            if (0..w).contains(&x) && (0..d).contains(&z) {
+                scene.rock[(z * w + x) as usize] = Rock { height: b.height, tex: b.tex };
+            }
+        }
         scene.lights = lights;
         scene.sun_dir = sun_dir;
         scene.sun_col = sun_col;
         scene.ambient = self.ambient;
         scene.strange = self.strange();
+        scene.sky = self.plain.clone();
+        if scene.sky.is_some() {
+            scene.strange.amount = 0.0;
+        }
         scene.paint = self.paint.iter().map(|(&((x, l, z), f), &t)| (([x, l, z], f), t)).collect();
         scene.build_level();
 
@@ -663,6 +714,10 @@ impl Level {
                 EntityKind::Chest { .. } => {
                     scene.add_box([x, floor, z], crate::world::things::CHEST, crate::world::things::CHEST_BODY, e.yaw, 2, [0.7, 0.55, 0.4]);
                     scene.span_mut(n).blocked = true;
+                }
+                EntityKind::Person { look, seed, role } => {
+                    let look = look.unwrap_or_else(|| crate::world::person::Look::random(*seed));
+                    scene.add_person(look, *role, [x, floor, z], e.yaw, *seed);
                 }
                 // Items are the game's to draw and pick up.
                 EntityKind::PlayerStart

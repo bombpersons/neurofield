@@ -382,6 +382,7 @@ pub fn entity_colour(k: &EntityKind) -> Color {
     match k {
         EntityKind::PlayerStart => Color::srgb(0.2, 1.0, 0.3),
         EntityKind::Creature { .. } => Color::srgb(1.0, 0.25, 0.3),
+        EntityKind::Person { .. } => Color::srgb(1.0, 0.75, 0.55),
         EntityKind::Door { .. } => Color::srgb(0.85, 0.6, 0.3),
         EntityKind::Key { .. } => Color::srgb(1.0, 0.9, 0.2),
         EntityKind::Chest { .. } => Color::srgb(0.7, 0.45, 0.2),

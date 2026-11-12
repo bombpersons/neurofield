@@ -56,7 +56,16 @@ and it makes every editing operation simple:
 
 Outdoor areas have a **sky** flag on the top run of a column. Open cells at the top of a
 sky column draw no ceiling, and the solid around them is drawn as raised
-blocks, the way the generator does outdoors now.
+blocks, the way the generator does outdoors now. They all rise one tile past the
+level's top, unless `blocks` gives a column its own height (tiles) and wall
+texture: houses lower than a town wall, a keep with taller towers.
+
+A level of the waking world (the castle) sets `plain: Some(Sky(...))`: the game
+draws it only with the PS1 renderer and the drawn textures (never the photos),
+never strange, lit by day with no torch, under that sky (a gradient from `top` to
+`horizon` with `clouds` of `cloud`), its fog the horizon's colour at the level's
+fog distances. The editor skips the triangle budget there. `levels/castle.ron` is a
+temporary one.
 
 ### Slopes
 
@@ -166,6 +175,7 @@ default but stored as floats), a yaw, and properties that depend on its kind:
 | `Chest` | `contents` (item names, one a thing: a name twice is two of it), `locked`, `key` |
 | `Item` | `name` (an item name), `count` (1–99) |
 | `Creature` | `kind` (humanoid, beast, blob, floater, mass), `size`, `seed`, an optional skin motif, `extra_parts` |
+| `Person` | `seed`, an optional `look` of their own (height, build, skin, face features, hair), `role` (wander, stand at a stall, guard). Always drawn as a PS1 model; never fought. |
 | `Prop` | `shape` (box, pillar, pyramid, floating cube, …), size, texture, tint |
 | `Light` | as in Lights above |
 | `Lever` | `targets` (entity ids) |

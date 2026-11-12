@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::f32::consts::{PI, TAU};
 
 const TF: f32 = T as f32;
-const IDENT: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+pub(crate) const IDENT: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 /// Target mesh edge length in world units.
 const EDGE: f32 = 5.0;
 
@@ -93,7 +93,7 @@ pub struct Part {
 }
 
 impl Part {
-    fn new(shape: Shape, half: [f32; 3], skin: usize) -> Part {
+    pub(crate) fn new(shape: Shape, half: [f32; 3], skin: usize) -> Part {
         Part {
             parent: None,
             anchor: [0.0; 3],
@@ -110,43 +110,43 @@ impl Part {
         }
     }
 
-    fn on(mut self, parent: usize, t: f32, around: f32, out: f32) -> Part {
+    pub(crate) fn on(mut self, parent: usize, t: f32, around: f32, out: f32) -> Part {
         self.parent = Some(parent);
         self.anchor = [t, around, out];
         self
     }
 
-    fn root(mut self, offset: [f32; 3]) -> Part {
+    pub(crate) fn root(mut self, offset: [f32; 3]) -> Part {
         self.anchor = offset;
         self
     }
 
-    fn rot(mut self, m: M3) -> Part {
+    pub(crate) fn rot(mut self, m: M3) -> Part {
         self.rot = m;
         self
     }
 
-    fn pivot(mut self, p: [f32; 3]) -> Part {
+    pub(crate) fn pivot(mut self, p: [f32; 3]) -> Part {
         self.pivot = p;
         self
     }
 
-    fn taper(mut self, k: f32) -> Part {
+    pub(crate) fn taper(mut self, k: f32) -> Part {
         self.taper = k;
         self
     }
 
-    fn bend(mut self, k: f32) -> Part {
+    pub(crate) fn bend(mut self, k: f32) -> Part {
         self.bend = k;
         self
     }
 
-    fn bulge(mut self, k: f32) -> Part {
+    pub(crate) fn bulge(mut self, k: f32) -> Part {
         self.bulge = k;
         self
     }
 
-    fn lumps(mut self, k: f32) -> Part {
+    pub(crate) fn lumps(mut self, k: f32) -> Part {
         self.lumps = k;
         self
     }
@@ -360,7 +360,7 @@ impl Creature {
         (r, top, bottom)
     }
 
-    fn fit(&mut self, floor: f32, ceiling: f32, max_r: f32, grounded: bool) {
+    pub(crate) fn fit(&mut self, floor: f32, ceiling: f32, max_r: f32, grounded: bool) {
         let extent = Creature::extent;
         let (r, top, bottom) = extent(self);
         let room = floor - ceiling - 24.0;
@@ -905,15 +905,14 @@ impl Scene {
             for (p, at) in c.parts.iter().zip(c.pose()) {
                 let skin = &c.skins[p.skin];
                 let tex = c.slots.get(p.skin).copied().unwrap_or(tex::SKIN_BASE);
-                self.low_poly_part(p, &at, skin, tex, &mut out);
+                self.low_poly_part(p, &at, skin, tex, (LOW_AROUND, LOW_ALONG), &mut out);
             }
         }
         out
     }
 
-    /// One part as `LOW_AROUND` sides by `LOW_ALONG` rows, its ends closing to points.
-    fn low_poly_part(&self, p: &Part, at: &Placed, skin: &Skin, tex: u8, out: &mut Vec<Tri>) {
-        let (na, nl) = (LOW_AROUND, LOW_ALONG);
+    /// One part as `sides` (around, along), its ends closing to points.
+    pub(crate) fn low_poly_part(&self, p: &Part, at: &Placed, skin: &Skin, tex: u8, (na, nl): (usize, usize), out: &mut Vec<Tri>) {
         let mut pos = Vec::with_capacity((nl + 1) * (na + 1));
         let mut nrm = Vec::with_capacity(pos.capacity());
         for k in 0..=nl {
@@ -930,13 +929,15 @@ impl Scene {
         }
         let (u0, v0) = tex::uv_origin(tex);
         let alb = skin.tint.map(|c| (c * 128.0).clamp(0.0, 255.0) as u8);
+        // Each vertex lit once, for every triangle it is a corner of.
+        let cols: Vec<[u8; 3]> = pos.iter().zip(&nrm).map(|(q, &n)| self.shade(q.map(|c| c.round() as i32), n, skin.tint)).collect();
         let coord = |i: usize, n: usize| (63 * i / n) as u8;
         for k in 0..nl {
             for j in 0..na {
                 let v = |kk: usize, jj: usize| (kk * (na + 1) + jj, [u0 + coord(jj, na), v0 + coord(kk, nl)]);
                 let quad = [v(k, j), v(k, j + 1), v(k + 1, j), v(k + 1, j + 1)];
                 for [a, b, c] in [[0, 1, 2], [1, 3, 2]] {
-                    out.extend(self.creature_tri_of([quad[a], quad[b], quad[c]], &pos, &nrm, tex, skin.tint, alb));
+                    out.extend(self.creature_tri_of([quad[a], quad[b], quad[c]], &pos, &nrm, Some(&cols), tex, skin.tint, alb));
                 }
             }
         }
@@ -1066,13 +1067,24 @@ impl Scene {
     }
 
     fn creature_tri(&mut self, v: [(usize, [u8; 2]); 3], pos: &[[f32; 3]], nrm: &[[f32; 3]], tex: u8, tint: [f32; 3], alb: [u8; 3]) {
-        if let Some(t) = self.creature_tri_of(v, pos, nrm, tex, tint, alb) {
+        if let Some(t) = self.creature_tri_of(v, pos, nrm, None, tex, tint, alb) {
             self.creature_tris.push(t);
         }
     }
 
-    /// A lit creature triangle facing out, or none if it has no area.
-    fn creature_tri_of(&self, v: [(usize, [u8; 2]); 3], pos: &[[f32; 3]], nrm: &[[f32; 3]], tex: u8, tint: [f32; 3], alb: [u8; 3]) -> Option<Tri> {
+    /// A lit creature triangle facing out, or none if it has no area: its corners' light from
+    /// `cols` (by the same index as `pos`) when given, else worked out here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn creature_tri_of(
+        &self,
+        v: [(usize, [u8; 2]); 3],
+        pos: &[[f32; 3]],
+        nrm: &[[f32; 3]],
+        cols: Option<&[[u8; 3]]>,
+        tex: u8,
+        tint: [f32; 3],
+        alb: [u8; 3],
+    ) -> Option<Tri> {
         let p = v.map(|(i, _)| pos[i].map(|c| c.round() as i32));
         let e1 = [0, 1, 2].map(|c| (p[1][c] - p[0][c]) as f32);
         let e2 = [0, 1, 2].map(|c| (p[2][c] - p[0][c]) as f32);
@@ -1081,7 +1093,11 @@ impl Scene {
             return None;
         }
         let n_sum = add(add(nrm[v[0].0], nrm[v[1].0]), nrm[v[2].0]);
-        let mut verts = [0, 1, 2].map(|i| Vert { p: p[i], uv: v[i].1, col: self.shade(p[i], nrm[v[i].0], tint), alb });
+        let col = |i: usize| match cols {
+            Some(c) => c[v[i].0],
+            None => self.shade(p[i], nrm[v[i].0], tint),
+        };
+        let mut verts = [0, 1, 2].map(|i| Vert { p: p[i], uv: v[i].1, col: col(i), alb });
         if dot(cr, n_sum) < 0.0 {
             verts.swap(1, 2);
         }

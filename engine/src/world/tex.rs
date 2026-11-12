@@ -26,6 +26,11 @@ pub const STRANGE_STEPS: usize = 8;
 /// First texture id of the baked strange steps: step k (1..) of slot s is
 /// `STRANGE_BASE + (k - 1) * STRANGE_SLOTS + s`.
 pub const STRANGE_BASE: u8 = 64;
+/// People's textures (`person`), each its own image: the body's skin, the hair, then each
+/// person's face, `FACE_BASE + i` for the scene's person i.
+pub const PERSON_SKIN: u8 = 128;
+pub const PERSON_HAIR: u8 = 129;
+pub const FACE_BASE: u8 = 130;
 
 /// Dark and light ends of each texture's 16-step palette.
 const PALETTES: [([u8; 3], [u8; 3]); N] = [
@@ -61,7 +66,9 @@ impl Texture {
 
 /// Top-left texel of texture `t` inside its page.
 pub fn uv_origin(t: u8) -> (u8, u8) {
-    let s = if t >= STRANGE_BASE {
+    let s = if t >= PERSON_SKIN {
+        0
+    } else if t >= STRANGE_BASE {
         (t - STRANGE_BASE) as usize % 16
     } else if t >= SKIN_BASE {
         (t - SKIN_BASE) as usize % 16
@@ -297,23 +304,30 @@ pub fn level_texture(base: &[Texture], id: u8) -> Option<&Texture> {
 
 pub fn make_all() -> Vec<Texture> {
     (0..N)
-        .map(|t| {
-            if let Some(tex) = LEVEL.get().and_then(|l| l.get(t)).and_then(|t| t.as_ref()) {
-                return Texture { idx: tex.idx.clone(), pal: tex.pal };
-            }
-            let (lo, hi) = PALETTES[t];
-            let mut pal = [[0u8; 3]; 16];
-            for (i, c) in pal.iter_mut().enumerate() {
-                let k = i as f32 / 15.0;
-                for ch in 0..3 {
-                    c[ch] = (lo[ch] as f32 + (hi[ch] as f32 - lo[ch] as f32) * k).round() as u8;
-                }
-            }
-            let idx =
-                (0..SIZE * SIZE).map(|i| (texel(t, i % SIZE, i / SIZE).clamp(0.0, 1.0) * 15.0).round() as u8).collect();
-            Texture { idx, pal }
+        .map(|t| match LEVEL.get().and_then(|l| l.get(t)).and_then(|t| t.as_ref()) {
+            Some(tex) => Texture { idx: tex.idx.clone(), pal: tex.pal },
+            None => drawn(t),
         })
         .collect()
+}
+
+/// The textures as drawn here, never the photos `load_level` puts in their place: for the
+/// waking world (`Scene::sky`).
+pub fn make_drawn() -> Vec<Texture> {
+    (0..N).map(drawn).collect()
+}
+
+fn drawn(t: usize) -> Texture {
+    let (lo, hi) = PALETTES[t];
+    let mut pal = [[0u8; 3]; 16];
+    for (i, c) in pal.iter_mut().enumerate() {
+        let k = i as f32 / 15.0;
+        for ch in 0..3 {
+            c[ch] = (lo[ch] as f32 + (hi[ch] as f32 - lo[ch] as f32) * k).round() as u8;
+        }
+    }
+    let idx = (0..SIZE * SIZE).map(|i| (texel(t, i % SIZE, i / SIZE).clamp(0.0, 1.0) * 15.0).round() as u8).collect();
+    Texture { idx, pal }
 }
 
 /// RGB8 atlas of all textures (256 wide), laid out as on their page.

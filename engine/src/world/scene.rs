@@ -259,6 +259,10 @@ impl Strange {
     }
 
     pub fn at(&self, p: [f32; 3]) -> f32 {
+        // None in force (the waking world, or the dungeon as it really is).
+        if self.amount == 0.0 {
+            return 0.0;
+        }
         let (x, z) = (p[0], p[2]);
         let mut s = self.base + self.grad[0] * (x - self.centre[0]) + self.grad[1] * (z - self.centre[1]);
         for &(c, r, k) in &self.bumps {
@@ -347,6 +351,10 @@ pub struct Scene {
     pub(crate) paint: std::collections::HashMap<([i32; 3], crate::world::level::Face), u8>,
     /// Hand-built levels: doors, keys and levers, drawn from their own parts.
     pub things: crate::world::things::Things,
+    /// A level of the waking world: its sky (see `level::Level::plain`).
+    pub sky: Option<crate::world::level::Sky>,
+    /// The people in it (see `person`).
+    pub people: Vec<crate::world::person::Person>,
 }
 
 /// Position and orientation of one view. Angles use the GTE's 4096 = 360°.
@@ -675,6 +683,8 @@ impl Scene {
             strange,
             paint: Default::default(),
             things: Default::default(),
+            sky: None,
+            people: Vec::new(),
         };
         scene.build_level();
         if !scene.outdoor {
@@ -788,7 +798,8 @@ impl Scene {
     /// Fade the level's strangeness to `amount` of itself, baking its lights again to match.
     /// Doors and the like keep the meshes they have until something else rebuilds them.
     pub fn set_strange_amount(&mut self, amount: f32) {
-        self.strange.amount = amount;
+        // The waking world is never strange.
+        self.strange.amount = if self.sky.is_some() { 0.0 } else { amount };
         self.bake_lights();
     }
 
@@ -831,6 +842,9 @@ impl Scene {
     /// What fog fades to for a camera at `pos`, RGB 0..1: black while grounded,
     /// the level's lurid fog colour where it is strange.
     pub fn fog_colour(&self, pos: [i32; 3]) -> [f32; 3] {
+        if let Some(sky) = &self.sky {
+            return sky.horizon;
+        }
         let w = ramp(self.strange.fog_ramp, self.strange.at(pos.map(|c| c as f32)));
         self.strange.fog.map(|c| c * w)
     }
@@ -985,6 +999,8 @@ impl Scene {
             },
             paint: Default::default(),
             things: Default::default(),
+            sky: None,
+            people: Vec::new(),
         }
     }
 

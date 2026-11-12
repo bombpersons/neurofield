@@ -469,7 +469,16 @@ pub struct Animator {
     pitch: f32,
     chase: Option<[f32; 3]>,
     /// The player's feet, which its body keeps out of.
-    player: Option<[f32; 3]>,
+    pub player: Option<[f32; 3]>,
+    /// Something to stop and face (a person turning to the player near them), unless chasing.
+    pub attend: Option<[f32; 3]>,
+    /// Furthest it strays from where it was grown, unless chasing.
+    pub leash: f32,
+    /// Stays where it was put, facing the way it was put, unless something draws it.
+    pub stay: bool,
+    home_yaw: f32,
+    /// What it does when it's stood still a while.
+    fidgets: Vec<Fidget>,
     act: Option<Act>,
     /// Seconds stood still, and how long until it fidgets.
     still: f32,
@@ -665,6 +674,11 @@ impl Animator {
             pitch: 0.0,
             chase: None,
             player: None,
+            attend: None,
+            leash: LEASH,
+            stay: false,
+            home_yaw: c.yaw,
+            fidgets: Fidget::ALL.to_vec(),
             act: None,
             still: 0.0,
             restless,
@@ -673,6 +687,17 @@ impl Animator {
             fall: 0.0,
             settled: false,
         }
+    }
+
+    /// Go about at an easy walk, fidgeting only in the ways given (a person, not a creature).
+    pub fn calm(&mut self, fidgets: &[Fidget]) {
+        self.walk_speed *= 0.7;
+        self.fidgets = fidgets.to_vec();
+    }
+
+    /// How many legs it walks on.
+    pub fn legs(&self) -> usize {
+        self.legs.len()
     }
 
     /// Run after `target` (a point in the world), or with None go back to wandering.
@@ -826,16 +851,23 @@ impl Animator {
             self.want_yaw = (-d[0]).atan2(d[2]);
             self.going = d[0].hypot(d[2]) > 0.8 * self.reach();
             self.wait = 0.5;
+        } else if let Some(target) = self.attend {
+            let d = sub(target, c.base);
+            self.want_yaw = (-d[0]).atan2(d[2]);
+            self.going = false;
+            self.wait = self.rng.fr(0.5, 1.5);
         } else {
             if self.wait <= 0.0 {
-                self.going = self.rng.chance(0.65);
+                self.going = !self.stay && self.rng.chance(0.65);
                 self.wait = if self.going { self.rng.fr(2.0, 6.0) } else { self.rng.fr(1.0, 3.5) };
-                self.want_yaw = c.yaw + self.rng.fr(-1.5, 1.5);
+                self.want_yaw = if self.stay { self.home_yaw } else { c.yaw + self.rng.fr(-1.5, 1.5) };
             }
             let home = sub(self.spawn, c.base);
-            if home[0].hypot(home[2]) > LEASH {
+            if home[0].hypot(home[2]) > self.leash.max(1.0) {
                 self.want_yaw = (-home[0]).atan2(home[2]);
                 self.going = true;
+            } else if self.stay && home[0].hypot(home[2]) < 0.5 * self.leash {
+                self.going = false;
             }
         }
         // Striking or casting, it turns to face its target but stands.
@@ -1230,7 +1262,7 @@ impl Animator {
         if self.act.is_none() && self.chase.is_none() && self.speed < 0.05 * self.walk_speed {
             self.still += dt;
             if self.still > self.restless {
-                let f = self.rng.pick(&Fidget::ALL);
+                let f = self.rng.pick(&self.fidgets);
                 self.fidget(f);
                 self.still = 0.0;
                 self.restless = self.rng.fr(2.0, 6.0);

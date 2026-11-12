@@ -114,7 +114,7 @@ pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
         let swelling = effects::Swelling::of(affliction, time, &cam);
         swelling.tris(&level.tris, &mut swollen);
         let t = tokens::tokens(&swollen, &v);
-        lashes += growths.update(&level.scene, &cam, effects::growth(affliction), 1.0 / 30.0, &mut rng) as u32;
+        lashes += growths.update(&level.scene, &cam, effects::growth(affliction), 1.0 / 30.0, &mut rng).is_some() as u32;
         most = most.max(growths.count());
         let t0 = Instant::now();
         let mut rgb = net.render(&t, &Dream::calm(W));

@@ -1383,6 +1383,7 @@ pub(crate) fn kind_name(k: &EntityKind) -> &'static str {
     match k {
         EntityKind::PlayerStart => "PlayerStart",
         EntityKind::Creature { .. } => "Creature",
+        EntityKind::Person { .. } => "Person",
         EntityKind::Door { .. } => "Door",
         EntityKind::Key { .. } => "Key",
         EntityKind::Chest { .. } => "Chest",
@@ -1412,6 +1413,7 @@ fn entity_label(e: &LevelEntity) -> String {
     let at = format!("({:.1}, {:.1}, {:.1})", e.pos[0] / TF, up(e.pos[1]), e.pos[2] / TF);
     match &e.kind {
         EntityKind::Creature { kind, .. } => format!("#{} {kind:?} {at}", e.id),
+        EntityKind::Person { role, .. } => format!("#{} {role:?} {at}", e.id),
         EntityKind::Key { name } => format!("#{} {name} {at}", e.id),
         EntityKind::Prop { shape, .. } => format!("#{} {shape:?} {at}", e.id),
         EntityKind::Item { name, count: 1 } => format!("#{} {name} {at}", e.id),
@@ -1554,6 +1556,30 @@ fn entity_properties(
                     ui.add(egui::DragValue::new(seed));
                     if ui.button("re-roll").clicked() {
                         *seed = engine::world::rng::hash(*seed ^ 0x9E37_79B9) as u64 % 100_000;
+                    }
+                });
+                ui.end_row();
+            }
+            EntityKind::Person { look, seed, role } => {
+                use engine::world::person::Role;
+                ui.label("role");
+                ui.horizontal(|ui| {
+                    for r in [Role::Wander, Role::Stand, Role::Guard] {
+                        ui.selectable_value(role, r, format!("{r:?}"));
+                    }
+                });
+                ui.end_row();
+                ui.label("look");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(seed));
+                    if ui.button("re-roll").clicked() {
+                        *seed = engine::world::rng::hash(*seed ^ 0x9E37_79B9) as u64 % 100_000;
+                        *look = None;
+                    }
+                    // A look of its own stays when the seed changes; until then the seed makes it up.
+                    let mut own = look.is_some();
+                    if ui.checkbox(&mut own, "keep").changed() {
+                        *look = own.then(|| engine::world::person::Look::random(*seed));
                     }
                 });
                 ui.end_row();

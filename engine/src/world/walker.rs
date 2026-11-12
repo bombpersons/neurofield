@@ -98,6 +98,7 @@ fn creatures_near(scene: &Scene, at: [f32; 3]) -> impl Iterator<Item = ([f32; 3]
     scene
         .creatures
         .iter()
+        .chain(scene.people.iter().map(|p| &p.body))
         .filter(move |c| c.girth > 0.0 && (c.base[1] - at[1]).abs() < CREATURE_FLOOR)
         .map(|c| (c.base, c.girth + RADIUS))
 }
@@ -186,6 +187,13 @@ impl Walker {
             body: Body::default(),
             kick: Kick::default(),
         })
+    }
+
+    /// Daylight: fog from `near` to `far` (tiles) and no torch, for the waking world.
+    pub fn daylight(&mut self, (near, far): (f32, f32)) {
+        self.fog_near = (near * TF) as i32;
+        self.fog_far = (far.max(near + 0.5) * TF) as i32;
+        self.torch = [0.0; 3];
     }
 
     /// Choose a destination (biased toward far cells) and the cell path to it.

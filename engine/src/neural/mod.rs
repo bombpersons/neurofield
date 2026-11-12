@@ -97,7 +97,10 @@ impl Level {
     pub fn from_file(level: &crate::world::level::Level, start: Option<([f32; 3], f32)>, rng: &mut Rng) -> Result<Level, String> {
         let scene = level.to_scene();
         let (pos, yaw) = start.or_else(|| level.player_start()).ok_or("the level has no PlayerStart")?;
-        let walker = Walker::at(&scene, pos, yaw, rng).ok_or("the start is inside rock")?;
+        let mut walker = Walker::at(&scene, pos, yaw, rng).ok_or("the start is inside rock")?;
+        if level.plain.is_some() {
+            walker.daylight(level.fog);
+        }
         let mut tris = Vec::new();
         tri_features(&scene, &mut tris);
         Ok(Level { scene, walker, tris })
