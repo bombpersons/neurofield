@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["psx-bevy", "engine", "training-data-gen", "game", "editor"]
+members = ["psx-bevy", "engine", "training-data-gen", "game", "editor", "dream-renderer"]
 # The psx submodule is a workspace of its own.
 exclude = ["external"]
 

@@ -85,6 +85,9 @@ pub struct View {
     pub cam: Option<PsxCamera>,
     /// The fog's colour where the camera is.
     pub fog_colour: [f32; 3],
+    /// How far the sculpted flesh's dial has turned (`world::dreamed`): the walls fold out by
+    /// it on the GPU (`Gfx::spawn_folding_walls`).
+    pub dial: f32,
     /// Where to put the camera instead of `cam`'s place, for a free camera (the
     /// editor's); `cam` still sets the lens, light and fog.
     pub transform: Option<Transform>,
@@ -312,6 +315,19 @@ impl Gfx<'_> {
         tris: &[crate::world::flesh::Tri],
     ) -> Entity {
         flesh::spawn_moving(commands, &mut self.meshes, material, fl, tris)
+    }
+
+    /// The folded walls of `d`, built once, that fold out as `View::dial` turns, with the
+    /// skins of `material` and `fl`'s lights.
+    pub fn spawn_folding_walls(
+        &mut self,
+        commands: &mut Commands,
+        material: &MeshMaterial3d<flesh::FleshMaterial>,
+        fl: &crate::world::flesh::Flesh,
+        d: &crate::world::dreamed::Dreamed,
+    ) -> Option<Entity> {
+        let (tris, how) = crate::world::dreamed::walls_at_rest(d);
+        (!tris.is_empty()).then(|| flesh::spawn_folding(commands, &mut self.meshes, material, fl, &tris, &how))
     }
 
     /// `fl`'s flesh that moves, built once at its dial's turn, with the skins of `material`:

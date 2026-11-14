@@ -13,6 +13,21 @@
 //!     draws it with the rasteriser, as the level net might one day (`engine::world::dreamed`);
 //!     its textures default to data/painted. [ and ] turn it from plain stone to fully flesh
 //!     and back (select + L1 / R1 on the pad).
+//!     `--nca runs/nca/slot1` (with `--sculpt`): that painted flesh texture lives, a flesh
+//!     automaton (train/nca.py) growing and moving in its place (NCA_RATE steps a second,
+//!     NCA_STEEP how much its height slopes the surface, NCA_DEPTH how deep (tiles a spread) its height
+//!     lifts the flesh walls, which all wear it and take their shape from it alone, NCA_SLOT
+//!     another texture's place).
+//!     `--dream-atlas runs/dream/googlenet.safetensors`: in place of the level network, DeepDream
+//!     grows on the dungeon's walls over the PS1 picture (dream_atlas.rs; train/export_googlenet.py
+//!     makes the weights); `--dream-layers 4c` and `--dream-fine-layers 3b,4d` pick what each
+//!     octave dreams with, `--dream-colour 0.25` how much colour it may change (0: light and
+//!     shade only), `--dream-relief 0.1` how far (in tiles) the dream stands off the walls where
+//!     it has taken them over (0: flat), `--dream-mode reproject` where it grows: `walls`
+//!     always on the walls, `still` (the default) on the screen while the view rests and laid
+//!     on the walls as it moves, `reproject` always on the screen, carried along as the view
+//!     moves (`--dream-remember 4`: put on the walls over 4 frames as it goes, so what comes
+//!     back into sight is as it was; 0 forgets). Its knobs are in the panel (h).
 //!     `--view raster` (or `both`) starts on the rasteriser instead of the network.
 //!     `--strangeness 0.7` sets how strange each level is (otherwise random).
 //!     `--affliction 0.7` starts the player that afflicted, to try how it looks.
@@ -51,6 +66,7 @@
 //! scaled to fill the window.
 //! The rasteriser is psx-bevy drawing the level (`engine::render`) into its 320x240 screen.
 //! `GAME_SHOT=out.png:5` saves a screenshot after 5 seconds and quits.
+//! `GAME_GLITCH=warp=0.2,smear=8` starts with the glitch panel's knobs set (`glitch_from_env`).
 //!
 //! Developer builds (`--features dev-mcp`) take `--mcp` for psx-bevy's developer MCP
 //! on stdio (see psx-bevy's README, "Agent driving"), with `--headless` and `--software`
@@ -78,11 +94,12 @@ use psx_bevy::controller::{BindingDevice, Button, ControllerBindings, Controller
 use psx_bevy::psx::{fit_scale, PsxPlugin, PsxScreen, DISPLAY_LAYER};
 use psx_bevy::shell::{GameSystems, ShellPlugin, TickRate};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use engine::neural::gpu_net::MAX_W;
 use engine::neural::{effects, Level, Network, TICK};
 
 mod hud;
+mod dream_atlas;
 mod drops;
 mod foes;
 mod menu;
@@ -191,6 +208,10 @@ struct Sim {
     /// Seconds since each dream effect was turned on, or None when it is off.
     effects: [Option<f32>; effects::EFFECTS.len()],
     panel: bool,
+    /// The dream atlas draws the network's view (`--dream-atlas`), not the level network.
+    dream_atlas: bool,
+    /// The glitch panel's knobs, held where they are set.
+    glitch: effects::Glitch,
     net_ms: f32,
     herd: engine::world::animate::Herd,
     /// The people's animators.
@@ -300,7 +321,8 @@ impl Sim {
 
     /// Whether the rasteriser is needed, showing through a fade as well.
     fn raster_on(&self) -> bool {
-        self.shown() != Mode::Network || self.veil > 0.0 || self.stair.is_some()
+        // The dream atlas dreams on the rasteriser's picture.
+        self.shown() != Mode::Network || self.veil > 0.0 || self.stair.is_some() || self.dream_atlas
     }
 
     /// Whether a clear seeing potion has the dream draining, gone, or coming back: then the
@@ -1139,6 +1161,7 @@ fn main() {
         }
         None => (Level::new(&mut rng), Vec::new(), Vec::new()),
     };
+    let living = opts.get("nca").map(|dir| Living::load(Path::new(dir)).unwrap_or_else(|e| panic!("{e}")));
     let eyes = opts.get("sculpt").map(PathBuf::from);
     let sculpted = eyes.as_deref().map(|dir| engine::world::dreamed::sculpt(&mut level.scene, seed, Some(dir)));
     let strangeness = level.scene.strange.base;
@@ -1170,6 +1193,8 @@ fn main() {
         },
         effects: [None; effects::EFFECTS.len()],
         panel: false,
+        dream_atlas: opts.contains_key("dream-atlas"),
+        glitch: glitch_from_env(),
         net_ms: 0.0,
         herd: Default::default(),
         people: Default::default(),
@@ -1269,15 +1294,39 @@ fn main() {
         .insert_non_send(net)
         .init_resource::<Parts>()
         .add_systems(Startup, (setup, capture_mouse))
-        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, pose_creatures, pose_people, raster_camera, status, update_hud, auto_screenshot).chain())
+        .add_systems(Update, (keys, menu_mouse, menu_cursor, mouse, draw, build_scene, move_things, pose_sculpted, live_flesh, pose_creatures, pose_people, raster_camera, status, update_hud, auto_screenshot).chain())
         .add_systems(Update, egui_on_display)
         // After psx-bevy fits its display to the window.
         .add_systems(PostUpdate, layout.before(TransformSystems::Propagate))
         .add_systems(FixedUpdate, walk.in_set(GameSystems::Game))
-        .add_systems(EguiPrimaryContextPass, panel)
+        .add_systems(EguiPrimaryContextPass, (panel, dream_atlas::panel))
+        .add_systems(Update, dream_atlas::draw.after(draw))
         .add_systems(Last, save_on_quit);
     if let Some(layer) = dream {
         app.insert_non_send(layer);
+    }
+    if let Some(weights) = opts.get("dream-atlas") {
+        let list = |k: &str| opts.get(k).map_or(Vec::new(), |v| v.split(',').map(str::to_string).collect::<Vec<_>>());
+        let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+        let mut atlas = dream_atlas::DreamAtlas::new(Path::new(weights), &list("dream-layers"), &list("dream-fine-layers"), &mut images)
+            .unwrap_or_else(|e| panic!("the dream atlas: {e}"));
+        if let Some(c) = opts.get("dream-colour") {
+            atlas.step.colour = c.parse().expect("--dream-colour 0..1");
+        }
+        if let Some(m) = opts.get("dream-mode") {
+            atlas.mode = dream_atlas::DreamMode::parse(m).expect("--dream-mode walls, still or reproject");
+        }
+        if let Some(n) = opts.get("dream-remember") {
+            atlas.step.remember_every = n.parse().expect("--dream-remember 4 (frames; 0 forgets)");
+        }
+        if let Some(r) = opts.get("dream-relief") {
+            atlas.step.relief = r.parse().expect("--dream-relief 0.1 (tiles)");
+        }
+        dream_atlas::setup(&mut app, &atlas);
+        app.insert_non_send(atlas);
+    }
+    if let Some(living) = living {
+        app.insert_resource(living);
     }
     #[cfg(feature = "dev-mcp")]
     if mcp {
@@ -1641,7 +1690,100 @@ fn panel(mut contexts: EguiContexts, mut sim: ResMut<Sim>) -> Result {
         }
         ui.label("esc frees the mouse; click the view to look again");
     });
+    egui::Window::new("network glitches").default_pos([12.0, 420.0]).default_height(420.0).vscroll(true).show(contexts.ctx_mut()?, |ui| {
+        let g = &mut sim.glitch;
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut g.texture, 0.0..=1.0).text("textures become"));
+            egui::ComboBox::from_id_salt("texture_to").width(40.0).selected_text(g.texture_to.to_string()).show_ui(ui, |ui| {
+                for t in 0..engine::neural::dream::NUM_TEX {
+                    ui.selectable_value(&mut g.texture_to, t, t.to_string());
+                }
+            });
+        });
+        ui.add(egui::Slider::new(&mut g.temp, 0.2..=5.0).logarithmic(true).text("attention temperature"));
+        ui.separator();
+        ui.label("per-pixel stage (sculpted levels)");
+        ui.add(egui::Slider::new(&mut g.warp, 0.0..=0.5).text("latent warp"));
+        ui.add(egui::Slider::new(&mut g.smear, 0.0..=32.0).text("head smear (px)"));
+        ui.separator();
+        ui.add(egui::Slider::new(&mut g.echo, 0.0..=0.97).text("patch echo"));
+        ui.add(egui::Slider::new(&mut g.pixel_echo, 0.0..=0.97).text("pixel echo"));
+        ui.separator();
+        ui.label("geometry (tiles)");
+        ui.add(egui::Slider::new(&mut g.split, 0.0..=0.5).text("stage's own geometry"));
+        ui.add(egui::Slider::new(&mut g.tear, 0.0..=0.5).text("tear triangles"));
+        ui.add(egui::Slider::new(&mut g.peel, 0.0..=0.5).text("peel along normals"));
+        ui.add(egui::Slider::new(&mut g.snap, 0.0..=0.5).text("snap to camera grid"));
+        ui.separator();
+        ui.label("pixel G-buffer (sculpted levels)");
+        let b = &mut g.gbuffer;
+        ui.add(egui::Slider::new(&mut b.warp, 0.0..=32.0).text("G-buffer warp (px)"));
+        ui.add(egui::Slider::new(&mut b.twist, 0.0..=2.0).text("twist normals"));
+        ui.add(egui::Slider::new(&mut b.depth, 0.0..=2.0).text("lie about depth"));
+        ui.add(egui::Slider::new(&mut b.scramble, 0.0..=1.0).text("scramble uvs"));
+        ui.add(egui::Slider::new(&mut b.cells, 0.0..=16.0).text("uv cells (0: off)"));
+        ui.add(egui::Slider::new(&mut b.flesh, 0.0..=1.0).text("flesh everywhere"));
+        ui.add(egui::Slider::new(&mut b.ghost, 0.0..=1.0).text("ghost organs"));
+        ui.separator();
+        let d = &mut g.damage;
+        ui.add(egui::Slider::new(&mut d.rot, 0.0..=1.0).logarithmic(true).text("weight rot"));
+        ui.add(egui::Slider::new(&mut d.stage_units, 0.0..=1.0).logarithmic(true).text("stage units lost"));
+        ui.add(egui::Slider::new(&mut d.net_units, 0.0..=1.0).logarithmic(true).text("transformer units lost"));
+        ui.add(egui::Slider::new(&mut d.jitter, 0.0..=2.0).text("unit jitter"));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut d.invert, "invert lost units");
+            ui.add(egui::DragValue::new(&mut d.seed).prefix("seed "));
+            if ui.button("reroll").clicked() {
+                d.seed = d.seed.wrapping_add(1);
+            }
+        });
+        ui.separator();
+        if ui.button("reset").clicked() {
+            *g = effects::Glitch::default();
+        }
+    });
     Ok(())
+}
+
+/// The glitch panel's knobs from `GAME_GLITCH` ("warp=0.2,smear=8,..."; names as `Glitch`'s
+/// and `Damage`'s fields, the G-buffer's as `gwarp`, `twist`, `depth`, `scramble`, `cells`,
+/// `flesh`, `ghost`, `texture_to` and `seed` whole numbers, `invert` 0 or 1), for
+/// trying them from a script.
+fn glitch_from_env() -> effects::Glitch {
+    let mut g = effects::Glitch::default();
+    for kv in std::env::var("GAME_GLITCH").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!("GAME_GLITCH: {kv} is not name=value"));
+        let x: f32 = v.parse().unwrap_or_else(|e| panic!("GAME_GLITCH {k}: {e}"));
+        let d = &mut g.damage;
+        match k {
+            "texture" => g.texture = x,
+            "texture_to" => g.texture_to = x as usize,
+            "temp" => g.temp = x,
+            "warp" => g.warp = x,
+            "smear" => g.smear = x,
+            "echo" => g.echo = x,
+            "pixel_echo" => g.pixel_echo = x,
+            "rot" => d.rot = x,
+            "stage_units" => d.stage_units = x,
+            "net_units" => d.net_units = x,
+            "jitter" => d.jitter = x,
+            "invert" => d.invert = x != 0.0,
+            "seed" => d.seed = x as u32,
+            "split" => g.split = x,
+            "tear" => g.tear = x,
+            "peel" => g.peel = x,
+            "snap" => g.snap = x,
+            "gwarp" => g.gbuffer.warp = x,
+            "twist" => g.gbuffer.twist = x,
+            "depth" => g.gbuffer.depth = x,
+            "scramble" => g.gbuffer.scramble = x,
+            "cells" => g.gbuffer.cells = x,
+            "flesh" => g.gbuffer.flesh = x,
+            "ghost" => g.gbuffer.ghost = x,
+            _ => panic!("GAME_GLITCH: no knob {k}"),
+        }
+    }
+    g
 }
 
 /// The mouse in the menus: hovering picks a row, a click chooses it and right click goes back.
@@ -2022,7 +2164,7 @@ fn draw(
         }
         sim.tris = tokens.len();
         sim.net_ms = sim.net_ms * 0.9 + 0.1 * t0.elapsed().as_secs_f32() * 1000.0;
-    } else if sim.shown() != Mode::Raster {
+    } else if sim.shown() != Mode::Raster && !sim.dream_atlas {
         let t0 = std::time::Instant::now();
         let width = sim.width;
         let sim = &mut *sim;
@@ -2030,9 +2172,39 @@ fn draw(
         // All this drains away with the strangeness when the player sees clearly.
         let swelling = effects::Swelling::of(sim.showing(), sim.dream_time, &cam);
         swelling.tris(&sim.level.tris, &mut sim.swollen);
-        let mut tokens = sim.level.tokens_of(&sim.swollen, width);
-        let disturbed = effects::apply_set(&sim.effects, &mut tokens, &sim.swollen);
-        let mut rgb = net.render(&tokens, &disturbed);
+        // A sculpted level, for a model trained on them: how its triangles turn, the organs in
+        // sight, and the per-pixel stage drawing on the frame.
+        let view = sim.level.view(&cam, width);
+        effects::shake(&mut sim.swollen, &sim.glitch, sim.dream_time, &view);
+        let (mut turning, mut organs) = (Vec::new(), Vec::new());
+        let sculpted = sim.sculpted.as_ref().filter(|_| net.has_stage());
+        if let Some(d) = sculpted {
+            engine::world::dreamed::turning_features(&sim.level.scene, d, &mut turning);
+            engine::world::dreamed::organs(d, &cam, width, sim.dream_time, &mut organs);
+        }
+        let turned = sculpted.map(|d| engine::neural::tokens::Turned { amount: d.amount, turning: &turning, organs: &organs });
+        let mut tokens = engine::neural::tokens::tokens_turned(&sim.swollen, &view, turned.as_ref());
+        let mut disturbed = effects::apply_set(&sim.effects, &mut tokens, &sim.swollen);
+        effects::glitch(&mut disturbed, &sim.glitch, sim.dream_time);
+        net.set_damage(&sim.glitch.damage);
+        let mut rgb = match &turned {
+            Some(u) => {
+                // The glitch panel may give the stage geometry of its own.
+                let mut split = Vec::new();
+                let tris = if sim.glitch.split > 0.0 {
+                    effects::split(&sim.swollen, &sim.glitch, sim.dream_time, &mut split);
+                    &split
+                } else {
+                    &sim.swollen
+                };
+                let stage = engine::neural::gpu_net::StageView { tris, turning: u.turning, organs: u.organs, view: &view, amount: u.amount };
+                net.render_staged(&tokens, &disturbed, &stage).unwrap_or_else(|e| {
+                    eprintln!("the per-pixel stage: {e}");
+                    net.render(&tokens, &disturbed)
+                })
+            }
+            None => net.render(&tokens, &disturbed),
+        };
         if let (Some(layer), Some(growths)) = (dream.as_mut(), &sim.growths) {
             if let Err(e) = layer.draw(&mut sim.level.scene, sim.version, &sim.swollen, growths.creature(), |p| swelling.tiles(p), &cam, &mut rgb, width) {
                 eprintln!("dream layer: {e}");
@@ -2052,7 +2224,8 @@ fn draw(
     // rasteriser doesn't swell the level, so neither are they; the flesh pass hides them
     // behind the level and its flesh.
     let mut on = false;
-    if sim.shown() != Mode::Network && !sim.seeing_clearly() {
+    // The dream atlas dreams over the rasteriser's picture, so they're in it there too.
+    if (sim.shown() != Mode::Network || sim.dream_atlas) && !sim.seeing_clearly() {
         let sim = &mut *sim;
         if let (Some(layer), Some(growths)) = (dream.as_mut(), &sim.growths) {
             let cam = sim.level.walker.camera();
@@ -2061,9 +2234,14 @@ fn draw(
             let Creatures { rgba, near } = &mut *creatures;
             rgba.resize((width * H * 4) as usize, 0.0);
             near.resize((width * H) as usize, f32::MAX);
+            let t0 = std::time::Instant::now();
             match layer.draw_alone(&mut sim.level.scene, sim.version, &[], growths.creature(), |p| p, &cam, rgba, near, width) {
                 Ok(()) => on = true,
                 Err(e) => eprintln!("dream layer: {e}"),
+            }
+            // Under the dream atlas the level network doesn't run: "net" is the creatures'.
+            if sim.dream_atlas {
+                sim.net_ms = sim.net_ms * 0.9 + 0.1 * t0.elapsed().as_secs_f32() * 1000.0;
             }
         }
         if on {
@@ -2208,8 +2386,8 @@ fn pose_sculpted(
     time: Res<Time>,
     key: Res<ButtonInput<KeyCode>>,
     mut moving: Local<Option<(Entity, Handle<bevy::render::storage::ShaderBuffer>, engine::world::dreamed::Moving)>>,
-    mut walls: Local<Option<Entity>>,
-    mut walls_of: Local<Option<(AssetId<engine::render::flesh::FleshMaterial>, f32)>>,
+    mut walls: Local<Option<(Entity, AssetId<engine::render::flesh::FleshMaterial>)>>,
+    mut parts_of: Local<Option<(AssetId<engine::render::flesh::FleshMaterial>, f32)>>,
     mut since: Local<f32>,
     // The scene's own only: what's remade may still have the last level's skins.
     flesh: Query<&MeshMaterial3d<engine::render::flesh::FleshMaterial>, Without<engine::render::flesh::MovingFlesh>>,
@@ -2228,26 +2406,96 @@ fn pose_sculpted(
     sculpted.amount = sim.dial * (1.0 - sim.calm);
     let Some(material) = flesh.iter().next() else { return };
     let scene = &mut sim.level.scene;
-    let now = (material.id(), sculpted.amount);
-    // Remaking the meshes is the slow part of a frame: not every frame while the dial turns.
-    if *walls_of != Some(now) && *since >= 1.0 / REMAKE_RATE {
-        *since = 0.0;
-        for e in walls.take().into_iter().chain(moving.take().map(|m| m.0)) {
+    // The walls fold out on the GPU as the dial turns (`View::dial`): made once a scene.
+    if walls.map(|w| w.1) != Some(material.id()) {
+        if let Some((e, _)) = walls.take() {
             commands.entity(e).despawn();
         }
-        let tris = engine::world::dreamed::walls(sculpted);
-        if !tris.is_empty() {
-            *walls = Some(gfx.spawn_moving_flesh(&mut commands, material, &scene.flesh, &tris));
+        *walls = gfx.spawn_folding_walls(&mut commands, material, &scene.flesh, sculpted).map(|e| (e, material.id()));
+    }
+    let now = (material.id(), sculpted.amount);
+    // Remaking the eyes, mouths and veins is slow: not every frame while the dial turns.
+    if *parts_of != Some(now) && *since >= 1.0 / REMAKE_RATE {
+        *since = 0.0;
+        if let Some(m) = moving.take() {
+            commands.entity(m.0).despawn();
         }
         let parts = engine::world::dreamed::Moving::new(scene, sculpted);
         if !parts.tris.is_empty() {
             *moving = gfx.spawn_moving_parts(&mut commands, material, &scene.flesh, &parts).map(|(e, h)| (e, h, parts));
         }
-        *walls_of = Some(now);
+        *parts_of = Some(now);
     }
     if let Some((_, handle, parts)) = &mut *moving {
         parts.pose(sculpted, &sim.level.walker.camera(), sim.dream_time);
         gfx.set_moving_parts(handle, parts);
+    }
+}
+
+/// A painted flesh texture that lives (`--nca`): an automaton stepped on the GPU, shown in
+/// the texture's place on the sculpted flesh (`engine::render::flesh::LivingFlesh`).
+#[derive(Resource)]
+struct Living {
+    nca: engine::neural::nca::Nca,
+    /// The painted slot it stands in for (train/nca.py's `--slot`).
+    slot: usize,
+    /// Steps a second, and the part of one due.
+    rate: f32,
+    due: f32,
+    steep: f32,
+    depth: f32,
+}
+
+impl Living {
+    /// The automaton the trainer left in `dir` (nca.bin, nca.json), grown a little.
+    fn load(dir: &Path) -> Result<Living, String> {
+        let meta = std::fs::read_to_string(dir.join("nca.json")).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let slot = meta.split("\"slot\":").nth(1).and_then(|s| s.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())).and_then(|s| s.parse::<usize>().ok());
+        let slot = slot.ok_or_else(|| format!("{}: no slot in nca.json", dir.display()))?;
+        let mut nca = engine::neural::nca::Nca::load(&dir.join("nca.bin"), 1)?;
+        // Grown from noise before it's seen.
+        nca.step(96);
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        // NCA_SLOT puts it in another texture's place, to see it where that one is.
+        let slot = env("NCA_SLOT", slot as f32) as usize;
+        Ok(Living { nca, slot, rate: env("NCA_RATE", 20.0), due: 0.0, steep: env("NCA_STEEP", 8.0), depth: env("NCA_DEPTH", 0.08) })
+    }
+}
+
+/// Step the living flesh texture as time passes, and show it in its painted texture's place.
+fn live_flesh(
+    sim: Res<Sim>,
+    time: Res<Time>,
+    living: Option<ResMut<Living>>,
+    mut shown: ResMut<engine::render::flesh::LivingFlesh>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Some(mut living) = living else { return };
+    let layer = sim.sculpted.as_ref().and_then(|d| d.painted).and_then(|p| p.get(living.slot).copied());
+    let now = engine::render::flesh::LivingFlesh { layer, steep: living.steep, depth: living.depth, height: shown.height };
+    if (shown.layer, shown.steep, shown.depth) != (now.layer, now.steep, now.depth) {
+        *shown = now;
+    }
+    if layer.is_none() {
+        return;
+    }
+    living.due += living.rate * time.delta_secs();
+    let n = living.due.floor();
+    if n < 1.0 && time.elapsed_secs() > 0.1 {
+        return;
+    }
+    living.due -= n;
+    living.nca.step(n as usize);
+    match living.nca.read() {
+        Ok(rgba) => {
+            // How its height spreads, for the folds to be as deep whatever it has grown to.
+            let n = (rgba.len() / 4) as f32;
+            let mean = rgba.chunks_exact(4).map(|c| c[3] as f32 / 255.0).sum::<f32>() / n;
+            let var = rgba.chunks_exact(4).map(|c| (c[3] as f32 / 255.0 - mean).powi(2)).sum::<f32>() / n;
+            shown.height = [mean, var.sqrt()];
+            engine::render::flesh::set_living(&mut images, engine::neural::nca::SIZE, &rgba);
+        }
+        Err(e) => eprintln!("the living flesh: {e}"),
     }
 }
 
@@ -2325,7 +2573,8 @@ fn pose_people(
 /// The level camera follows the walker; it rests while only the network is shown.
 fn raster_camera(sim: Res<Sim>, mut view: ResMut<engine::render::View>) {
     let cam = sim.level.walker.camera();
-    let v = engine::render::View { hidden: !sim.raster_on(), ..engine::render::View::of(&sim.level.scene, &cam) };
+    let dial = sim.sculpted.as_ref().map_or(0.0, |d| d.amount);
+    let v = engine::render::View { hidden: !sim.raster_on(), dial, ..engine::render::View::of(&sim.level.scene, &cam) };
     view.set_if_neq(v);
 }
 

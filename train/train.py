@@ -41,15 +41,56 @@ WARMUP = 500
 WARMUP_NEW_HEAD = 3000
 
 
+def contextual(x, y, h=0.5):
+    """The contextual loss (Mechrez et al. 2018) of features x [N, C] against y [M, C]: low
+    when every feature of y has one of x like it, wherever each lies."""
+    mu = y.mean(0, keepdim=True)
+    x, y = F.normalize(x - mu, dim=1), F.normalize(y - mu, dim=1)
+    d = 1 - x @ y.T  # [N, M] cosine distances
+    rel = d / (d.min(1, keepdim=True).values + 1e-5)
+    w = torch.exp((1 - rel) / h)
+    cx = w / w.sum(1, keepdim=True)
+    return -torch.log(cx.max(0).values.mean() + 1e-5)
+
+
+def vibe_loss(net, scale, pred, target, flesh, crops=4, size=128, layers=(2, 3, 4), h=0.5):
+    """How unlike the target's flesh the prediction's is, by its look rather than its pixels:
+    the contextual loss of AlexNet's `layers` (1-5) over up to `crops` windows of `size`
+    pixels a view that are nearly all flesh, the same window of each. 0 without any. (On the
+    validation flesh, layers 2-4 over 128 pixels score the target shifted 10 pixels at 0.57 of
+    it blurred, and even 24 pixels off better than blurred.)"""
+    cover = F.avg_pool2d(flesh.float()[:, None], size, 8)[:, 0]  # [b, h', w'], windows 8 px apart
+    total, n = pred.new_zeros(()), 0
+    with torch.autocast(pred.device.type, enabled=False):
+        for i in range(len(pred)):
+            at = torch.nonzero(cover[i] > 0.9)
+            if not len(at):
+                continue
+            for y, x in at[torch.randperm(len(at), device=at.device)[:crops]].tolist():
+                y, x = y * 8, x * 8
+                a = scale(pred[i : i + 1, :, y : y + size, x : x + size].float() * 2 - 1)
+                b = scale(target[i : i + 1, :, y : y + size, x : x + size].float() * 2 - 1)
+                slices = [net.slice1, net.slice2, net.slice3, net.slice4, net.slice5]
+                for k in range(max(layers)):
+                    a, b = slices[k](a), slices[k](b)
+                    if k + 1 in layers:
+                        c = a.shape[1]
+                        total = total + contextual(a[0].reshape(c, -1).T, b[0].reshape(c, -1).T, h)
+                n += 1
+    return total / max(n, 1)
+
+
 class Trainer:
     def __init__(
         self, data, out, small=False, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.1, ema_decay=0.999,
-        up=None, deferred=False, freeze=10000, trunk_scale=0.1, organ_weight=0.0, on_save=None,
+        up=None, deferred=False, freeze=10000, trunk_scale=0.1, organ_weight=0.0, vibe=0.0, on_save=None,
     ):
         """With `deferred`, the model gets (or keeps) the per-pixel stage (model.Deferred):
         added to a model without one, everything else is frozen for `freeze` steps and then
         learns at `trunk_scale` of the rate. `organ_weight` is how much more L1 counts on
-        eyes, sphincters and veins (by the per-pixel stage's organ channels). `up` None keeps
+        eyes, sphincters and veins (by the per-pixel stage's organ channels). `vibe` is the
+        weight of the contextual loss on flesh (`vibe_loss`): there the frame need only look
+        like the target, not match it pixel for pixel. `up` None keeps
         the checkpoint's head (another starts a fresh one). `on_save` is called after each
         checkpoint is written (to commit a volume, say)."""
         self.out = Path(out)
@@ -73,6 +114,7 @@ class Trainer:
         self.train_set = Shards(data, range(n_shards - 1), pixels=deferred)
         self.val_set = Shards(data, [n_shards - 1], pixels=deferred)
         self.organ_weight = organ_weight
+        self.vibe = vibe
         # Until which step everything but the per-pixel stage stands still, and how fast it
         # learns after.
         self.freeze_until, self.trunk_scale = 0, trunk_scale
@@ -108,6 +150,8 @@ class Trainer:
         # A perceptual loss on top of L1, against the blur that L1 alone settles for.
         self.lpips_weight = lpips_weight
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(self.device).eval().requires_grad_(False)
+        # Per pixel, to leave flesh out of it.
+        self.lpips_map = lpips.LPIPS(net="alex", spatial=True, verbose=False).to(self.device).eval().requires_grad_(False) if vibe > 0 else None
         covers = ("cover", "part_cover", "organ_cover")
         stage = lambda n: n.startswith("deferred.")  # noqa: E731
         main = [p for n, p in self.model.named_parameters() if n not in covers and not stage(n)]
@@ -204,8 +248,10 @@ class Trainer:
         return peak
 
     def forward(self, batch, model=None, weight=False):
-        """(prediction, target) for a batch: the level alone. With `weight`, also how much
-        each pixel's L1 counts [b, 240, width] (None: all alike)."""
+        """(prediction, target) for a batch: the level alone. With `weight`, also what the
+        losses need to know of each pixel: a dict with how much its L1 counts ("weight",
+        [b, 240, width]) and whether it's flesh to be judged by its look ("flesh"), each only
+        when in use."""
         feats, tex, pad, cams, images = (x.to(self.device, non_blocking=True) for x in batch[:5])
         organs = tuple(x.to(self.device, non_blocking=True) for x in batch[6])
         model = model or self.model
@@ -218,21 +264,47 @@ class Trainer:
             pred = model(feats, tex, pad, cams, width=images.shape[3], organs=organs, pixels=px)
         if not weight:
             return pred.float(), images
-        w = None
-        if px is not None and self.organ_weight > 0:
+        aux = {}
+        if px is not None:
             plain = px[0]
             organ = (plain[:, 9] + plain[:, 10] + (plain[:, 18] > 0.5).float()).clamp(max=1)
-            w = 1 + self.organ_weight * organ
-        return pred.float(), images, w
+            if self.organ_weight > 0:
+                aux["weight"] = 1 + self.organ_weight * organ
+            if self.vibe > 0:
+                # Turned well over, and no eye or vein (those are placed, so matched exactly).
+                aux["flesh"] = (plain[:, 5] > 0.5) & (plain[:, 6] > 0.5) & (organ < 0.5)
+        return pred.float(), images, aux
 
-    def losses(self, pred, target, weight=None):
-        """(training loss, L1, LPIPS) for a batch; `weight` [b, 240, width] weighs the L1 the
-        loss uses (the L1 it reports is plain)."""
+    def losses(self, pred, target, aux=None):
+        """(training loss, L1, LPIPS) for a batch; `aux` (from `forward`) weighs the L1 the
+        loss uses and says where flesh is judged by its look (the L1 and LPIPS it reports are
+        plain, over the whole frame)."""
+        aux = aux or {}
+        weight, flesh = aux.get("weight"), aux.get("flesh")
         l1 = loss_fn(pred, target)
-        fit = l1 if weight is None else ((pred - target).abs().mean(1) * weight).sum() / weight.sum()
+        if weight is None and flesh is None:
+            fit = l1
+        else:
+            err = (pred - target).abs().mean(1)
+            if flesh is not None:
+                # On flesh only the broad colour and light have to be in place.
+                blur = lambda x: F.avg_pool2d(x, 9, 1, 4, count_include_pad=False)  # noqa: E731
+                err = torch.where(flesh, (blur(pred) - blur(target)).abs().mean(1), err)
+            w = weight if weight is not None else torch.ones_like(err)
+            fit = (err * w).sum() / w.sum()
         with torch.autocast(self.device, dtype=torch.float16, enabled=self.amp):
-            perceptual = self.lpips(pred * 2 - 1, target * 2 - 1).float().mean()
-        return fit + self.lpips_weight * perceptual, l1, perceptual
+            if flesh is None:
+                perceptual = self.lpips(pred * 2 - 1, target * 2 - 1).float().mean()
+                learn = perceptual
+            else:
+                lmap = self.lpips_map(pred * 2 - 1, target * 2 - 1).float()[:, 0]
+                perceptual = lmap.mean()
+                rest = (~flesh).float()
+                learn = (lmap * rest).sum() / rest.sum().clamp(min=1)
+        loss = fit + self.lpips_weight * learn
+        if flesh is not None:
+            loss = loss + self.vibe * vibe_loss(self.lpips.net, self.lpips.scaling_layer, pred, target, flesh)
+        return loss, l1, perceptual
 
     def run(self, minutes=None, steps=None, log_every=50, sample_every=500, decay=False, spent=0.0, total=None):
         """Train for `minutes` and/or `steps`. With `decay`, the learning rate follows a cosine
@@ -342,7 +414,8 @@ if __name__ == "__main__":
     ap.add_argument("--deferred", action="store_true", help="add (or keep) the per-pixel stage")
     ap.add_argument("--freeze", type=int, default=10000, help="steps the rest stands still when the stage is new")
     ap.add_argument("--organ-weight", type=float, default=0.0, help="extra weight of L1 on organs")
+    ap.add_argument("--vibe", type=float, default=0.0, help="weight of the contextual loss on flesh")
     a = ap.parse_args()
     t = Trainer(a.data, a.out, small=a.small, batch=a.batch, workers=a.workers, lpips_weight=a.lpips, up=a.up,
-                deferred=a.deferred, freeze=a.freeze, organ_weight=a.organ_weight)
+                deferred=a.deferred, freeze=a.freeze, organ_weight=a.organ_weight, vibe=a.vibe)
     t.run(minutes=a.minutes, steps=a.steps, log_every=a.log_every, sample_every=a.sample_every, decay=a.decay)

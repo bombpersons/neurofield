@@ -114,12 +114,50 @@ cut off. And a blend with the previous frame along the camera's motion, if it fl
    project; the trainer rasterises on its device), and `Trainer(deferred=True, freeze,
    organ_weight)` / `train.py --deferred`. Run 7 with a fresh stage draws exactly what run 7
    draws; six CPU steps train, freeze and save. The stage adds 6.4M parameters, nearly all
-   latent textures. The decoder reads 71 channels (16 head, 22 plain, 8 level, 8 flesh, 8 eye,
+   latent textures. The decoder reads 66 channels (16 head, 22 plain, 8 level, 8 flesh, 8 eye,
    4 iris), more than the bench's 48. `export_weights.py` and the game don't know the stage
    yet (step 4).
 3. Pilot, 2.5 h. Decide on the full run from the flesh/organ numbers and the samples.
 4. Engine: G-buffer pass, latent textures, the WGSL kernel; compare against PyTorch on the
    same view (as `datagen check` does for the network now) and time it.
+
+## Porting to the game: what's missing (surveyed 2026-11-12, on hold)
+
+On hold until a run shows the stage learning flesh (`vibe1`, the contextual loss on flesh,
+`train.py --vibe`). The game can't load `runs/sculpt1` or `runs/stage1` yet; in order:
+
+1. **The transformer's inputs.** Sculpt-trained models take 61-float triangle tokens: the 46
+   plain ones plus the turning columns, and strangeness replaced by `amount * mean(turning[:, :3])`
+   (`data.py` around `tri_tokens`, `TRI_FEATURES` 61). The engine's `tokens::tokens` makes 46
+   and no turning (`engine/src/neural/tokens.rs`, `features.rs`). The game has the turning and
+   organs only under `--sculpt` (`Sim.sculpted`; `dreamed::turning_features`, `dreamed::organs`
+   with `sim.dream_time`), and so far only datagen calls them.
+2. **Organ tokens.** A port of `data.organ_tokens` (23 features, box at 12:16), `organ_in` (23 +
+   4 x 16 Fourier of the box), `organ_kind`, the organs appended after the triangles through the
+   encoder and the decoder's keys, and their coverage bias `-organ_cover[l, h] * box distance`
+   (`model.py` Renderer.forward). `GpuNet::render` builds only camera + triangles, and the cover
+   bias only from triangle boxes (`gpu_net.rs`).
+3. **The resize head.** These models upsample by bilinear x2 then a 3x3 conv (c channels, not
+   4c); the game only has the pixel-shuffle head (`conv3x3` SHUFFLE, scratch sized for it).
+   `upsample2` in `dream_net.wgsl` already matches `F.interpolate(bilinear, align_corners=False)`.
+4. **The export and loader.** `export_weights.py` dumps every tensor but its cfg leaves out
+   `up` and `deferred`; `GpuNet::load` rejects unknown weights (`organ_*`, `deferred.*`) and
+   doesn't check `tri_in.0`'s width (157 now). Beware `model.sh`: it exports the newest
+   `runs/*/ckpt.pt` over `runs/model.safetensors`, which the game would then refuse.
+5. **The stage.** A G-buffer pass with the 22 plain channels (`pixels.py`, order there) and the
+   sampling coordinates; the latents as textures (`level` 8 x 384 x 512 atlas of 12 tiles 4 x 3,
+   half-texel inset; `flesh` 8 slots x 8 x 256 x 256 wrapped; `eye` 8 x 8 blinks x 64 x 64,
+   trilinear with zero edges; `iris` 4 x 64 x 64 shifted by -0.8 (gaze - 0.5)); and the MLP
+   66 -> 64 -> 64 -> 3 (GELU), reading head's last 16 | plain 22 | level x covered 8 | flesh x mask 8
+   | eye x on 8 | iris x on 4, added to the head's RGB. The G-buffer must split and snap as
+   `gbuffer.py` does, which follows the renderer as it was before 1f87ae5 (midpoint splits,
+   snapped corners); the game now splits at T-junctions and by longest edges, and doesn't
+   snap, so one or the other has to change to agree.
+6. **Checks.** A `datagen check` for sculpted views (turning, amount, organs written out) and a
+   fixture check of the stage as `datagen dream-check` does for the dream net.
+
+Parts 1-4 run sculpt1's kind of net in the game; 5 adds the stage. Cheaper first look, if
+wanted: the PyTorch model over a recorded walk through a sculpted level, as a video.
 
 ## Open questions
 

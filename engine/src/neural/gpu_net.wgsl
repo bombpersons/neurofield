@@ -174,8 +174,9 @@ fn layer_norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id
 
 // Attention softmax in place over scores [batch (heads)][m][n] at a_off: each score is scaled
 // by f0, then, if b_off != NONE, has strength[head] * dist[row][col] taken off (strength at
-// b_off + head, dist at x1 with row stride n: the coverage bias), and columns from x2 on are
-// masked out (padding). One workgroup per row.
+// b_off + head, dist at x1 with row stride n: the coverage bias; from column k on, if k > 0,
+// the organs' strength at c_off + head instead), and columns from x2 on are masked out
+// (padding). One workgroup per row.
 @compute @workgroup_size(64)
 fn softmax(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid3: vec3<u32>) {
     let head = wg.y;
@@ -184,11 +185,13 @@ fn softmax(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l
     let x = p.a_off + (head * p.m + row) * p.n;
     let cover = p.b_off != NONE;
     var strength = 0.0;
+    var organ_strength = 0.0;
     if (cover) { strength = mem[p.b_off + head]; }
+    if (cover && p.k > 0u) { organ_strength = mem[p.c_off + head]; }
     var mx = -3.0e38;
     for (var j = lid; j < p.x2; j += 64u) {
         var s = mem[x + j] * p.f0;
-        if (cover) { s -= strength * mem[p.x1 + row * p.n + j]; }
+        if (cover) { s -= select(strength, organ_strength, p.k > 0u && j >= p.k) * mem[p.x1 + row * p.n + j]; }
         mem[x + j] = s;
         mx = max(mx, s);
     }
@@ -201,10 +204,10 @@ fn softmax(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l
 
 // ---- Inputs ---------------------------------------------------------------------------------
 
-// The triangle MLP's input: m rows of [features (k = 46), Fourier features of the 6 NDC
-// coordinates (16 each: sin at 8 octaves from pi / 4, then cos)], from features at a_off to
-// c_off (row stride n = k + 96). Angles are reduced in turns first, exactly, since GPU sin and
-// cos lose accuracy far from zero.
+// The triangle (or organ) MLP's input: m rows of [features (k of them), Fourier features of
+// the coordinates from column x0 on (16 each: sin at 8 octaves from pi / 4, then cos)], from
+// features at a_off (row stride a_rs) to c_off (row stride n, k + 16 a coordinate). Angles
+// are reduced in turns first, exactly, since GPU sin and cos lose accuracy far from zero.
 @compute @workgroup_size(64)
 fn prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.y;
@@ -212,10 +215,10 @@ fn prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (row >= p.m || col >= p.n) { return; }
     var v: f32;
     if (col < p.k) {
-        v = mem[p.a_off + row * p.k + col];
+        v = mem[p.a_off + row * p.a_rs + col];
     } else {
         let c = col - p.k;
-        let x = mem[p.a_off + row * p.k + 9u + c / 16u];
+        let x = mem[p.a_off + row * p.a_rs + p.x0 + c / 16u];
         let r = c % 16u;
         // angle = x * 2^(band - 2) * pi = 2 pi * (x * 2^(band - 3)) turns
         let turns = fract(x * exp2(f32(r % 8u) - 3.0));
@@ -236,17 +239,25 @@ fn add_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     mem[p.c_off + (1u + row) * p.n + col] += mem[p.b_off + t * p.n + col];
 }
 
-// Coverage distances, as model.py cover_distance: for patch i < m and token j < n, the
-// distance in patch widths (f0) from the patch centre (x, y at b_off + 2i) to the screen
-// bounding box of triangle j - 1 (NDC at features a_off + (j - 1) * k + 9), 0 for the
-// camera token j = 0; written to c_off + i * n + j.
+// Coverage distances, as model.py cover_distance and box_distance: for patch i < m and token
+// j < n, the distance in patch widths (f0) from the patch centre (x, y at b_off + 2i) to the
+// screen bounding box of triangle j - 1 (NDC at features a_off + (j - 1) * k + 9), 0 for the
+// camera token j = 0; from j = x0 on, of organ j - x0's screen box (x0, y0, x1, y1 at x1 +
+// (j - x0) * 23 + 12); written to c_off + i * n + j.
 @compute @workgroup_size(64)
 fn cover_distance(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = gid.x;
     let i = gid.y;
     if (i >= p.m || j >= p.n) { return; }
     var d = 0.0;
-    if (j > 0u) {
+    if (j >= p.x0 && p.x0 > 0u) {
+        let f = p.x1 + (j - p.x0) * 23u + 12u;
+        let lo = vec2<f32>(mem[f], mem[f + 1u]);
+        let hi = vec2<f32>(mem[f + 2u], mem[f + 3u]);
+        let c = vec2<f32>(mem[p.b_off + 2u * i], mem[p.b_off + 2u * i + 1u]);
+        let gap = max(lo - c, vec2<f32>(0.0)) + max(c - hi, vec2<f32>(0.0));
+        d = length(gap) / p.f0;
+    } else if (j > 0u) {
         let f = p.a_off + (j - 1u) * p.k + 9u;
         let lo = vec2<f32>(min(min(mem[f], mem[f + 2u]), mem[f + 4u]), min(min(mem[f + 1u], mem[f + 3u]), mem[f + 5u]));
         let hi = vec2<f32>(max(max(mem[f], mem[f + 2u]), mem[f + 4u]), max(max(mem[f + 1u], mem[f + 3u]), mem[f + 5u]));
@@ -404,4 +415,417 @@ fn add(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * 65535u * 64u + gid.x;
     if (i >= p.m) { return; }
     mem[p.c_off + i] += mem[p.a_off + i];
+}
+
+// c = mix(c, a, f0) over m floats: the glitch panel's echoes (last frame's latents kept).
+@compute @workgroup_size(64)
+fn lerp_into(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * 65535u * 64u + gid.x;
+    if (i >= p.m) { return; }
+    mem[p.c_off + i] = mix(mem[p.c_off + i], mem[p.a_off + i], p.f0);
+}
+
+// Doubles planes [z][m / 2][n / 2] at a_off to [z][m][n] at c_off, bilinearly, as
+// F.interpolate(scale_factor=2, mode="bilinear", align_corners=False); z by dispatch depth.
+@compute @workgroup_size(16, 16)
+fn resize2(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    let c = gid.z;
+    if (x >= p.n || y >= p.m) { return; }
+    let hm = i32(p.m / 2u);
+    let hn = i32(p.n / 2u);
+    let src = p.a_off + c * u32(hm * hn);
+    let ox = 2 * i32(x & 1u) - 1;
+    let oy = 2 * i32(y & 1u) - 1;
+    let x0 = i32(x / 2u);
+    let y0 = i32(y / 2u);
+    let x1 = clamp(x0 + ox, 0, hn - 1);
+    let y1 = clamp(y0 + oy, 0, hm - 1);
+    let a = mem[src + u32(y0 * hn + x0)];
+    let b = mem[src + u32(y0 * hn + x1)];
+    let cc = mem[src + u32(y1 * hn + x0)];
+    let d = mem[src + u32(y1 * hn + x1)];
+    mem[p.c_off + c * p.m * p.n + y * p.n + x] = 0.75 * (0.75 * a + 0.25 * b) + 0.25 * (0.75 * cc + 0.25 * d);
+}
+
+// ---- The per-pixel stage ----------------------------------------------------------------------
+// train/pixels.py `one_view` and model.py `Deferred` up to its MLP: for each pixel, which piece
+// it shows (gbuffer.py `rasterise`: the nearest by 1/z, of those as near the later), what the
+// G-buffer says of it, and the latent textures sampled there, written as planes [66][m][n] at
+// c_off: the head's last 16 channels (planes at bias_off), the 22 plain channels, then the
+// level (8, times covered), flesh (8, times on flesh), eye (8) and iris (4, both times on an
+// eye) latents. Pieces (gbuffer.rs PIECE floats) at a_off, rows (ROW) at b_off, tiles (start,
+// count) at x0, their lists at x1, k organs (19 floats each) at x2, the view (views.npy row)
+// at a_bs, the latents at a_rs (level), a_cs (flesh), b_bs (eye) and b_rs (iris); the dial's
+// amount in f0. A workgroup per 16x16 tile.
+
+const PIECE: u32 = 19u;
+const ROW: u32 = 31u;
+const LEVEL_SIZE: u32 = 128u;
+const FLESH_SIZE: u32 = 256u;
+const EYE_SIZE: u32 = 64u;
+const BLINKS: u32 = 8u;
+
+fn piece_weights(q: u32, cx: f32, cy: f32) -> vec3<f32> {
+    let a = vec2<f32>(mem[q], mem[q + 1u]);
+    let b = vec2<f32>(mem[q + 2u], mem[q + 3u]);
+    let c = vec2<f32>(mem[q + 4u], mem[q + 5u]);
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    let l0 = ((b.x - cx) * (c.y - cy) - (b.y - cy) * (c.x - cx)) / area;
+    let l1 = ((c.x - cx) * (a.y - cy) - (c.y - cy) * (a.x - cx)) / area;
+    return vec3<f32>(l0, l1, 1.0 - l0 - l1);
+}
+
+// gbuffer.py's far(): a ray that never meets a plane is far off it, by the sign of the infinity.
+fn clamp_far(x: f32) -> f32 {
+    return clamp(x, -1e3, 1e3);
+}
+
+// Bilinear from plane `c` [h][w] at `base`, at normalised (x, y), zeros outside: grid_sample
+// with align_corners=False.
+fn bilinear(base: u32, h: u32, w: u32, x: f32, y: f32) -> f32 {
+    let ix = ((x + 1.0) * f32(w) - 1.0) * 0.5;
+    let iy = ((y + 1.0) * f32(h) - 1.0) * 0.5;
+    let x0 = floor(ix);
+    let y0 = floor(iy);
+    let fx = ix - x0;
+    let fy = iy - y0;
+    var s = 0.0;
+    for (var j = 0; j < 2; j++) {
+        for (var i = 0; i < 2; i++) {
+            let xi = i32(x0) + i;
+            let yj = i32(y0) + j;
+            if (xi >= 0 && xi < i32(w) && yj >= 0 && yj < i32(h)) {
+                let k = select(1.0 - fx, fx, i == 1) * select(1.0 - fy, fy, j == 1);
+                s += k * mem[base + u32(yj) * w + u32(xi)];
+            }
+        }
+    }
+    return s;
+}
+
+@compute @workgroup_size(16, 16)
+fn stage_inputs(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    let width = p.n;
+    if (x >= width || y >= p.m) { return; }
+    let plane = p.m * width;
+    let px = y * width + x;
+    // The glitch panel's lies (GBuffer::floats at c_bs): warp, twist, depth, scramble,
+    // cells, flesh, ghost, time. All zero, the pixel is told the truth.
+    let gl = p.c_bs;
+    let g_warp = mem[gl];
+    let g_twist = mem[gl + 1u];
+    let g_depth = mem[gl + 2u];
+    let g_scramble = mem[gl + 3u];
+    let g_cells = mem[gl + 4u];
+    let g_flesh = mem[gl + 5u];
+    let g_ghost = mem[gl + 6u];
+    let g_t = mem[gl + 7u];
+    let ox = f32(x) + 0.5;
+    let oy = f32(y) + 0.5;
+    // The G-buffer warp: what this pixel shows is looked up somewhere near it.
+    var cx = ox;
+    var cy = oy;
+    if (g_warp > 0.0) {
+        let wv = glitch_wobble(vec2<f32>(ox / 97.0, oy / 83.0), g_t);
+        cx = clamp(ox + g_warp * wv.x, 0.5, f32(width) - 0.5);
+        cy = clamp(oy + g_warp * wv.y, 0.5, f32(p.m) - 0.5);
+    }
+    // Which piece: the nearest of those whose triangle holds the pixel centre.
+    let tile = p.x0 + 2u * ((u32(cy) / 16u) * (width / 16u) + u32(cx) / 16u);
+    let start = u32(mem[tile]);
+    let count = u32(mem[tile + 1u]);
+    var best = -1.0;
+    var who = -1;
+    for (var e = 0u; e < count; e++) {
+        let k = u32(mem[p.x1 + start + e]);
+        let q = p.a_off + k * PIECE;
+        let lam = piece_weights(q, cx, cy);
+        if (lam.x >= 0.0 && lam.y >= 0.0 && lam.z >= 0.0) {
+            let iz = lam.x * mem[q + 6u] + lam.y * mem[q + 7u] + lam.z * mem[q + 8u];
+            if (iz > best || (iz == best && i32(k) > who)) {
+                best = iz;
+                who = i32(k);
+            }
+        }
+    }
+    let covered = who >= 0;
+    let cov = select(0.0, 1.0, covered);
+    var w = vec3<f32>(0.0);
+    var row = p.b_off;
+    if (covered) {
+        let q = p.a_off + u32(who) * PIECE;
+        let lam = piece_weights(q, cx, cy);
+        for (var j = 0u; j < 3u; j++) {
+            w[j] = lam.x * mem[q + 10u + j] + lam.y * mem[q + 13u + j] + lam.z * mem[q + 16u + j];
+        }
+        row = p.b_off + u32(mem[q + 9u]) * ROW;
+    }
+    let iz = max(best, 0.0);
+    let face = f32((row - p.b_off) / ROW);
+    let v = p.a_bs;
+    let h = mem[v + 13u];
+    let R = mat3x3<f32>(mem[v + 4u], mem[v + 7u], mem[v + 10u], mem[v + 5u], mem[v + 8u], mem[v + 11u], mem[v + 6u], mem[v + 9u], mem[v + 12u]);
+    // (R is the view's rows as columns of the transpose: R * d turns a world direction d.)
+
+    // Texture, and where on it.
+    var texid = 0u;
+    if (covered) { texid = u32(clamp(mem[row + 15u], 0.0, 11.0)); }
+    var uv = clamp(vec2<f32>(w.x * mem[row + 9u] + w.y * mem[row + 11u] + w.z * mem[row + 13u],
+                             w.x * mem[row + 10u] + w.y * mem[row + 12u] + w.z * mem[row + 14u]) * (64.0 / 63.0), vec2<f32>(0.0), vec2<f32>(1.0));
+    // Facing, in view space.
+    var n = vec3<f32>(0.0);
+    if (covered) {
+        let p0 = vec3<f32>(mem[row], mem[row + 1u], mem[row + 2u]);
+        let p1 = vec3<f32>(mem[row + 3u], mem[row + 4u], mem[row + 5u]);
+        let p2 = vec3<f32>(mem[row + 6u], mem[row + 7u], mem[row + 8u]);
+        let c = R * cross(p1 - p0, p2 - p0);
+        n = c / max(length(c), 1e-9);
+        if (g_twist > 0.0) {
+            let tw = vec3<f32>(sin(face * 12.9898 + g_t * 0.5), sin(face * 78.233 + g_t * 0.37), sin(face * 37.719 + g_t * 0.29));
+            n = normalize(n + g_twist * tw);
+        }
+    }
+    let near = h / 2.0 / 256.0;
+    var inv = clamp(iz * near, 0.0, 2.0);
+    if (g_depth > 0.0) {
+        inv = clamp(inv * exp(g_depth * sin(cx * 0.021 + g_t * 0.6 + 2.0 * sin(cy * 0.033 - g_t * 0.4))), 0.0, 2.0);
+    }
+    // Flesh.
+    let t = row + 16u;
+    var lay = vec2<f32>(w.x * mem[t + 3u] + w.y * mem[t + 5u] + w.z * mem[t + 7u], w.x * mem[t + 4u] + w.y * mem[t + 6u] + w.z * mem[t + 8u]);
+    var slot = i32(texid);
+    if (texid == 3u) { slot = 0; } else if (texid == 4u || texid == 5u) { slot = 1; } else if (texid == 7u) { slot = 6; } else if (texid >= 8u) { slot = -1; }
+    var lays = 0.0;
+    for (var j = 3u; j < 9u; j++) { lays += abs(mem[t + j]); }
+    let truly = covered && lays > 0.0 && slot >= 0;
+    var reach = p.f0 * (w.x * mem[t] + w.y * mem[t + 1u] + w.z * mem[t + 2u]);
+    // Flesh told where there is none: its latent faded in by g_flesh, laid by the texture.
+    let flesh = truly || (covered && g_flesh > 0.0);
+    let fleshness = select(g_flesh, 1.0, truly);
+    if (flesh && !truly) {
+        slot = max(slot, 0);
+        if (lays == 0.0) { lay = uv * 2.0; }
+        reach = max(reach, g_flesh);
+    }
+    // Each face's texture turned and scaled its own way, and the coordinates snapped to cells.
+    if (g_scramble > 0.0 && covered) {
+        let a = g_scramble * 6.2832 * fract(sin(face * 91.17) * 43758.5);
+        let sc = 1.0 + g_scramble * 2.0 * fract(sin(face * 27.3) * 1373.1);
+        let turn = mat2x2<f32>(cos(a), sin(a), -sin(a), cos(a));
+        uv = fract(turn * (uv - 0.5) * sc + 0.5);
+        lay = turn * lay * sc;
+    }
+    if (g_cells > 0.0) {
+        uv = clamp((floor(uv * g_cells) + 0.5) / g_cells, vec2<f32>(0.0), vec2<f32>(1.0));
+        lay = (floor(lay * g_cells) + 0.5) / g_cells;
+    }
+    let fh = t + 9u;
+    let fold = mem[fh] * w.x * (2.0 * w.x - 1.0) + mem[fh + 1u] * w.y * (2.0 * w.y - 1.0) + mem[fh + 2u] * w.z * (2.0 * w.z - 1.0)
+        + 4.0 * (mem[fh + 3u] * w.x * w.y + mem[fh + 4u] * w.x * w.z + mem[fh + 5u] * w.y * w.z);
+
+    // Organs, where the pixel's ray meets their planes.
+    var feat = array<f32, 13>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    if (p.k > 0u) {
+        let ray = vec3<f32>((cx - f32(width) / 2.0) / h, (cy - 120.0) / h, 1.0);
+        let depth = select(1e6, 1.0 / max(iz, 1e-6), covered);
+        let pos = vec3<f32>(mem[v + 1u], mem[v + 2u], mem[v + 3u]);
+        var spot_best = 3.0e38;
+        var spot_i = 0u;
+        var spot_on = false;
+        var spot_u = 0.0;
+        var spot_v = 0.0;
+        var spot_r2 = 0.0;
+        var vein_key = 1e30;
+        var vein_i = 0u;
+        var vein_u = 0.0;
+        var vein_v = 0.0;
+        for (var i = 0u; i < p.k; i++) {
+            let o = p.x2 + i * 19u;
+            let kind = u32(mem[o]);
+            let at = R * (vec3<f32>(mem[o + 1u], mem[o + 2u], mem[o + 3u]) - pos);
+            let faces = R * vec3<f32>(mem[o + 4u], mem[o + 5u], mem[o + 6u]);
+            let across = R * vec3<f32>(mem[o + 7u], mem[o + 8u], mem[o + 9u]);
+            let up = R * vec3<f32>(mem[o + 10u], mem[o + 11u], mem[o + 12u]);
+            let num = dot(at, faces);
+            var den = dot(ray, faces);
+            if (!(abs(den) > 1e-6)) { den = 1e-6; }
+            let tt = num / den;
+            let meets = tt > 0.0;
+            var u = 0.0;
+            var vv = 0.0;
+            if (meets) {
+                let d = ray * tt - at;
+                u = clamp_far(dot(d, across) / max(mem[o + 13u], 1e-4));
+                vv = clamp_far(dot(d, up) / max(mem[o + 14u], 1e-4));
+            } else {
+                // ray * inf - at: each part infinite with its ray's sign; summed along a way, a
+                // mix of signs (or a zero times infinity) is NaN, which far() makes 1e3.
+                u = far_sign(ray, across);
+                vv = far_sign(ray, up);
+            }
+            if (g_ghost > 0.0) {
+                u = abs(u) - 1.2 * g_ghost;
+                vv = vv * (1.0 + g_ghost);
+            }
+            let seen = meets && tt < depth + 0.1;
+            let r2 = u * u + vv * vv;
+            if (seen && kind <= 1u && r2 < 1.44 && mem[o + 15u] > 0.0 && r2 < spot_best) {
+                spot_best = r2;
+                spot_i = i;
+                spot_on = true;
+                spot_u = u;
+                spot_v = vv;
+                spot_r2 = r2;
+            }
+            // The vein nearest across, by exp(-v^2) as pixels.py has it. That is above zero in
+            // PyTorch down to the smallest denormal, v^2 about 104, which the GPU flushes to
+            // zero, so compare v^2 instead.
+            let v2 = vv * vv;
+            let near = seen && kind == 2u && abs(u) <= 1.0 && v2 < 103.9;
+            if (i == 0u || (near && v2 < vein_key)) {
+                vein_key = select(1e30, v2, near);
+                vein_i = i;
+                vein_u = u;
+                vein_v = vv;
+            }
+        }
+        if (spot_on) {
+            let o = p.x2 + spot_i * 19u;
+            let kind = u32(mem[o]);
+            feat[0] = select(0.0, 1.0, kind == 0u);
+            feat[1] = select(0.0, 1.0, kind == 1u);
+            feat[2] = spot_u;
+            feat[3] = spot_v;
+            feat[4] = sqrt(spot_r2);
+            feat[5] = mem[o + 15u];
+            feat[6] = mem[o + 16u];
+            feat[7] = mem[o + 17u];
+            feat[8] = mem[o + 18u];
+        }
+        let vein_best = select(0.0, exp(-vein_key), vein_key < 103.9);
+        feat[9] = vein_best;
+        feat[10] = clamp(vein_v, -3.0, 3.0) / 3.0;
+        feat[11] = clamp(vein_u, -1.0, 1.0);
+        feat[12] = select(0.0, mem[p.x2 + vein_i * 19u + 15u], vein_best > 0.01);
+    }
+
+    let out = p.c_off;
+    // The glitch panel's smear (f2 pixels, at f3 seconds): the head's channels read from
+    // beside the pixel, so what the network meant slides off the walls.
+    var hp = px;
+    if (p.f2 > 0.0) {
+        let dx = p.f2 * sin(oy * 0.11 + p.f3 * 1.3 + 2.0 * sin(ox * 0.031 - p.f3 * 0.7));
+        let dy = 0.5 * p.f2 * sin(ox * 0.083 - p.f3 * 0.9 + 2.0 * sin(oy * 0.047 + p.f3 * 0.5));
+        let sx = clamp(i32(round(ox - 0.5 + dx)), 0, i32(width) - 1);
+        let sy = clamp(i32(round(oy - 0.5 + dy)), 0, i32(p.m) - 1);
+        hp = u32(sy) * width + u32(sx);
+    }
+    for (var c = 0u; c < 16u; c++) {
+        mem[out + c * plane + px] = mem[p.bias_off + c * plane + hp];
+    }
+    var plain = array<f32, 22>(cov, inv, n.x * cov, n.y * cov, n.z * cov, select(0.0, fleshness, flesh), reach, p.f0, fold * 4.0,
+        feat[0], feat[1], feat[2], feat[3], feat[4], feat[5], feat[6], feat[7], feat[8], feat[9], feat[10], feat[11], feat[12]);
+    for (var c = 0u; c < 22u; c++) {
+        mem[out + (16u + c) * plane + px] = clamp(plain[c], -1e3, 1e3);
+    }
+
+    // The level latent: tile `texid` of the 4 x 3 atlas, half a texel inside it.
+    let e = 0.5 / f32(LEVEL_SIZE);
+    // The glitch panel's warp (f1 of a texture, at f3 seconds): the latents read off true.
+    var wuv = uv;
+    if (p.f1 > 0.0) { wuv = fract(uv + p.f1 * glitch_wobble(uv, p.f3)); }
+    let luv = wuv * (1.0 - 2.0 * e) + e;
+    let ax = (f32(texid % 4u) + luv.x) / 4.0 * 2.0 - 1.0;
+    let ay = (f32(texid / 4u) + luv.y) / 3.0 * 2.0 - 1.0;
+    let ah = 3u * LEVEL_SIZE;
+    let aw = 4u * LEVEL_SIZE;
+    for (var c = 0u; c < 8u; c++) {
+        mem[out + (38u + c) * plane + px] = bilinear(p.a_rs + c * ah * aw, ah, aw, ax, ay) * cov;
+    }
+    // The flesh latent of the painted slot, wrapping.
+    let fs = i32(FLESH_SIZE);
+    let wl = lay + p.f1 * glitch_wobble(lay, p.f3);
+    let lx = (wl.x - floor(wl.x)) * f32(FLESH_SIZE) - 0.5;
+    let ly = (wl.y - floor(wl.y)) * f32(FLESH_SIZE) - 0.5;
+    let fx0 = floor(lx);
+    let fy0 = floor(ly);
+    let ffx = lx - fx0;
+    let ffy = ly - fy0;
+    let xa = u32(((i32(fx0) % fs) + fs) % fs);
+    let xb = u32(((i32(fx0) + 1) % fs + fs) % fs);
+    let ya = u32(((i32(fy0) % fs) + fs) % fs) * FLESH_SIZE;
+    let yb = u32(((i32(fy0) + 1) % fs + fs) % fs) * FLESH_SIZE;
+    for (var c = 0u; c < 8u; c++) {
+        var s = 0.0;
+        if (flesh) {
+            let base = p.a_cs + (u32(max(slot, 0)) * 8u + c) * FLESH_SIZE * FLESH_SIZE;
+            let top = mem[base + ya + xa] * (1.0 - ffx) + mem[base + ya + xb] * ffx;
+            let bottom = mem[base + yb + xa] * (1.0 - ffx) + mem[base + yb + xb] * ffx;
+            s = (top * (1.0 - ffy) + bottom * ffy) * fleshness;
+        }
+        mem[out + (46u + c) * plane + px] = s;
+    }
+    // The eye by blink, trilinearly, and the iris shifted by the gaze; only on an eye.
+    let on = feat[0] > 0.0;
+    let eu = clamp(feat[2], -1.0, 1.0);
+    let ev = clamp(feat[3], -1.0, 1.0);
+    let ez = clamp(feat[6], 0.0, 1.0) * 2.0 - 1.0;
+    let iz3 = ((ez + 1.0) * f32(BLINKS) - 1.0) * 0.5;
+    let z0 = floor(iz3);
+    let fz = iz3 - z0;
+    let es = EYE_SIZE * EYE_SIZE;
+    for (var c = 0u; c < 8u; c++) {
+        var s = 0.0;
+        if (on) {
+            for (var k = 0; k < 2; k++) {
+                let zi = i32(z0) + k;
+                if (zi >= 0 && zi < i32(BLINKS)) {
+                    s += select(1.0 - fz, fz, k == 1) * bilinear(p.b_bs + (c * BLINKS + u32(zi)) * es, EYE_SIZE, EYE_SIZE, eu, ev);
+                }
+            }
+        }
+        mem[out + (54u + c) * plane + px] = s;
+    }
+    let gx = feat[7] - 0.5;
+    let gy = feat[8] - 0.5;
+    for (var c = 0u; c < 4u; c++) {
+        var s = 0.0;
+        if (on) { s = bilinear(p.b_rs + c * es, EYE_SIZE, EYE_SIZE, eu - 0.8 * gx, ev - 0.8 * gy); }
+        mem[out + (62u + c) * plane + px] = s;
+    }
+}
+
+// The glitch panel's warp: slow waves, about -1..1 on each axis, at `q` and `t` seconds.
+fn glitch_wobble(q: vec2<f32>, t: f32) -> vec2<f32> {
+    let a = 6.2832 * (1.7 * q.y + 0.13 * t) + 2.0 * sin(6.2832 * (0.9 * q.x - 0.1 * t));
+    let b = 6.2832 * (1.3 * q.x - 0.11 * t) + 2.0 * sin(6.2832 * (1.1 * q.y + 0.07 * t));
+    return vec2<f32>(sin(a), sin(b));
+}
+
+// What dot(ray * inf - at, way) is after far(): +-1e3 by the sign of the infinite sum, 1e3 if
+// it is NaN (infinities of both signs, or an infinity times zero).
+fn far_sign(ray: vec3<f32>, way: vec3<f32>) -> f32 {
+    var pos = false;
+    var neg = false;
+    var nan = false;
+    for (var i = 0; i < 3; i++) {
+        let r = ray[i];
+        let a = way[i];
+        if (r == 0.0) {
+            // 0 * inf is NaN: the point itself is NaN along this axis.
+            nan = true;
+        } else if (a == 0.0) {
+            nan = true;
+        } else if ((r > 0.0) == (a > 0.0)) {
+            pos = true;
+        } else {
+            neg = true;
+        }
+    }
+    if (nan || (pos && neg)) { return 1e3; }
+    return select(-1e3, 1e3, pos);
 }

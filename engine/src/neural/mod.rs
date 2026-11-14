@@ -8,8 +8,10 @@ pub mod dream;
 pub mod dream_net;
 pub mod effects;
 pub mod features;
+pub mod gbuffer;
 pub mod gpu;
 pub mod gpu_net;
+pub mod nca;
 pub mod tokens;
 
 use crate::world::rng::Rng;
@@ -52,6 +54,21 @@ impl Network {
     /// The frame (240 high, as wide as the tokens say), RGB floats (roughly 0..1), row by row.
     pub fn render(&mut self, t: &tokens::Tokens, dream: &Dream) -> Vec<f32> {
         self.net.render(t, dream).expect("inference")
+    }
+
+    /// The same for a sculpted level's view, which a model with a per-pixel stage draws on.
+    pub fn render_staged(&mut self, t: &tokens::Tokens, dream: &Dream, view: &gpu_net::StageView) -> Result<Vec<f32>, String> {
+        self.net.render_staged(t, dream, Some(view))
+    }
+
+    /// Change its weights as the glitch panel says (see `gpu_net::Damage`).
+    pub fn set_damage(&mut self, dmg: &gpu_net::Damage) {
+        self.net.set_damage(dmg);
+    }
+
+    /// Whether it was trained on sculpted levels and has a per-pixel stage.
+    pub fn has_stage(&self) -> bool {
+        self.net.has_stage()
     }
 }
 
@@ -144,8 +161,13 @@ impl Level {
 
     /// The same seen from `cam` (looking into this level from another, say).
     pub fn tokens_seen(&self, tris: &[f32], cam: &crate::world::scene::Camera, width: u32) -> tokens::Tokens {
+        tokens::tokens(tris, &self.view(cam, width))
+    }
+
+    /// The view from `cam` as the network is told it (`views.npy`'s row).
+    pub fn view(&self, cam: &crate::world::scene::Camera, width: u32) -> Vec<f32> {
         let mut v = Vec::new();
         view_features(&self.scene, 0, cam, width, &mut v);
-        tokens::tokens(tris, &v)
+        v
     }
 }

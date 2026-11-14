@@ -9,6 +9,7 @@ bevy.workspace = true
 bevy_egui.workspace = true
 psx-bevy.workspace = true
 engine = { path = "../engine" }
+dream-renderer = { path = "../dream-renderer" }
 serde.workspace = true
 ron.workspace = true
 

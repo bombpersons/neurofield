@@ -45,6 +45,63 @@ const OVERLAY_SHADER: Handle<Shader> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5
 const DREAM_SHADER: Handle<Shader> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b14");
 /// The parts' numbers for flesh with nothing that moves (see `FleshMaterial::parts`).
 const NO_PARTS: Handle<ShaderBuffer> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b15");
+/// The living skin (`LivingFlesh`), which every flesh material reads.
+const LIVING: Handle<Image> = uuid_handle!("3b7f0c52-1d4e-4a8b-9f61-2c5e8d0a7b16");
+
+/// A skin that lives: a flesh automaton's texture (`neural::nca`) shown in place of the skin
+/// `layer` wherever flesh wears it, its height sloping the surface by `steep` and folding the
+/// walls there `depth` deep. Set `image`
+/// (RGBA8, colour and height, `size` square) each frame it moves.
+#[derive(Resource, Default)]
+pub struct LivingFlesh {
+    pub layer: Option<u16>,
+    pub steep: f32,
+    /// How deep (tiles) its height folds the walls that wear it, for a height one spread from
+    /// the middle; the folds being its depth alone there (0: the walls fold as they were
+    /// sculpted).
+    pub depth: f32,
+    /// The texture's height now (0..1): its mean and standard deviation.
+    pub height: [f32; 2],
+}
+
+/// The living skin's texture from an automaton's RGBA8 [size * size * 4], with its mips.
+pub fn set_living(images: &mut Assets<Image>, size: usize, rgba: &[u8]) {
+    let mut data = rgba.to_vec();
+    let (mut level, mut s) = (rgba.to_vec(), size);
+    let mut levels = 1;
+    while s > 1 {
+        let h = s / 2;
+        let mut next = vec![0u8; h * h * 4];
+        for y in 0..h {
+            for x in 0..h {
+                for c in 0..4 {
+                    let at = |dx: usize, dy: usize| level[((2 * y + dy) * s + 2 * x + dx) * 4 + c] as u32;
+                    next[(y * h + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+                }
+            }
+        }
+        data.extend_from_slice(&next);
+        (level, s) = (next, h);
+        levels += 1;
+    }
+    let mut image = Image::new(
+        Extent3d { width: size as u32, height: size as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.mip_level_count = levels;
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    let _ = images.insert(&LIVING, image);
+}
 
 // A flesh vertex. Each skin's values ride with each corner (the triangle's own
 // ones repeated): the normal and blend weight, per skin the wrapped and cap
@@ -88,6 +145,12 @@ struct FleshUniform {
     /// Fog near and far.
     fog: Vec4,
     fog_colour: Vec4,
+    /// x: how far the sculpted flesh's dial has turned (`View::dial`); y: the skin layer the
+    /// living texture stands in for, -1 for none; z: how steep its height makes the surface;
+    /// w: how deep it folds the walls.
+    dial: Vec4,
+    /// The living texture's height: its mean and spread (`LivingFlesh::height`).
+    living: Vec4,
 }
 
 /// The creatures of one scene: their skins as texture arrays, one layer per skin.
@@ -105,6 +168,10 @@ pub struct FleshMaterial {
     /// What each part of the flesh that moves is doing now (`world::dreamed::Moving::state`).
     #[storage(4, read_only)]
     parts: Handle<ShaderBuffer>,
+    /// The living skin (`LivingFlesh`).
+    #[texture(5)]
+    #[sampler(6)]
+    living: Handle<Image>,
 }
 
 impl Material for FleshMaterial {
@@ -386,6 +453,7 @@ pub(crate) fn plugin(app: &mut App) {
     ))
     .add_systems(Startup, (setup, no_parts))
     .init_resource::<FleshLayers>()
+    .init_resource::<LivingFlesh>()
     .add_systems(Update, (display_after_overlay, overlay_on, dream_on))
     .add_systems(
         PostUpdate,
@@ -394,9 +462,11 @@ pub(crate) fn plugin(app: &mut App) {
     .add_systems(PostUpdate, update_uniforms);
 }
 
-fn no_parts(mut buffers: ResMut<Assets<ShaderBuffer>>) {
+fn no_parts(mut buffers: ResMut<Assets<ShaderBuffer>>, mut images: ResMut<Assets<Image>>) {
     let none = ShaderBuffer::new(vec![[0.0f32; 4]], RenderAssetUsages::default());
     buffers.insert(&NO_PARTS, none).expect("a handle of our own");
+    // No skin lives until something sets one.
+    set_living(&mut images, 1, &[128, 128, 128, 128]);
 }
 
 fn flesh_image(size: UVec2) -> Image {
@@ -546,7 +616,7 @@ fn follow_camera(
     }
 }
 
-fn uniform(view: &View) -> FleshUniform {
+fn uniform(view: &View, living: &LivingFlesh) -> FleshUniform {
     let Some(cam) = view.cam else { return FleshUniform::default() };
     // No fog: as far off as the level's.
     let (near, far) = if view.clear { (1e4 * TF, 2e4 * TF) } else { (cam.fog_near as f32, cam.fog_far as f32) };
@@ -555,14 +625,16 @@ fn uniform(view: &View) -> FleshUniform {
         torch: Vec4::new(cam.torch[0], cam.torch[1], cam.torch[2], cam.torch_radius.max(1) as f32),
         fog: Vec4::new(near, far, 0.0, 0.0),
         fog_colour: Vec4::new(view.fog_colour[0], view.fog_colour[1], view.fog_colour[2], 0.0),
+        dial: Vec4::new(view.dial, living.layer.map_or(-1.0, |l| l as f32), living.steep, living.depth),
+        living: Vec4::new(living.height[0], living.height[1].max(1e-3), 0.0, 0.0),
     }
 }
 
-fn update_uniforms(view: Res<View>, mut materials: ResMut<Assets<FleshMaterial>>) {
-    if !view.is_changed() {
+fn update_uniforms(view: Res<View>, living: Res<LivingFlesh>, mut materials: ResMut<Assets<FleshMaterial>>) {
+    if !view.is_changed() && !living.is_changed() {
         return;
     }
-    let u = uniform(&view);
+    let u = uniform(&view, &living);
     let ids: Vec<_> = materials.ids().collect();
     for id in ids {
         if let Some(mut m) = materials.get_mut(id) {
@@ -631,7 +703,7 @@ fn spawn_flesh_tris(
         return None;
     }
     let (colour, normal) = skin_arrays(&fl.skins, fl.matte);
-    let material = FleshMaterial { uniform: uniform(view), colour: images.add(colour), normal: images.add(normal), parts: NO_PARTS };
+    let material = FleshMaterial { uniform: uniform(view, &LivingFlesh::default()), colour: images.add(colour), normal: images.add(normal), parts: NO_PARTS, living: LIVING };
     let mesh = meshes.add(mesh(fl, tris, None));
     Some(commands.spawn((Mesh3d(mesh), MeshMaterial3d(materials.add(material)), RenderLayers::layer(FLESH_LAYER))).id())
 }
@@ -649,6 +721,19 @@ pub(crate) fn spawn_moving(
     tris: &[crate::world::flesh::Tri],
 ) -> Entity {
     commands.spawn((Mesh3d(meshes.add(mesh(fl, tris, None))), material.clone(), RenderLayers::layer(FLESH_LAYER), MovingFlesh)).id()
+}
+
+/// Flesh that moves by the dial alone (`world::dreamed::walls_at_rest`): `tris` moving as
+/// `how` says, with the skins of `material` (its parts are never read).
+pub(crate) fn spawn_folding(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    material: &MeshMaterial3d<FleshMaterial>,
+    fl: &Flesh,
+    tris: &[crate::world::flesh::Tri],
+    how: &[[[f32; 4]; 3]],
+) -> Entity {
+    commands.spawn((Mesh3d(meshes.add(mesh(fl, tris, Some(how)))), material.clone(), RenderLayers::layer(FLESH_LAYER), MovingFlesh)).id()
 }
 
 /// The flesh that moves, built once (see `world::dreamed::Moving`), with the skins of

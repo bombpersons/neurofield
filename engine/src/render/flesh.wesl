@@ -12,6 +12,12 @@ struct FleshUniform {
     // Fog near, far.
     fog: vec4<f32>,
     fog_colour: vec4<f32>,
+    // x: how far the sculpted flesh's dial has turned; y: the skin layer the living texture
+    // stands in for (-1 none); z: how steep its height makes the surface; w: how deep (tiles)
+    // its height, a spread from the middle, lifts the flesh walls (all of which wear it).
+    dial: vec4<f32>,
+    // The living skin's height: its mean and spread.
+    living: vec4<f32>,
 };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> u: FleshUniform;
@@ -21,6 +27,9 @@ struct FleshUniform {
 // What the parts of flesh that moves are doing (world::dreamed::Moving::state): first the
 // time and the heartbeat's period, then each part's numbers, which its corners point at.
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var<storage, read> parts: array<vec4<f32>>;
+// A skin that lives (a flesh automaton, render::flesh::LivingFlesh): colour, and height in alpha.
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var living_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var living_sampler: sampler;
 
 struct Vertex {
     @location(0) position: vec3<f32>,
@@ -74,6 +83,49 @@ const LID: i32 = 2;
 const VEIN: i32 = 3;
 const MOUTH: i32 = 4;
 const FILMED: i32 = 5;
+const WALL: i32 = 6;
+// Where along the dial the walls' flesh grows in and sags out: world::dreamed's CREEP, SAG.
+const CREEP: vec2<f32> = vec2(0.25, 0.8);
+const SAG: vec2<f32> = vec2(0.35, 0.85);
+
+fn stage(x: f32, at: vec2<f32>) -> f32 {
+    return smoothstep(0.0, 1.0, (x - at.x) / (at.y - at.x));
+}
+
+// How flesh stands off the stone, softly (tiles): world::dreamed's LIFT, LIFT_SOFT.
+const LIFT: f32 = 0.16;
+const LIFT_SOFT: f32 = 0.05;
+// Tiles one repeat of a flesh texture covers: world::dreamed's SPAN.
+const SPAN: f32 = 2.5;
+
+// The living skin's height at engine-world `p` on a surface facing `n` (world::dreamed::
+// laid_on: laid flat from the side it faces most), a little blurred, in spreads from its
+// middle; and its slope along each way it's laid, per tile.
+struct Living {
+    h: f32,
+    slope: vec3<f32>,
+};
+
+fn living_at(p: vec3<f32>, n: vec3<f32>) -> Living {
+    var au = vec3(1.0, 0.0, 0.0);
+    var av = vec3(0.0, 1.0, 0.0);
+    if abs(n.y) > 0.7 {
+        av = vec3(0.0, 0.0, 1.0);
+    } else if abs(n.x) > abs(n.z) {
+        au = vec3(0.0, 0.0, 1.0);
+    }
+    let uv = vec2(dot(p, au), dot(p, av)) / (SPAN * u.eye.w);
+    // Smoothed to what the wall's points (some 6 texels apart) can follow; the finer
+    // relief is the fragment's.
+    let e = 1.0 / 16.0;
+    let lod = 4.0;
+    var out: Living;
+    out.h = (textureSampleLevel(living_tex, living_sampler, uv, lod).a - u.living.x) / u.living.y;
+    let hu = textureSampleLevel(living_tex, living_sampler, uv + vec2(e, 0.0), lod).a - textureSampleLevel(living_tex, living_sampler, uv - vec2(e, 0.0), lod).a;
+    let hv = textureSampleLevel(living_tex, living_sampler, uv + vec2(0.0, e), lod).a - textureSampleLevel(living_tex, living_sampler, uv - vec2(0.0, e), lod).a;
+    out.slope = (au * hu + av * hv) / (2.0 * e * SPAN * u.living.y);
+    return out;
+}
 
 // How much of a heartbeat is passing, x beats after the last: world::dreamed::beat.
 fn beat(x: f32) -> f32 {
@@ -107,10 +159,13 @@ fn vertex(v: Vertex) -> Varying {
     out.ax1 = v.ax1;
     out.ax2 = v.ax2;
     var shown = true;
+    var light = 1.0;
+    var grow = v.grow;
     @if(MOVING)
     {
         let how = i32(round(v.moves.x));
-        let at = u32(round(v.moves.y));
+        // (Walls have no parts: theirs is a skin.)
+        let at = select(u32(round(v.moves.y)), 0u, how == WALL);
         let first = parts[at];
         if how == BALL {
             // Turned in its socket to look at the viewer, with everything that points.
@@ -174,6 +229,47 @@ fn vertex(v: Vertex) -> Varying {
             // The frame of the film and the gaze it's on.
             shown = first.y > 0.0;
             out.bs0 = vec4(v.bs0.xyz, first.x);
+        } else if how == WALL {
+            // Flesh coming out of the stone and folding out as the dial turns, as
+            // world::dreamed::walls_where has it (walls_at_rest): what folds it rides in the
+            // second skin's slots, which hold the first skin's again after.
+            let here = u.dial.x * v.moves.z;
+            let sag = stage(here, SAG);
+            grow = stage(here, CREEP);
+            let facing = v.nw.xyz;
+            let base = p - facing * 5.0;
+            var h = v.uvcap1.x;
+            // Its height and folded facing; for a fold of the living skin's, how far it has
+            // turned, its room, and the features' hold (a h + b).
+            let bent = vec3(v.uvcap1.y, v.uvcap1.zw);
+            var n = normalize(facing * (1.0 - sag) + bent * sag);
+            var shadow = v.moves.w;
+            let living = u.dial.y >= 0.0 && u.dial.w > 0.0;
+            if living {
+                // While a skin lives, every flesh wall wears it, and its shape is the living
+                // height alone, as it moves: flat stone, lifted softly off it (never into it)
+                // by the height; the sculpted folds are left out.
+                // Its long tail held to two spreads either way, so no one point shoots out.
+                let live = living_at(base, facing);
+                let held = 2.0 * tanh(live.h * 0.5);
+                let raw = u.dial.w * held;
+                let x = raw + LIFT;
+                let soft = sqrt(x * x + 4.0 * LIFT_SOFT * LIFT_SOFT);
+                h = 0.5 * (x + soft);
+                let slope = 0.5 * (1.0 + x / soft) * u.dial.w * (1.0 - held * held * 0.25);
+                n = normalize(facing - live.slope * (slope * sag));
+                shadow = 0.35 + 0.65 * smoothstep(0.0, 1.0, (raw + 0.5 * u.dial.w) / u.dial.w);
+            }
+            p = base + facing * (5.0 + h * tile * sag);
+            out.nw = vec4(n, v.nw.w);
+            out.uvcap1 = v.uvcap0;
+            out.tw1 = v.tw0;
+            out.bs1 = v.bs0;
+            if living {
+                out.bs0.w = u.dial.y;
+                out.bs1.w = u.dial.y;
+            }
+            light = 1.0 + (shadow - 1.0) * sag;
         }
     }
     let world = vec3(p.x, -p.y, -p.z) / tile;
@@ -184,10 +280,10 @@ fn vertex(v: Vertex) -> Varying {
     }
     let depth = -position_world_to_view(world).z * tile;
     out.pz = vec4(p, depth);
-    out.sh0 = v.sh0;
-    out.sh1 = v.sh1;
-    out.sh2 = v.sh2;
-    out.grow = v.grow;
+    out.sh0 = v.sh0 * light;
+    out.sh1 = v.sh1 * light;
+    out.sh2 = v.sh2 * light;
+    out.grow = grow;
     return out;
 }
 
@@ -208,8 +304,18 @@ fn project(n0: vec3<f32>, uv: vec2<f32>, tt: vec3<f32>, bb: vec3<f32>, layer: i3
     if dot(b, bb) < 0.0 {
         b = -b;
     }
-    let c = textureSampleGrad(colour_tex, skin_sampler, uv, layer, ddx, ddy);
-    let tn = textureSampleGrad(normal_tex, skin_sampler, uv, layer, ddx, ddy).xyz * 2.0 - 1.0;
+    var c = textureSampleGrad(colour_tex, skin_sampler, uv, layer, ddx, ddy);
+    var tn = textureSampleGrad(normal_tex, skin_sampler, uv, layer, ddx, ddy).xyz * 2.0 - 1.0;
+    if layer == i32(round(u.dial.y)) {
+        // The living skin in its place: its colour (the gloss stays the skin's), and the
+        // surface sloped by its height, a texel either way.
+        let live = textureSampleGrad(living_tex, living_sampler, uv, ddx, ddy);
+        c = vec4(live.rgb, c.a);
+        let e = 1.0 / f32(textureDimensions(living_tex).x);
+        let hu = textureSampleGrad(living_tex, living_sampler, uv + vec2(e, 0.0), ddx, ddy).a - textureSampleGrad(living_tex, living_sampler, uv - vec2(e, 0.0), ddx, ddy).a;
+        let hv = textureSampleGrad(living_tex, living_sampler, uv + vec2(0.0, e), ddx, ddy).a - textureSampleGrad(living_tex, living_sampler, uv - vec2(0.0, e), ddx, ddy).a;
+        tn = normalize(vec3(-hu * u.dial.z, -hv * u.dial.z, 1.0));
+    }
     var s: Sample;
     s.colour = c.rgb;
     s.wet = c.a;
@@ -283,6 +389,10 @@ fn fragment(in: Varying) -> @location(0) vec4<f32> {
     }
     // Where the surface is still growing in, it stops along a ragged line with a dark wet rim.
     if in.grow < 1.0 {
+        // Not grown in at all (as walls_where leaves out a triangle none of whose corners is).
+        if in.grow <= 1e-4 {
+            discard;
+        }
         let cover = in.grow * 2.2 - 0.9 + (ragged(p / u.eye.w * 1.6) - 0.5) * 2.0;
         if cover <= 0.0 {
             discard;

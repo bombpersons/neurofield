@@ -8,7 +8,9 @@
 //! kernels take any sizes, so nothing is compiled per triangle count.
 
 use crate::neural::dream::{Dream, DREAM_DIRS, NUM_TEX};
-use crate::neural::tokens::{Tokens, CAM_FEATURES, MAX_TRIS, TRI_FEATURES};
+use crate::neural::tokens::{Tokens, CAM_FEATURES, MAX_TRIS, ORGAN_FEATURES, TRI_FEATURES, TRI_FEATURES_PLAIN};
+use crate::neural::gbuffer;
+use crate::world::dreamed::{MAX_ORGANS, ORGAN_FEATURES as RAW_ORGAN};
 use crate::world::view::{H, W};
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,6 +23,11 @@ const BANDS: usize = 8;
 const LOW: i32 = 2;
 /// Columns of the triangle MLP's input: the features and 16 Fourier features per NDC coordinate.
 const TRI_IN: usize = TRI_FEATURES + 6 * 2 * BANDS;
+/// The organ MLP's: the features and 16 Fourier features per corner of the screen box.
+const ORGAN_IN: usize = ORGAN_FEATURES + 4 * 2 * BANDS;
+/// Where the NDC corners, and the organs' screen box, start among their features.
+const TRI_NDC: u32 = 9;
+const ORGAN_BOX: u32 = 12;
 /// The widest frame (training data's widest, 2.4:1), and its patch grid.
 pub const MAX_W: u32 = 576;
 const GH: usize = H as usize / PATCH;
@@ -75,9 +82,12 @@ enum Kernel {
     Transpose,
     Conv3x3,
     Add,
+    Upsample2,
+    StageInputs,
+    Lerp,
 }
 
-const KERNELS: [(Kernel, &str); 9] = [
+const KERNELS: [(Kernel, &str); 12] = [
     (Kernel::Matmul, "matmul"),
     (Kernel::LayerNorm, "layer_norm"),
     (Kernel::Softmax, "softmax"),
@@ -87,7 +97,79 @@ const KERNELS: [(Kernel, &str); 9] = [
     (Kernel::Transpose, "transpose"),
     (Kernel::Conv3x3, "conv3x3"),
     (Kernel::Add, "add"),
+    (Kernel::Upsample2, "resize2"),
+    (Kernel::StageInputs, "stage_inputs"),
+    (Kernel::Lerp, "lerp_into"),
 ];
+/// Room for one view's G-buffer pieces, the triangles they are of, and their places in tiles.
+const MAX_PIECES: usize = 1 << 18;
+const MAX_ROWS: usize = 1 << 15;
+const MAX_PAIRS: usize = 1 << 20;
+/// The per-pixel stage's input channels: the head's last, plain, and the latents (model.py Deferred).
+const STAGE_IN: usize = 16 + 22 + 8 + 8 + 8 + 4;
+
+/// A sculpted level's view, for the per-pixel stage: its raw triangles and their turning
+/// (one row each, as `tokens::Turned`), the organs in sight (`dreamed::organs` rows), the
+/// view (`views.npy` row) and how far the dial has turned.
+/// The glitch panel's changes to the weights: all of them `rot` of the way to noise of
+/// the same mean and spread, then a share of the hidden units of the per-pixel stage's MLP
+/// (`stage_units`) and of the transformer's MLPs (`net_units`) silenced, or turned
+/// over with `invert`, and every other unit scaled by up to 1 +- `jitter`; which units,
+/// by `seed`.
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub struct Damage {
+    pub rot: f32,
+    pub stage_units: f32,
+    pub net_units: f32,
+    pub jitter: f32,
+    pub invert: bool,
+    pub seed: u32,
+}
+
+/// A hash of (a, b, c) to 0..1.
+fn hash01(a: u64, b: u64, c: u64) -> f32 {
+    let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    x ^= x >> 33;
+    (x >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// Noise with each tensor's (`spans`) mean and spread, for `Damage::rot`.
+fn noise_like(w: &[f32], spans: &[(usize, usize)]) -> Vec<f32> {
+    let mut out = vec![0.0; w.len()];
+    for (k, &(at, len)) in spans.iter().enumerate() {
+        let v = &w[at..at + len];
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / len.max(1) as f64;
+        let var = v.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / len.max(1) as f64;
+        let sd = var.sqrt() as f32;
+        for (i, o) in out[at..at + len].iter_mut().enumerate() {
+            // Roughly normal: the sum of four uniforms.
+            let u: f32 = (0..4).map(|j| hash01(k as u64, i as u64, j)).sum::<f32>() - 2.0;
+            *o = mean as f32 + sd * u * 1.73;
+        }
+    }
+    out
+}
+
+pub struct StageView<'a> {
+    pub tris: &'a [f32],
+    pub turning: &'a [f32],
+    pub organs: &'a [f32],
+    pub view: &'a [f32],
+    pub amount: f32,
+}
+
+/// The per-pixel stage's weights in `mem`: its latent textures and its MLP.
+struct Stage {
+    level: u32,
+    flesh: u32,
+    eye: u32,
+    iris: u32,
+    mlp: [Linear; 3],
+}
 
 /// A linear layer in `mem`: weight [inp, out] (row stride `rs`, which is wider than `out`
 /// when it is the first columns of a bigger matrix) and bias.
@@ -122,6 +204,9 @@ struct Block {
 struct Scratch {
     feats: u32,
     tex: u32,
+    organs: u32,
+    organ_kinds: u32,
+    organ_in: u32,
     cams: u32,
     mix: u32,
     noise: u32,
@@ -149,10 +234,26 @@ struct Scratch {
     ga: u32,
     gb: u32,
     out: u32,
+    /// The per-pixel stage's G-buffer pieces, rows, tiles, tile lists, raw organs and view,
+    /// its inputs [STAGE_IN][pixels] and its hidden layers [pixels][64] (none without a stage).
+    pieces: u32,
+    rows: u32,
+    tiles: u32,
+    lists: u32,
+    raw_organs: u32,
+    view: u32,
+    stage_in: u32,
+    stage_hidden: u32,
+    /// Last frame's patch queries and head channels, for the glitch panel's echoes.
+    echo: u32,
+    pixel_echo: u32,
+    /// The glitch panel's G-buffer lies (`GBuffer::floats`).
+    gbuffer: u32,
     end: u32,
 }
 
-/// One doubling of the upsampling head: 3x3 conv weights [4 cout][cin][3][3], bias, sizes.
+/// One doubling of the upsampling head: 3x3 conv weights [cout][cin][3][3] (cout four times
+/// the next grid's channels when pixel-shuffled), bias, sizes.
 #[derive(Clone, Copy)]
 struct Up {
     w: u32,
@@ -164,6 +265,8 @@ struct Up {
 /// Host copy of the weights region of `mem`, built at load.
 struct Upload {
     data: Vec<f32>,
+    /// Where each tensor is: offset and length.
+    spans: Vec<(usize, usize)>,
 }
 
 impl Upload {
@@ -172,6 +275,7 @@ impl Upload {
         self.data.resize(self.data.len().div_ceil(16) * 16, 0.0);
         let at = self.data.len() as u32;
         self.data.extend_from_slice(v);
+        self.spans.push((at as usize, v.len()));
         at
     }
 }
@@ -297,7 +401,11 @@ pub struct GpuNet {
     d: usize,
     heads: usize,
     tri_in: (Linear, Linear),
+    /// How many of a triangle token's features the model takes (TRI_FEATURES_PLAIN or all).
+    tri_features: usize,
     tex: u32,
+    /// Organ tokens' MLP, kind table and [dec_layers, heads] coverage strengths, if the model has them.
+    organs: Option<((Linear, Linear), u32, u32)>,
     cam_in: (Linear, Linear),
     encoder: Vec<Block>,
     decoder: Vec<Block>,
@@ -314,7 +422,20 @@ pub struct GpuNet {
     /// The upsampling head: projection, doublings, and the conv to RGB.
     proj: Linear,
     ups: Vec<Up>,
+    /// Whether each doubling is bilinear then a convolution, not a convolution then pixel shuffle.
+    resize: bool,
     rgb: Up,
+    stage: Option<Stage>,
+    /// The weights as loaded, where they are in `mem` (from 0), each tensor's span, and the
+    /// noise `Damage::rot` goes toward (made when first wanted).
+    weights: Vec<f32>,
+    spans: Vec<(usize, usize)>,
+    rot_target: Option<Vec<f32>>,
+    damage: Damage,
+    /// The layers whose hidden units `Damage` reaches: each, and whether it is the stage's.
+    units: Vec<(Linear, bool)>,
+    /// The frame width the echoes' last frames (`s.echo`, `s.pixel_echo`) were kept at, if any.
+    echo_width: [Option<u32>; 2],
     pub adapter: String,
 }
 
@@ -346,11 +467,26 @@ impl GpuNet {
             ));
         }
         let mut w = Weights(tensors);
-        let mut up = Upload { data: Vec::new() };
+        let mut up = Upload { data: Vec::new(), spans: Vec::new() };
 
         let tri_in = (w.linear(&mut up, "tri_in.0")?, w.linear(&mut up, "tri_in.2")?);
         let d = tri_in.1.out;
+        let tri_features = tri_in.0.inp - 6 * 2 * BANDS;
+        if tri_features != TRI_FEATURES && tri_features != TRI_FEATURES_PLAIN {
+            return Err(format!("the model takes {tri_features} features a triangle, not {TRI_FEATURES} or {TRI_FEATURES_PLAIN}"));
+        }
         let tex = up.push(&w.take("tex.weight")?.1);
+        let organs = if w.0.contains_key("organ_in.0.weight") {
+            let mlp = (w.linear(&mut up, "organ_in.0")?, w.linear(&mut up, "organ_in.2")?);
+            if mlp.0.inp != ORGAN_IN {
+                return Err(format!("the model's organ tokens take {} inputs, not {ORGAN_IN}", mlp.0.inp));
+            }
+            let kinds = up.push(&w.take("organ_kind.weight")?.1);
+            let cover = up.push(&w.take("organ_cover")?.1);
+            Some((mlp, kinds, cover))
+        } else {
+            None
+        };
         let cam_in = (w.linear(&mut up, "cam_in.0")?, w.linear(&mut up, "cam_in.2")?);
         let block =
             |w: &mut Weights, up: &mut Upload, p: &str, cross: bool| -> Result<(Block, Option<(Vec<f32>, Vec<f32>)>)> {
@@ -412,6 +548,29 @@ impl GpuNet {
             }
         }
         let rgb = conv(&mut w, &mut up, "head.rgb")?;
+        // A resizing head's last doubling makes the channels the RGB conv takes; a shuffling
+        // one's four times as many.
+        let resize = ups.last().is_some_and(|u| u.cout == rgb.cin);
+        let stage = if w.0.contains_key("deferred.level") {
+            let mut tex = |name: &str, shape: &[usize]| -> Result<u32> {
+                let (s, v) = w.take(name)?;
+                if s != shape {
+                    return Err(format!("{name} is {s:?}, gpu_net.wgsl takes {shape:?}"));
+                }
+                Ok(up.push(&v))
+            };
+            let level = tex("deferred.level", &[8, 384, 512])?;
+            let flesh = tex("deferred.flesh", &[8, 8, 256, 256])?;
+            let eye = tex("deferred.eye", &[8, 8, 64, 64])?;
+            let iris = tex("deferred.iris", &[4, 64, 64])?;
+            let mlp = [w.linear(&mut up, "deferred.mlp.0")?, w.linear(&mut up, "deferred.mlp.2")?, w.linear(&mut up, "deferred.mlp.4")?];
+            if mlp[0].inp != STAGE_IN || mlp[2].out != 3 || rgb.cin != 16 {
+                return Err(format!("the stage's MLP takes {} channels, gpu_net.wgsl makes {STAGE_IN}", mlp[0].inp));
+            }
+            Some(Stage { level, flesh, eye, iris, mlp })
+        } else {
+            None
+        };
         // Creature part tokens aren't ported yet: without them the network draws the
         // level alone, as it does for views with no creature in sight.
         w.0.retain(|k, _| !(k.starts_with("part_in.") || k == "shape.weight" || k == "motif.weight" || k == "part_cover"));
@@ -422,9 +581,15 @@ impl GpuNet {
         }
 
         // Scratch space after the weights, sized for the largest view.
-        let (s_max, p) = (MAX_TRIS + 1, MAX_PATCHES);
+        let (s_max, p) = (MAX_TRIS + 1 + if organs.is_some() { MAX_ORGANS } else { 0 }, MAX_PATCHES);
         // The biggest of the head's grids: each doubling's conv output, as channels x pixels.
-        let grid = ups.iter().enumerate().map(|(i, u)| u.cout * p << (2 * i)).chain([proj.out * p]).max().unwrap_or(0);
+        let grid = ups
+            .iter()
+            .enumerate()
+            .map(|(i, u)| if resize { u.cin.max(u.cout) * p << (2 * i + 2) } else { u.cout * p << (2 * i) })
+            .chain([proj.out * p])
+            .max()
+            .unwrap_or(0);
         let rows = s_max.max(p);
         let mut at = up.data.len().div_ceil(64) * 64;
         let mut alloc = |n: usize| {
@@ -436,6 +601,9 @@ impl GpuNet {
         let s = Scratch {
             feats: alloc(MAX_TRIS * TRI_FEATURES),
             tex: alloc(MAX_TRIS),
+            organs: alloc(MAX_ORGANS * ORGAN_FEATURES),
+            organ_kinds: alloc(MAX_ORGANS),
+            organ_in: alloc(MAX_ORGANS * ORGAN_IN),
             cams: alloc(CAM_FEATURES),
             mix: alloc(NUM_TEX * NUM_TEX),
             noise: alloc(p * DREAM_DIRS),
@@ -460,6 +628,17 @@ impl GpuNet {
             ga: alloc(grid),
             gb: alloc(grid),
             out: alloc(3 * plane),
+            pieces: alloc(if stage.is_some() { MAX_PIECES * gbuffer::PIECE } else { 0 }),
+            rows: alloc(if stage.is_some() { MAX_ROWS * gbuffer::ROW } else { 0 }),
+            tiles: alloc(if stage.is_some() { 2 * plane / (gbuffer::TILE * gbuffer::TILE) } else { 0 }),
+            lists: alloc(if stage.is_some() { MAX_PAIRS } else { 0 }),
+            raw_organs: alloc(MAX_ORGANS * RAW_ORGAN),
+            view: alloc(64),
+            stage_in: alloc(if stage.is_some() { STAGE_IN * plane } else { 0 }),
+            stage_hidden: alloc(if stage.is_some() { 2 * 64 * plane } else { 0 }),
+            echo: alloc(p * d),
+            pixel_echo: alloc(rgb.cin * plane),
+            gbuffer: alloc(8),
             end: alloc(0),
         };
 
@@ -548,6 +727,10 @@ impl GpuNet {
             })
             .collect();
 
+        let mut units: Vec<(Linear, bool)> = encoder.iter().chain(&decoder).map(|b| (b.mlp.0, false)).collect();
+        if let Some(st) = &stage {
+            units.extend([(st.mlp[0], true), (st.mlp[1], true)]);
+        }
         Ok(GpuNet {
             device,
             queue,
@@ -560,7 +743,9 @@ impl GpuNet {
             d,
             heads,
             tri_in,
+            tri_features,
             tex,
+            organs,
             cam_in,
             encoder,
             decoder,
@@ -572,7 +757,15 @@ impl GpuNet {
             out_norm,
             proj,
             ups,
+            resize,
             rgb,
+            stage,
+            weights: up.data,
+            spans: up.spans,
+            rot_target: None,
+            damage: Damage::default(),
+            units,
+            echo_width: [None; 2],
             adapter,
         })
     }
@@ -596,8 +789,67 @@ impl GpuNet {
         self.grid_w = gw;
     }
 
+    /// Whether the model has a per-pixel stage, which draws with a `StageView`.
+    pub fn has_stage(&self) -> bool {
+        self.stage.is_some()
+    }
+
+    /// Change the weights as `dmg` says (from those loaded), if that isn't how they are.
+    pub fn set_damage(&mut self, dmg: &Damage) {
+        if *dmg == self.damage {
+            return;
+        }
+        let mut w = self.weights.clone();
+        if dmg.rot > 0.0 {
+            let target = self.rot_target.get_or_insert_with(|| noise_like(&self.weights, &self.spans));
+            for (a, b) in w.iter_mut().zip(target.iter()) {
+                *a += (b - *a) * dmg.rot;
+            }
+        }
+        for (k, &(l, stage)) in self.units.iter().enumerate() {
+            let share = if stage { dmg.stage_units } else { dmg.net_units };
+            for o in 0..l.out {
+                let seed = dmg.seed as u64;
+                let f = if hash01(seed, k as u64, o as u64) < share {
+                    if dmg.invert { -1.0 } else { 0.0 }
+                } else {
+                    1.0 + dmg.jitter * (2.0 * hash01(seed ^ 0xA5A5, k as u64, o as u64) - 1.0)
+                };
+                if f == 1.0 {
+                    continue;
+                }
+                for i in 0..l.inp {
+                    w[l.w as usize + i * l.rs + o] *= f;
+                }
+                w[l.b as usize + o] *= f;
+            }
+        }
+        self.queue.write_buffer(&self.mem, 0, bytemuck::cast_slice(&w));
+        self.damage = *dmg;
+    }
+
+    /// Mix the last frame's `len` floats kept at `kept` into those at `at` (`amount` of them),
+    /// then keep these; echo `which` (0: patch queries, 1: head channels) at frame `width`.
+    fn echo(&mut self, ops: &mut Ops, which: usize, at: u32, kept: u32, len: usize, amount: f32, width: u32) {
+        let groups = [len.div_ceil(64) as u32, 1, 1];
+        if amount <= 0.0 {
+            self.echo_width[which] = None;
+            return;
+        }
+        if self.echo_width[which] == Some(width) {
+            ops.push(Kernel::Lerp, Params { m: len as u32, a_off: kept, c_off: at, f0: amount, ..Default::default() }, groups);
+        }
+        ops.push(Kernel::Lerp, Params { m: len as u32, a_off: at, c_off: kept, f0: 1.0, ..Default::default() }, groups);
+        self.echo_width[which] = Some(width);
+    }
+
     /// The network's frame for these tokens: [240 * t.width * 3] floats, roughly 0..1, row-major RGB.
     pub fn render(&mut self, t: &Tokens, dream: &Dream) -> Result<Vec<f32>> {
+        self.render_staged(t, dream, None)
+    }
+
+    /// The same, with the per-pixel stage drawing on it where the model has one and `view` is given.
+    pub fn render_staged(&mut self, t: &Tokens, dream: &Dream, view: Option<&StageView>) -> Result<Vec<f32>> {
         let width = t.width;
         if width % PATCH as u32 != 0 || !(PATCH as u32..=MAX_W).contains(&width) {
             return Err(format!("a frame {width} wide: it must be a multiple of {PATCH} up to {MAX_W}"));
@@ -608,12 +860,18 @@ impl GpuNet {
         }
         let patches = gw * GH;
         let n = t.len().min(MAX_TRIS);
-        let tokens = n + 1; // the camera rides along as token 0
+        // The organs follow the triangles, if the model knows them.
+        let o = if self.organs.is_some() { t.organ_kinds.len().min(MAX_ORGANS) } else { 0 };
+        let tokens = n + 1 + o; // the camera rides along as token 0
         let s = &self.s;
         let write = |at: u32, v: &[f32]| self.queue.write_buffer(&self.mem, at as u64 * 4, bytemuck::cast_slice(v));
         if n > 0 {
             write(s.feats, &t.feats[..n * TRI_FEATURES]);
             write(s.tex, &t.tex[..n].iter().map(|&x| x as f32).collect::<Vec<_>>());
+        }
+        if o > 0 {
+            write(s.organs, &t.organs[..o * ORGAN_FEATURES]);
+            write(s.organ_kinds, &t.organ_kinds[..o].iter().map(|&x| x as f32).collect::<Vec<_>>());
         }
         write(s.cams, &t.cam);
         write(s.mix, &dream.tex_mix);
@@ -630,10 +888,12 @@ impl GpuNet {
                 Kernel::Prepare,
                 Params {
                     m: n as u32,
-                    k: TRI_FEATURES as u32,
-                    n: TRI_IN as u32,
+                    k: self.tri_features as u32,
+                    n: (self.tri_features + 6 * 2 * BANDS) as u32,
                     a_off: s.feats,
+                    a_rs: TRI_FEATURES as u32,
                     c_off: s.tri_in,
+                    x0: TRI_NDC,
                     ..Default::default()
                 },
                 [TRI_IN.div_ceil(64) as u32, n as u32, 1],
@@ -646,6 +906,32 @@ impl GpuNet {
                 Kernel::AddTexture,
                 Params { m: n as u32, n: d as u32, a_off: s.tex, b_off: s.table, c_off: s.x, ..Default::default() },
                 [d.div_ceil(64) as u32, n as u32, 1],
+            );
+        }
+        if let (Some((mlp, kinds, _)), true) = (self.organs, o > 0) {
+            // Organ tokens likewise, from the Fourier features of their screen boxes, plus
+            // their kinds' embeddings.
+            ops.push(
+                Kernel::Prepare,
+                Params {
+                    m: o as u32,
+                    k: ORGAN_FEATURES as u32,
+                    n: ORGAN_IN as u32,
+                    a_off: s.organs,
+                    a_rs: ORGAN_FEATURES as u32,
+                    c_off: s.organ_in,
+                    x0: ORGAN_BOX,
+                    ..Default::default()
+                },
+                [ORGAN_IN.div_ceil(64) as u32, o as u32, 1],
+            );
+            ops.linear(s.organ_in, o, mlp.0, s.hidden, GELU);
+            let first = s.x + ((1 + n) * d) as u32;
+            ops.linear(s.hidden, o, mlp.1, first, 0);
+            ops.push(
+                Kernel::AddTexture,
+                Params { m: o as u32, n: d as u32, a_off: s.organ_kinds, b_off: kinds, c_off: first - d as u32, ..Default::default() },
+                [d.div_ceil(64) as u32, o as u32, 1],
             );
         }
         ops.linear(s.cams, 1, self.cam_in.0, s.cam_hidden, GELU);
@@ -672,6 +958,8 @@ impl GpuNet {
                 a_off: s.feats,
                 b_off: s.centres,
                 c_off: s.dist,
+                x0: (1 + n) as u32,
+                x1: s.organs,
                 f0: 2.0 * PATCH as f32 / W as f32,
                 ..Default::default()
             },
@@ -684,7 +972,8 @@ impl GpuNet {
             ops.norm(s.q, patches, d, n2, s.qn);
             ops.linear(s.qn, patches, xq, s.qc, 0);
             let kv = s.kv + (l * 2 * d) as u32;
-            let cover = (self.cover + (l * heads) as u32, s.dist);
+            let organ_cover = self.organs.filter(|_| o > 0).map(|(_, _, c)| (c + (l * heads) as u32, (1 + n) as u32));
+            let cover = (self.cover + (l * heads) as u32, s.dist, organ_cover);
             let alpha = 1.0 / ((d / heads) as f32).sqrt() / dream.temp;
             ops.attention(
                 s,
@@ -701,6 +990,10 @@ impl GpuNet {
             ops.linear(s.attn, patches, xout, s.q, ACCUMULATE);
             ops.mlp(blk, s, s.q, patches, d);
         }
+
+        let (q, kept) = (s.q, s.echo);
+        self.echo(&mut ops, 0, q, kept, patches * d, dream.echo, width);
+        let s = &self.s;
 
         // Pixels: the head projects the queries to a grid of channels, doubles it four times
         // (conv, then pixel shuffle) and convolves it to RGB.
@@ -729,14 +1022,127 @@ impl GpuNet {
         };
         let (mut from, mut to, mut size) = (s.ga, s.gb, (GH, gw));
         for &u in &self.ups {
-            conv(&mut ops, u, from, to, size, SHUFFLE | GELU);
-            (from, to, size) = (to, from, (size.0 * 2, size.1 * 2));
+            if self.resize {
+                // Bilinear to twice the size, then the conv at that size.
+                let big = (size.0 * 2, size.1 * 2);
+                ops.push(
+                    Kernel::Upsample2,
+                    Params { m: big.0 as u32, n: big.1 as u32, a_off: from, c_off: to, ..Default::default() },
+                    [big.1.div_ceil(16) as u32, big.0.div_ceil(16) as u32, u.cin as u32],
+                );
+                conv(&mut ops, u, to, from, big, GELU);
+                size = big;
+            } else {
+                conv(&mut ops, u, from, to, size, SHUFFLE | GELU);
+                (from, to, size) = (to, from, (size.0 * 2, size.1 * 2));
+            }
         }
         if size != (H as usize, width as usize) {
             return Err(format!("the head makes {size:?} images, not 240 x {width}"));
         }
-        conv(&mut ops, self.rgb, from, s.out, size, INTERLEAVE);
+        let kept = s.pixel_echo;
+        self.echo(&mut ops, 1, from, kept, self.rgb.cin * size.0 * size.1, dream.pixel_echo, width);
+        conv(&mut ops, self.rgb, from, self.s.out, size, INTERLEAVE);
+        if let (Some(stage), Some(view)) = (&self.stage, view) {
+            self.stage_ops(&mut ops, stage, view, from, width as usize, dream)?;
+        }
         self.run(&ops, 3 * H as usize * width as usize)
+    }
+
+    /// The per-pixel stage, added to the frame at `s.out`: its G-buffer and latents from the
+    /// view, with the head's last channels at `head`, then its MLP.
+    fn stage_ops(&self, ops: &mut Ops, stage: &Stage, v: &StageView, head: u32, width: usize, dream: &Dream) -> Result<()> {
+        let s = &self.s;
+        let g = gbuffer::pieces(v.tris, v.turning, v.view);
+        let (pieces, rows) = (g.pieces.len() / gbuffer::PIECE, g.rows.len() / gbuffer::ROW);
+        if pieces > MAX_PIECES || rows > MAX_ROWS || g.lists.len() > MAX_PAIRS {
+            return Err(format!("{pieces} G-buffer pieces of {rows} triangles in {} places: too many", g.lists.len()));
+        }
+        let organs = (v.organs.len() / RAW_ORGAN).min(MAX_ORGANS);
+        let write = |at: u32, x: &[f32]| {
+            if !x.is_empty() {
+                self.queue.write_buffer(&self.mem, at as u64 * 4, bytemuck::cast_slice(x));
+            }
+        };
+        write(s.pieces, &g.pieces);
+        write(s.rows, &g.rows);
+        write(s.tiles, &g.tiles);
+        write(s.lists, &g.lists);
+        write(s.raw_organs, &v.organs[..organs * RAW_ORGAN]);
+        write(s.view, v.view);
+        write(s.gbuffer, &dream.gbuffer.floats(dream.time));
+        let pixels = H as usize * width;
+        ops.push(
+            Kernel::StageInputs,
+            Params {
+                m: H,
+                n: width as u32,
+                k: organs as u32,
+                a_off: s.pieces,
+                b_off: s.rows,
+                c_off: s.stage_in,
+                bias_off: head,
+                x0: s.tiles,
+                x1: s.lists,
+                x2: s.raw_organs,
+                a_bs: s.view,
+                a_rs: stage.level,
+                a_cs: stage.flesh,
+                b_bs: stage.eye,
+                b_rs: stage.iris,
+                f0: v.amount,
+                f1: dream.warp,
+                f2: dream.smear,
+                f3: dream.time,
+                c_bs: s.gbuffer,
+                ..Default::default()
+            },
+            [(width / gbuffer::TILE) as u32, H / gbuffer::TILE as u32, 1],
+        );
+        // The MLP, pixel by pixel: its input is planes, so read down them.
+        let [l0, l1, l2] = stage.mlp;
+        let first = Params {
+            m: pixels as u32,
+            k: l0.inp as u32,
+            n: l0.out as u32,
+            batch: 1,
+            a_off: s.stage_in,
+            a_rs: 1,
+            a_cs: pixels as u32,
+            b_off: l0.w,
+            b_rs: l0.rs as u32,
+            b_cs: 1,
+            c_off: s.stage_hidden,
+            c_rs: l0.out as u32,
+            bias_off: l0.b,
+            flags: GELU,
+            ..Default::default()
+        };
+        ops.push(Kernel::Matmul, first, [l0.out.div_ceil(32) as u32, pixels.div_ceil(32) as u32, 1]);
+        let second = s.stage_hidden + (64 * pixels) as u32;
+        ops.linear(s.stage_hidden, pixels, l1, second, GELU);
+        ops.linear(second, pixels, l2, s.out, ACCUMULATE);
+        Ok(())
+    }
+
+    /// The per-pixel stage's inputs from the last frame drawn with it, [STAGE_IN][240 * width]
+    /// (for checking against PyTorch).
+    pub fn stage_inputs(&self, width: u32) -> Result<Vec<f32>> {
+        let floats = STAGE_IN * H as usize * width as usize;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stage inputs"),
+            size: floats as u64 * 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.mem, self.s.stage_in as u64 * 4, &buf, 0, floats as u64 * 4);
+        self.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| e.to_string())?;
+        let out = bytemuck::cast_slice(&slice.get_mapped_range().map_err(|e| e.to_string())?).to_vec();
+        Ok(out)
     }
 
     /// Run the dispatches as one submission and read back the first `floats` of the output.
@@ -823,8 +1229,9 @@ impl Ops {
     }
 
     /// Multi-head attention of queries [l, d] (at q.0, row stride q.1) to keys and values
-    /// [s, d] (likewise), the scores scaled by `alpha` and, with `cover` (strengths, distances),
-    /// biased toward covering triangles; the heads' outputs side by side in `attn` [l, d].
+    /// [s, d] (likewise), the scores scaled by `alpha` and, with `cover` (strengths, distances,
+    /// and the organs' strengths and first column if any), biased toward covering triangles
+    /// and organs; the heads' outputs side by side in `attn` [l, d].
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &mut self,
@@ -837,7 +1244,7 @@ impl Ops {
         d: usize,
         heads: usize,
         alpha: f32,
-        cover: Option<(u32, u32)>,
+        cover: Option<(u32, u32, Option<(u32, u32)>)>,
     ) {
         let dh = d / heads;
         let scores = Params {
@@ -860,13 +1267,16 @@ impl Ops {
             ..Default::default()
         };
         self.push(Kernel::Matmul, scores, [s.div_ceil(32) as u32, l.div_ceil(32) as u32, heads as u32]);
-        let (strength, dist) = cover.unwrap_or((NONE, 0));
+        let (strength, dist, organs) = cover.unwrap_or((NONE, 0, None));
+        let (organ_strength, first_organ) = organs.unwrap_or((NONE, 0));
         let soft = Params {
             m: l as u32,
+            k: first_organ,
             n: s as u32,
             batch: heads as u32,
             a_off: sc.scores,
             b_off: strength,
+            c_off: organ_strength,
             x1: dist,
             x2: s as u32,
             f0: alpha,

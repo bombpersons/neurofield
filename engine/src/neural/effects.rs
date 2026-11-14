@@ -226,6 +226,130 @@ fn ramp(a: f32, lo: f32, hi: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
+/// The glitch panel's disturbances, held where they are set rather than drifting.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Glitch {
+    /// How far every texture's embedding goes over to texture `texture_to`'s, 0..1.
+    pub texture: f32,
+    pub texture_to: usize,
+    /// Times the cross-attention softmax temperature (1: as trained).
+    pub temp: f32,
+    /// See `Dream`.
+    pub warp: f32,
+    pub smear: f32,
+    pub echo: f32,
+    pub pixel_echo: f32,
+    /// Changes to the weights themselves.
+    pub damage: crate::neural::gpu_net::Damage,
+    /// The geometry, in tiles: the per-pixel stage's copy waved this far from the
+    /// transformer's (`split`), each triangle drifting on its own (`tear`) and off its face
+    /// (`peel`), and every corner snapped to a grid this coarse (`snap`).
+    pub split: f32,
+    pub tear: f32,
+    pub peel: f32,
+    pub snap: f32,
+    /// What the per-pixel stage is told of each pixel (see `Dream`).
+    pub gbuffer: crate::neural::dream::GBuffer,
+}
+
+impl Default for Glitch {
+    fn default() -> Glitch {
+        Glitch {
+            texture: 0.0,
+            texture_to: 0,
+            temp: 1.0,
+            warp: 0.0,
+            smear: 0.0,
+            echo: 0.0,
+            pixel_echo: 0.0,
+            damage: Default::default(),
+            split: 0.0,
+            tear: 0.0,
+            peel: 0.0,
+            snap: 0.0,
+            gbuffer: Default::default(),
+        }
+    }
+}
+
+/// Add the glitch panel's disturbances `g` to `dream`, at `t` seconds.
+pub fn glitch(dream: &mut Dream, g: &Glitch, t: f32) {
+    if g.texture > 0.0 {
+        let mut m = vec![0.0; NUM_TEX * NUM_TEX];
+        for i in 0..NUM_TEX {
+            m[i * NUM_TEX + i] = 1.0 - g.texture;
+            m[i * NUM_TEX + g.texture_to.min(NUM_TEX - 1)] += g.texture;
+        }
+        mix_textures(dream, &m);
+    }
+    dream.temp *= g.temp;
+    dream.warp = g.warp;
+    dream.smear = g.smear;
+    dream.time = t;
+    dream.echo = g.echo;
+    dream.pixel_echo = g.pixel_echo;
+    dream.gbuffer = g.gbuffer;
+}
+
+/// The glitch panel's tearing, peeling and snapping of the raw triangle features `tris`, at
+/// `t` seconds, seen from view `view` (`views.npy` row; corners snap to a grid that turns
+/// and moves with the camera, so they jump about as it does): the geometry both the
+/// transformer and the per-pixel stage see.
+pub fn shake(tris: &mut [f32], g: &Glitch, t: f32, view: &[f32]) {
+    let pos = [view[1], view[2], view[3]];
+    let r = [[view[4], view[5], view[6]], [view[7], view[8], view[9]], [view[10], view[11], view[12]]];
+    if g.tear <= 0.0 && g.peel <= 0.0 && g.snap <= 0.0 {
+        return;
+    }
+    for (i, tri) in tris.chunks_exact_mut(RAW).enumerate() {
+        let i = i as u64;
+        let mut shift = [0.0; 3];
+        if g.tear > 0.0 {
+            for (a, s) in shift.iter_mut().enumerate() {
+                *s += g.tear * noise(i * 3 + a as u64, t * 0.3 + hash(i, 7) * 10.0);
+            }
+        }
+        if g.peel > 0.0 {
+            let p = |j: usize| [tri[3 * j], tri[3 * j + 1], tri[3 * j + 2]];
+            let (a, b, c) = (p(0), p(1), p(2));
+            let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+            let k = g.peel * (0.5 + 0.5 * noise(i ^ 0x7E57, t * 0.4));
+            for a in 0..3 {
+                shift[a] += k * n[a] / l;
+            }
+        }
+        for v in tri[..9].chunks_exact_mut(3) {
+            for a in 0..3 {
+                v[a] += shift[a];
+            }
+            if g.snap > 0.0 {
+                let d = [v[0] - pos[0], v[1] - pos[1], v[2] - pos[2]];
+                let c = r.map(|row| ((row[0] * d[0] + row[1] * d[1] + row[2] * d[2]) / g.snap).round() * g.snap);
+                for a in 0..3 {
+                    v[a] = pos[a] + r[0][a] * c[0] + r[1][a] * c[1] + r[2][a] * c[2];
+                }
+            }
+        }
+    }
+}
+
+/// The per-pixel stage's copy of `tris` when the glitch panel splits it from the
+/// transformer's: every corner waved up to `g.split` tiles, at `t` seconds.
+pub fn split(tris: &[f32], g: &Glitch, t: f32, out: &mut Vec<f32>) {
+    out.clear();
+    out.extend_from_slice(tris);
+    for tri in out.chunks_exact_mut(RAW) {
+        for v in tri[..9].chunks_exact_mut(3) {
+            let h = heave([v[0], v[1], v[2]], t * 1.5);
+            for a in 0..3 {
+                v[a] += g.split * h[a];
+            }
+        }
+    }
+}
+
 /// Disturb the tokens (of a scene with raw triangle features `tris`) with every effect that
 /// has a time (seconds since it was turned on); returns the network-side disturbance.
 pub fn apply_set(times: &[Option<f32>; EFFECTS.len()], tok: &mut Tokens, tris: &[f32]) -> Dream {

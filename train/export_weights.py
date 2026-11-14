@@ -42,7 +42,8 @@ def main():
     tensors = dict(m.state_dict())
     tensors["noise_dirs"] = m.noise_dirs
     cfg = {"d": m.tex.weight.shape[1], "heads": m.encoder[0].attn.num_heads,
-           "enc_layers": len(m.encoder), "dec_layers": len(m.decoder), "bands": m.bands, "low": m.low}
+           "enc_layers": len(m.encoder), "dec_layers": len(m.decoder), "bands": m.bands, "low": m.low,
+           "up": "resize" if m.head.resize else "shuffle", "deferred": m.deferred is not None}
     save_safetensors(tensors, a.out, {"cfg": json.dumps(cfg), "step": str(state["step"])})
     print(f"wrote {a.out} (step {state['step']}, {len(tensors)} tensors)")
 

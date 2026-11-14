@@ -131,3 +131,96 @@ pub fn dream_walk(opts: &HashMap<String, String>, frames: usize, out: &Path) {
         println!("{name}: median {:.1} ms, slowest {:.1} ms", v[v.len() / 2], v[v.len() - 1]);
     }
 }
+
+/// A fixture's arrays (train/stage_fixture.py): name -> (shape, values).
+fn read_fixture(dir: &Path) -> HashMap<String, (Vec<usize>, Vec<f32>)> {
+    let json = std::fs::read_to_string(dir.join("fixture.json")).expect("fixture.json");
+    let mut out = HashMap::new();
+    // {"name": [d0, d1, ...], ...}
+    for part in json.trim().trim_start_matches('{').trim_end_matches('}').split("]") {
+        let Some((name, dims)) = part.split_once(':') else { continue };
+        let name = name.trim().trim_start_matches(',').trim().trim_matches('"').to_string();
+        let shape: Vec<usize> = dims.trim().trim_start_matches('[').split(',').filter(|d| !d.trim().is_empty()).map(|d| d.trim().parse().unwrap()).collect();
+        let bytes = std::fs::read(dir.join(format!("{name}.bin"))).expect("fixture array");
+        let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        out.insert(name, (shape, values));
+    }
+    out
+}
+
+/// Largest and mean absolute difference.
+fn diff(a: &[f32], b: &[f32]) -> (f32, f32) {
+    assert_eq!(a.len(), b.len(), "lengths differ");
+    let d: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
+    (d.iter().copied().fold(0.0, f32::max), d.iter().sum::<f32>() / d.len().max(1) as f32)
+}
+
+/// `datagen stage-check`: a sculpt-trained model's port (tokens, organs, the head and the
+/// per-pixel stage) against PyTorch, on train/stage_fixture.py's fixture.
+pub fn stage_check(opts: &HashMap<String, String>) {
+    use engine::neural::gpu_net::GpuNet;
+    let model = Path::new(opts.get("model").expect("--model FILE is required"));
+    let fx = read_fixture(Path::new(opts.get("fixture").expect("--fixture DIR is required")));
+    let get = |k: &str| &fx.get(k).unwrap_or_else(|| panic!("the fixture has no {k}")).1;
+    let turned = tokens::Turned { amount: get("amount")[0], turning: get("turning"), organs: get("organs") };
+    let t = tokens::tokens_turned(get("tris"), get("view"), Some(&turned));
+    // Triangles as near as each other may come in either order, which the network doesn't mind.
+    let sorted = |f: &[f32]| {
+        let mut rows: Vec<&[f32]> = f.chunks_exact(tokens::TRI_FEATURES).collect();
+        rows.sort_by(|a, b| a.iter().zip(*b).map(|(x, y)| x.total_cmp(y)).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
+        rows.concat()
+    };
+    let (m, mean) = diff(&sorted(&t.feats), &sorted(get("feats")));
+    println!("triangle tokens: {} (fixture {}), largest difference {m:.2e}, mean {mean:.2e}", t.len(), get("tex").len());
+    let (m, mean) = diff(&t.cam, get("cam"));
+    println!("camera token: largest difference {m:.2e}, mean {mean:.2e}");
+    let (m, mean) = diff(&t.organs, get("organ_feats"));
+    println!("organ tokens: {}, largest difference {m:.2e}, mean {mean:.2e}", t.organ_kinds.len());
+    let mut net = GpuNet::load(model).expect("loading the model");
+    println!("running on {}", net.adapter);
+    let dream = engine::neural::dream::Dream::calm(t.width);
+    let head = net.render(&t, &dream).expect("rendering");
+    let (m, mean) = diff(&head, get("head"));
+    println!("head alone: largest difference {m:.2e}, mean {mean:.2e}");
+    if !net.has_stage() {
+        return;
+    }
+    let view = engine::neural::gpu_net::StageView { tris: get("tris"), turning: get("turning"), organs: get("organs"), view: get("view"), amount: get("amount")[0] };
+    // Twice: the second as fast as it goes in a game.
+    let full = net.render_staged(&t, &dream, Some(&view)).expect("rendering with the stage");
+    let t0 = Instant::now();
+    net.render_staged(&t, &dream, Some(&view)).expect("rendering with the stage");
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = Instant::now();
+    let g = engine::neural::gbuffer::pieces(view.tris, view.turning, view.view);
+    println!(
+        "G-buffer: {} pieces of {} triangles, {} places in tiles, {:.1} ms on the CPU",
+        g.pieces.len() / engine::neural::gbuffer::PIECE,
+        g.rows.len() / engine::neural::gbuffer::ROW,
+        g.lists.len(),
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+    let t2 = Instant::now();
+    net.render(&t, &dream).expect("rendering");
+    println!("without the stage: {:.1} ms", t2.elapsed().as_secs_f64() * 1000.0);
+    // The plain channels against pixels.py's, channel by channel.
+    let inputs = net.stage_inputs(t.width).expect("reading the stage's inputs");
+    if let Some(out) = opts.get("out") {
+        std::fs::create_dir_all(out).unwrap();
+        std::fs::write(Path::new(out).join("stage_inputs.bin"), inputs.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    }
+    let px = H as usize * t.width as usize;
+    let want = get("plain");
+    let names = ["covered", "1/z", "facing x", "facing y", "facing z", "flesh", "reach", "amount", "fold", "eye", "sphincter", "u", "v", "radius",
+                 "state 0", "blink", "gaze x", "gaze y", "vein", "across", "along", "beat"];
+    for (c, name) in names.iter().enumerate() {
+        let got = &inputs[(16 + c) * px..(17 + c) * px];
+        let (m, mean) = diff(got, &want[c * px..(c + 1) * px]);
+        let off = got.iter().zip(&want[c * px..(c + 1) * px]).filter(|(a, b)| (*a - *b).abs() > 1e-3).count();
+        println!("  plain {c:2} {name:9}: largest difference {m:.2e}, mean {mean:.2e}, {off} pixels off by more than 1e-3");
+    }
+    let (m, mean) = diff(&full, get("full"));
+    println!("with the stage: largest difference {m:.2e}, mean {mean:.2e} ({ms:.1} ms a frame)");
+    let (m, mean) = diff(&full, get("target"));
+    println!("(against the target: largest {m:.2e}, mean {mean:.2e})");
+}

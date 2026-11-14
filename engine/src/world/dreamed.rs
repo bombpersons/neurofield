@@ -87,6 +87,8 @@ const LID: f32 = 2.0;
 const VEIN: f32 = 3.0;
 const MOUTH: f32 = 4.0;
 const FILMED: f32 = 5.0;
+/// Folded flesh on the walls, which the vertex shader folds out by the dial (`walls_at_rest`).
+const WALL: f32 = 6.0;
 
 fn smooth(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
@@ -323,6 +325,9 @@ struct WallPoint {
     spread: f32,
     shadow: f32,
     light: [[f32; 3]; 4],
+    /// For a fold made otherwise (`walls_at_rest`): how far it has turned, the room it has,
+    /// and the features' hold on it (its height h becomes a h + b).
+    fold: [f32; 4],
 }
 
 struct WallTri {
@@ -344,6 +349,8 @@ pub struct Dreamed {
     neutral: u16,
     /// How far the level has turned: 0 is the plain stone and 1 all of this.
     pub amount: f32,
+    /// The flesh skin of each painted slot (`tex::STRANGE_SLOTS`), when it was painted.
+    pub painted: Option<[u16; tex::STRANGE_SLOTS]>,
     /// Skins of a vein at rest and with a beat going through it.
     vein_skin: [u16; 2],
     footage: Option<Footage>,
@@ -772,6 +779,10 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
         .chain(mouth_sites.iter().map(|&(c, n, r)| (c, n, r * 2.4)))
         .map(|(c, n, half)| (c, n, half, lifted(scene, height(scene, c.map(|x| x as i32), n), n, c)))
         .collect();
+    // Per point, what a fold made by other means (a living texture's depth, on the GPU) needs
+    // to stand as these do: how far it has turned, the room it has, and the features' hold
+    // on it (h becomes a h + b).
+    let mut fold: HashMap<[i32; 3], [f32; 4]> = HashMap::new();
     let moved: HashMap<[i32; 3], (f32, [i32; 3])> = facing
         .iter()
         .map(|(&p, &n)| {
@@ -782,12 +793,16 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
             let floorish = 1.0 - 0.7 * smooth(-n[1] * 1.4);
             let raw = height(scene, p, n) + RELIEF * rise * turned(scene, w) * floorish;
             let mut h = lifted(scene, raw, n, w);
+            let (mut a, mut b) = (1.0, 0.0);
             for &(c, facing, half, middle) in &zones {
                 if dot(n, facing) > 0.5 {
                     let d = sub(w, c);
-                    h = middle + (h - middle) * smooth((dot(d, d).sqrt() / half - 0.9) / 0.5);
+                    let s = smooth((dot(d, d).sqrt() / half - 0.9) / 0.5);
+                    h = middle + (h - middle) * s;
+                    (a, b) = (a * s, b * s + middle * (1.0 - s));
                 }
             }
+            fold.insert(p, [turned(scene, w), room_for(scene, w, n), a, b]);
             let to = add(p.map(|c| c as f32), scale(n, h * TF));
             (p, (raw, to.map(|c| c.round() as i32)))
         })
@@ -844,6 +859,7 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
                         spread: spread_of(scene.strangeness(base)),
                         shadow: 0.35 + 0.65 * smooth((h + 0.5 * DEPTH) / DEPTH),
                         light: scene.light_sh(to),
+                        fold: fold[&v.p],
                     });
                     points.len() as u32 - 1
                 })
@@ -1069,7 +1085,8 @@ pub fn sculpt(scene: &mut Scene, seed: u64, eyes_from: Option<&Path>) -> Dreamed
         scene.flesh.tris.push(flesh::Tri { v: [v; 3], skin: [p.skins[0]; 2], light: [neutral; 2], corners: None, cap_axes: [[[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]; 2] });
     }
     let fixed = scene.flesh.tris.len();
-    Dreamed { eyes, mouths, points, walls: wall_tris, neutral, amount: 1.0, veins, vein_skin, footage, turning, fixed, lid }
+    let painted = painted.as_ref().map(|p| p.skins);
+    Dreamed { eyes, mouths, points, walls: wall_tris, neutral, amount: 1.0, painted, veins, vein_skin, footage, turning, fixed, lid }
 }
 
 /// What the net is told about how each level triangle turns, as written to `turning.npy`,
@@ -1420,6 +1437,52 @@ pub fn walls_seen(d: &Dreamed, cam: &Camera) -> Vec<flesh::Tri> {
             dot(to, ahead) > -0.5 * TF && dot(to, to) < far * far
         })
     })
+}
+
+/// The folded walls as they lie before the dial turns, and how each corner moves, for the
+/// vertex shader to fold them out by the dial itself (flesh.wesl, `WALL`), so turning it
+/// remakes nothing: each corner a hair off the stone, facing out, at full light, and grown;
+/// how it moves is (`WALL`, its skin, its spread, its shadow), its skin being the one all the
+/// walls it's a corner of wear, else -1. What folds it rides in the second skin's slots,
+/// which walls leave unused (they show one skin): its height (tiles, out along its facing)
+/// and its folded facing as the second uv and cap; for a fold the GPU makes instead (from a
+/// living texture's depth), how far it has turned, its room and the features' hold on it (a,
+/// b) as the second tangent and its wrap.
+pub fn walls_at_rest(d: &Dreamed) -> (Vec<flesh::Tri>, Vec<[[f32; 4]; 3]>) {
+    let mut skin: Vec<Option<Option<u16>>> = vec![None; d.points.len()];
+    for t in &d.walls {
+        for &i in &t.points {
+            let s = &mut skin[i as usize];
+            *s = match *s {
+                None => Some(Some(t.skin)),
+                Some(Some(k)) if k == t.skin => Some(Some(k)),
+                _ => Some(None),
+            };
+        }
+    }
+    let (mut tris, mut how) = (Vec::with_capacity(d.walls.len()), Vec::with_capacity(d.walls.len()));
+    for t in &d.walls {
+        let q = t.points.map(|i| &d.points[i as usize]);
+        let corner = |k: usize| {
+            let (h, bent, f) = (dot(q[k].rise, q[k].facing) / TF, q[k].bent, q[k].fold);
+            flesh::Vertex {
+                p: add(q[k].base, scale(q[k].facing, 5.0)),
+                n: q[k].facing,
+                w: 1.0,
+                uv: [t.uv[k], [h, bent[0]]],
+                t: [t.along, [f[0], f[1], f[2]]],
+                b: [t.down; 2],
+                cap: [t.uv[k], [bent[1], bent[2]]],
+                wrap: [1.0, f[3]],
+                grow: 1.0,
+            }
+        };
+        let light = |k: usize| q[k].light.map(|r| [0, 1, 2].map(|i| r[i] * t.tint[i]));
+        tris.push(flesh::Tri { v: [corner(0), corner(1), corner(2)], skin: [t.skin; 2], light: [d.neutral; 2], corners: Some([light(0), light(1), light(2)]), cap_axes: [[t.along, t.down]; 2] });
+        let skin_of = |k: usize| skin[t.points[k] as usize].flatten().map_or(-1.0, |s| s as f32);
+        how.push([0, 1, 2].map(|k| [WALL, skin_of(k), q[k].spread, q[k].shadow]));
+    }
+    (tris, how)
 }
 
 /// `walls`, keeping only the triangles `keep` says yes to, by their corners as they are now.

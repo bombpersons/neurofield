@@ -1,0 +1,16 @@
+[package]
+name = "dream-renderer"
+description = "DeepDream that grows on surfaces: GoogLeNet's dream of a picture, kept in pages laid over what's drawn, on the GPU"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+wgpu = "30.0.1"
+bytemuck = { version = "1.25", features = ["derive"] }
+safetensors = "0.8.0"
+
+[dev-dependencies]
+pollster = "0.4"
+safetensors = "0.8.0"
