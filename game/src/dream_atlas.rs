@@ -32,14 +32,14 @@ use bevy::render::renderer::{PendingCommandBuffers, RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
 use bevy::render::RenderApp;
 use bevy_egui::{egui, EguiContexts};
-use dream_renderer::{Config, DreamRenderer, Motion, Step, Surface, View};
+use dream_renderer::{Config, DreamRenderer, Light, LevelTri, NetConfig, Motion, Step, Surface, View};
 use engine::neural::features::TRI_FEATURES;
 use engine::neural::gpu_net::MAX_W;
 use engine::world::scene::Camera;
 use engine::world::view::H;
 use psx_bevy::psx::{PsxScreen, DISPLAY_LAYER};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const UP: u32 = 3;
@@ -62,8 +62,8 @@ struct Job {
     width: u32,
     screen: AssetId<Image>,
     out: AssetId<Image>,
-    /// The level's triangles, when they're new.
-    level: Option<Vec<[f32; 9]>>,
+    /// The level's triangles and their textures (64 a side), when they're new.
+    level: Option<(Vec<LevelTri>, Vec<Vec<u8>>)>,
     /// None: the view hasn't moved.
     view: Option<View>,
     /// The creatures' depth a pixel (f32::MAX where there are none), if any are in sight.
@@ -73,6 +73,8 @@ struct Job {
     step: Step,
     /// Wake from the dream.
     wake: bool,
+    /// The level's light from everywhere and its lights, as they are now.
+    lights: ([f32; 3], Vec<Light>),
     /// GAME_DREAM_CHECK: the CPU's G-buffer of this view.
     check: Option<Check>,
 }
@@ -145,6 +147,13 @@ struct CpuView {
 pub struct DreamAtlas {
     shared: Arc<Mutex<Shared>>,
     pub step: Step,
+    /// Where the torch is held, along the view's axes (right, down, forward) from the eye, in
+    /// tiles: by the sword.
+    pub torch_at: [f32; 3],
+    /// The networks' names (their files'), for `step.net`, and each one's steps (coarse, fine)
+    /// and gradient blur, kept as it was left when switching away.
+    net_names: Vec<String>,
+    net_steps: Vec<[f32; 3]>,
     /// The dream sharp only when the camera rests (else always).
     pub settle: bool,
     /// Off: the PS1 picture through the renderer with no dreaming.
@@ -173,30 +182,59 @@ pub struct DreamAtlas {
     pages_seen: usize,
     pages_in_use: usize,
     pub clear: bool,
-    /// The level's triangles as last given to the renderer.
-    level: Vec<[f32; 9]>,
+    /// The level's triangle features as last given to the renderer.
+    level: Vec<f32>,
     check: bool,
 }
 
 impl DreamAtlas {
-    pub fn new(weights: &Path, layers: &[String], fine_layers: &[String], images: &mut Assets<Image>) -> Result<DreamAtlas, String> {
-        let mut cfg = Config::new(weights);
+    /// Dream with network `i` of those given, with its own steps.
+    pub fn switch_net(&mut self, i: usize) {
+        let i = i.min(self.net_names.len() - 1);
+        let old = self.step.net.min(self.net_steps.len() - 1);
+        self.net_steps[old] = [self.step.lr, self.step.lr_fine, self.step.grad_blur];
+        [self.step.lr, self.step.lr_fine, self.step.grad_blur] = self.net_steps[i];
+        self.step.net = i;
+    }
+
+    /// Each network's weights, and the layers each octave dreams with (none: the network's own;
+    /// the fine octave's none: as the coarse).
+    pub fn new(weights: &[PathBuf], layers: &[Vec<String>], fine_layers: &[Vec<String>], images: &mut Assets<Image>) -> Result<DreamAtlas, String> {
+        let mut cfg = Config::new("");
+        cfg.nets = weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let layers = layers.get(i).cloned().unwrap_or_default();
+                let fine = fine_layers.get(i).filter(|f| !f.is_empty()).cloned().unwrap_or(layers.clone());
+                eprintln!("dream atlas: {} dreaming with {layers:?} and {fine:?} (none: its own)", w.display());
+                NetConfig { weights: w.clone(), layers, fine_layers: fine }
+            })
+            .collect();
+        let net_names: Vec<String> = weights.iter().map(|w| w.file_stem().map_or("?".into(), |s| s.to_string_lossy().into_owned())).collect();
         cfg.max_width = MAX_W;
         cfg.height = H;
         cfg.up = UP;
         cfg.max_touched = MAX_TOUCHED;
-        if !layers.is_empty() {
-            cfg.layers = layers.to_vec();
-        }
-        cfg.fine_layers = if fine_layers.is_empty() { cfg.layers.clone() } else { fine_layers.to_vec() };
-        eprintln!("dream atlas dreaming with {:?} and {:?}", cfg.layers, cfg.fine_layers);
         let max_pages = cfg.max_pages as usize;
         let size = Extent3d { width: MAX_W * UP, height: H * UP, depth_or_array_layers: 1 };
         let mut image = Image::new_fill(size, TextureDimension::D2, &[0, 0, 0, 255], TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::default());
         image.sampler = ImageSampler::nearest();
         Ok(DreamAtlas {
             shared: Arc::new(Mutex::new(Shared { config: Some(cfg), ..default() })),
-            step: Step { fine_split: 4, fine_every: 2, relief: 0.1, ..Step::default() },
+            net_steps: net_names
+                .iter()
+                .map(|n| {
+                    let d = Step::default();
+                    // The robust ResNet's gradients agree from step to step, so it wants smaller
+                    // ones, blurred against its grating.
+                    if n.contains("resnet") { [0.004, 0.003, 2.0] } else { [d.lr, d.lr_fine, d.grad_blur] }
+                })
+                .collect(),
+            net_names,
+            torch_at: [0.22, 0.2, 0.3],
+            // The relief shell-mapped (docs/shell_relief.md), deep and in as far as out.
+            step: Step { fine_split: 4, fine_every: 2, relief: 0.0, height: 0.001, height_max: 0.5, shell: 1.0, shell_smooth: 3.0, shell_far: 0.5, glint: 0.2, rough_dry: 0.8, rough_wet: 0.4, ..Step::default() },
             settle: false,
             mode: DreamMode::Still,
             drawn: None,
@@ -399,6 +437,8 @@ impl DreamAtlas {
                 duv_dy: others.map(|k| py[k] - p0[k]),
                 strength: 1.0 - fog,
                 slope: others.map(|k| eye[k] / rise),
+                pic: [x, y],
+                dist,
             };
             if let Some(p) = &prev {
                 let [x0, y0, z] = was(p, p0);
@@ -472,14 +512,15 @@ fn dream(mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<Render
     let (Some(job), Some(_), Some(_)) = (shared.job.as_ref(), shared.job.as_ref().and_then(|j| images.get(j.screen)), shared.job.as_ref().and_then(|j| images.get(j.out))) else { return };
     let (screen, out) = (images.get(job.screen).unwrap(), images.get(job.out).unwrap());
     let job = shared.job.take().unwrap();
-    if let Some(tris) = &job.level {
-        if let Err(e) = r.set_level(tris) {
+    if let Some((tris, textures)) = &job.level {
+        if let Err(e) = r.set_textures(64, textures).and_then(|_| r.set_level(tris)) {
             eprintln!("dream atlas: {e}");
         }
     }
     if job.wake {
         let _ = r.wake();
     }
+    r.set_lights(job.lights.0, &job.lights.1);
     let mut enc = device.wgpu_device().create_command_encoder(&Default::default());
     if let Err(e) = r.encode_view(&mut enc, &screen.texture, job.width, job.view.as_ref(), job.creatures.as_deref(), job.carry, &job.step, &out.texture) {
         eprintln!("dream atlas: {e}");
@@ -534,6 +575,46 @@ fn compare(r: &DreamRenderer, check: &Check) {
     );
 }
 
+/// The level's triangles as the dream renderer draws them (from their features: corners,
+/// place on the texture, the level's light and the torch's albedo, each 128 for as it is), each
+/// on the texture the PS1 renderer gives it (its strange step where the level's strange), and
+/// those textures, in the order the triangles count them.
+fn level_tris(level: &engine::neural::Level, textures: Option<&engine::render::LevelTextures>) -> (Vec<LevelTri>, Vec<Vec<u8>>) {
+    use engine::world::tex;
+    let scene = &level.scene;
+    let plain = scene.sky.is_some();
+    let mut layers: Vec<Vec<u8>> = Vec::new();
+    let mut layer_of: HashMap<u8, u32> = HashMap::new();
+    let tris = level
+        .tris
+        .chunks_exact(TRI_FEATURES)
+        .enumerate()
+        .map(|(i, t)| {
+            let base = t[15] as u8;
+            // Things (doors, keys, levers) after the level's own triangles keep their texture.
+            let id = if i < scene.tris.len() {
+                let centre = [0, 1, 2].map(|c| (t[c] + t[3 + c] + t[6 + c]) / 3.0 * engine::world::scene::T as f32);
+                tex::strange_variant(base, scene.morph(centre)).0
+            } else {
+                base
+            };
+            let texture = *layer_of.entry(id).or_insert_with(|| {
+                layers.push(textures.and_then(|tx| tx.rgba(id, plain)).unwrap_or_else(|| vec![128; 64 * 64 * 4]));
+                layers.len() as u32 - 1
+            });
+            let neutral = 255.0 / 128.0;
+            LevelTri {
+                pos: std::array::from_fn(|k| t[k]),
+                uv: std::array::from_fn(|k| t[9 + k] * 64.0 / 63.0),
+                light: std::array::from_fn(|k| t[16 + k] * neutral),
+                albedo: std::array::from_fn(|k| t[25 + k] * neutral),
+                texture,
+            }
+        })
+        .collect();
+    (tris, layers)
+}
+
 /// Each frame: the G-buffer of the PS1 screen's view (unless it hasn't moved), handed to the
 /// render world to dream on, and the sprite shown the frame it makes.
 pub fn draw(
@@ -542,6 +623,7 @@ pub fn draw(
     screen: Res<PsxScreen>,
     creatures: Res<crate::Creatures>,
     shown: Res<engine::render::DreamCreatures>,
+    textures: Option<Res<engine::render::LevelTextures>>,
     atlas: Option<NonSendMut<DreamAtlas>>,
     mut sprite: Query<&mut Sprite, With<NetworkSprite>>,
 ) {
@@ -570,14 +652,22 @@ pub fn draw(
     // The same view as the last frame's, with no creatures in it: its surfaces still hold.
     let still = atlas.mode != DreamMode::Walls && !atlas.clear && creatures.iter().all(|&z| z == f32::MAX) && atlas.drawn.is_some_and(|(c, w)| w == width && c.pos == cam.pos && c.yaw == cam.yaw && c.pitch == cam.pitch);
     atlas.drawn = Some((cam, width));
-    // The level's triangles, given again when they change (a door moves, another level).
-    let tris = sim.level.tris.chunks_exact(TRI_FEATURES);
-    let level = (tris.len() != atlas.level.len() || tris.zip(&atlas.level).any(|(t, l)| t[..9] != l[..])).then(|| {
-        atlas.level = sim.level.tris.chunks_exact(TRI_FEATURES).map(|t| std::array::from_fn(|k| t[k])).collect();
-        atlas.level.clone()
+    // The level's triangles, given again when they change (a door moves, its light changes,
+    // another level).
+    let level = (sim.level.tris != atlas.level).then(|| {
+        atlas.level = sim.level.tris.clone();
+        level_tris(&sim.level, textures.as_deref())
     });
     let v = sim.level.view(&cam, width);
-    let view = View { pos: [v[1], v[2], v[3]], axes: [[v[4], v[5], v[6]], [v[7], v[8], v[9]], [v[10], v[11], v[12]]], focal: v[13], fog: [v[14], v[15]] };
+    let view = View {
+        pos: [v[1], v[2], v[3]],
+        axes: [[v[4], v[5], v[6]], [v[7], v[8], v[9]], [v[10], v[11], v[12]]],
+        focal: v[13],
+        fog: [v[14], v[15]],
+        torch: [v[19], v[20], v[21], v[22]],
+        fog_colour: [v[23], v[24], v[25]],
+        torch_at: atlas.torch_at,
+    };
     let mut check = None;
     if atlas.check && !still {
         let mut evicted = Vec::new();
@@ -620,6 +710,7 @@ pub fn draw(
         step,
         wake,
         check,
+        lights: level_lights(&sim.level.scene, &cam),
     };
     {
         let mut shared = atlas.shared.lock().unwrap();
@@ -665,6 +756,20 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
         ui.label(format!("{:.1} ms a frame dreaming, {:.1} ms the main world's part", a.ms, a.gbuffer_ms));
         ui.label(format!("{} pages in sight (up to {MAX_TOUCHED} dreamed a frame), {} in all", a.pages_seen, a.pages_in_use));
         ui.checkbox(&mut a.dreaming, "dreaming");
+        if a.net_names.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label("dreaming with");
+                let mut net = a.step.net;
+                for (i, name) in a.net_names.iter().enumerate() {
+                    ui.radio_value(&mut net, i, name.as_str());
+                }
+                if net != a.step.net {
+                    a.switch_net(net);
+                }
+            });
+        }
+        ui.add(egui::Slider::new(&mut a.step.scale, 0.25..=1.5).text("coarse: the picture seen at (smaller dreams bigger)"));
+        ui.add(egui::Slider::new(&mut a.step.fine_scale, 1.0..=3.0).text("fine: the picture seen at (smaller dreams bigger)"));
         ui.add(egui::Slider::new(&mut a.step.lr, 0.0..=0.05).text("step, coarse"));
         ui.add(egui::Slider::new(&mut a.step.lr_fine, 0.0..=0.05).text("step, fine"));
         ui.add(egui::Slider::new(&mut a.step.coarse_every, 1..=8).text("coarse every n frames"));
@@ -673,9 +778,10 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
         ui.add(egui::Slider::new(&mut a.step.fine_split, 1..=6).text("fine piece: 1/n of the frame each way"));
         ui.add(egui::Slider::new(&mut a.step.colour, 0.0..=1.0).text("colour (0: light and shade only)"));
         ui.add(egui::Slider::new(&mut a.step.colour_blur, 1..=8).text("colour spread wider by"));
+        ui.add(egui::Slider::new(&mut a.step.grad_blur, 0.0..=4.0).text("gradient blurred (net pixels; against ResNet's grating)"));
         ui.add(egui::Slider::new(&mut a.step.take_over, 0.0..=0.1).logarithmic(true).text("takes the wall over a step"));
         ui.add(egui::Slider::new(&mut a.step.own_max, 0.0..=1.0).text("most of the wall it owns"));
-        ui.add(egui::Slider::new(&mut a.step.relief, 0.0..=0.3).text("relief (tiles off the wall)"));
+        ui.add(egui::Slider::new(&mut a.step.relief, 0.0..=10.0).logarithmic(true).text("relief (tiles off the wall)"));
         ui.add(egui::Slider::new(&mut a.step.relief_rate, 0.0..=0.3).logarithmic(true).text("relief rises a frame"));
         ui.add(egui::Slider::new(&mut a.step.decay, 0.0..=0.02).logarithmic(true).text("let go a frame"));
         ui.add(egui::Slider::new(&mut a.step.limit, 0.05..=1.0).text("most it may change"));
@@ -689,6 +795,38 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
             ui.radio_value(&mut a.mode, DreamMode::Reproject, "the screen, carried along");
         });
         ui.add(egui::Slider::new(&mut a.step.remember_every, 0..=16).text("carried along: put on the walls over n frames (0: forget)"));
+        ui.label("carried along, the dreamed height:");
+        ui.add(egui::Slider::new(&mut a.step.height, 0.0..=0.1).logarithmic(true).text("raised a step (tiles; 0: flat)"));
+        ui.add(egui::Slider::new(&mut a.step.height_max, 0.0..=10.0).logarithmic(true).text("highest (tiles)"));
+        ui.add(egui::Slider::new(&mut a.step.height_blur, 1..=12).text("each step blurred by (pixels)"));
+        ui.add(egui::Slider::new(&mut a.step.height_spread, 1..=6).text("blurred at this many sizes, each twice the last (whole shapes rise)"));
+        ui.add(egui::Slider::new(&mut a.step.height_power, 0.0..=2.0).text("bigger sizes weigh more by (1: half way, 2: integrated)"));
+        ui.add(egui::Slider::new(&mut a.step.height_from_colour, -1.0..=1.0).text("rises where the dream brightens (vs the lamp)"));
+        ui.add(egui::Slider::new(&mut a.step.height_decay, 0.0..=0.05).logarithmic(true).text("height let go a step (settles, not filling up)"));
+        ui.checkbox(&mut a.step.height_centred, "each step about its own mean (rises and sinks alike)");
+        ui.add(egui::Slider::new(&mut a.step.lamp, 0.0..=1.0).text("dream lamp: how much it shades what the dream sees"));
+        ui.add(egui::Slider::new(&mut a.step.lamp_ambient, 0.0..=1.0).text("dream lamp: light from everywhere"));
+        ui.add(egui::Slider::new(&mut a.step.shade_only_every, 0..=8).text("the dream sees the shading alone every n steps (0: never)"));
+        ui.add(egui::Slider::new(&mut a.step.show_shade, 0.0..=1.0).text("shown shaded by the height"));
+        ui.add(egui::Slider::new(&mut a.step.show_wrap, 0.0..=2.0).text("its light wraps round (0: hard, 1: soft, matte)"));
+        ui.checkbox(&mut a.step.show_height, "show the height alone");
+        ui.add(egui::Slider::new(&mut a.step.displace, 0.0..=2.0).text("the walls pushed out by it, subdivided (0: flat, the dream unmoved by it)"));
+        ui.add(egui::Slider::new(&mut a.step.shell, 0.0..=2.0).text("the relief marched in shells over the flat walls (0: none)"));
+        ui.add(egui::Slider::new(&mut a.step.shell_smooth, 0.0..=6.0).text("the relief smoothed (levels, each twice as broad; 0: as dreamed)"));
+        ui.add(egui::Slider::new(&mut a.step.shell_far, 0.0..=2.0).text("and smoother far off (two levels more at 4 / this tiles; 0: none)"));
+        ui.checkbox(&mut a.step.show_shell, "show the shells' relief alone (grey by height, red: nothing met)");
+        ui.checkbox(&mut a.step.own_picture, "the level drawn by the dream renderer (not the PS1 picture) under the dream");
+        ui.label("the torch, held (tiles from the eye):");
+        ui.add(egui::Slider::new(&mut a.torch_at[0], -0.5..=0.5).text("right"));
+        ui.add(egui::Slider::new(&mut a.torch_at[1], -0.5..=0.5).text("down"));
+        ui.add(egui::Slider::new(&mut a.torch_at[2], -0.5..=0.8).text("forward"));
+        ui.checkbox(&mut a.step.lights, "the height lit by the torch and the level's lights from where they are (else from the eye)");
+        ui.add(egui::Slider::new(&mut a.step.dream_lit, 0.0..=1.0).text("the dream lit as the wall is (0: it glows)"));
+        ui.label("the torch's glint:");
+        ui.add(egui::Slider::new(&mut a.step.glint, 0.0..=3.0).text("how bright (0: none)"));
+        ui.add(egui::Slider::new(&mut a.step.torch_reach, 1.0..=15.0).text("how far it reaches (tiles)"));
+        ui.add(egui::Slider::new(&mut a.step.rough_dry, 0.05..=1.0).text("rough, plain wall"));
+        ui.add(egui::Slider::new(&mut a.step.rough_wet, 0.05..=1.0).text("rough, where the dream owns it"));
         if !a.settle {
             ui.add(egui::Slider::new(&mut a.step.sharpness, 0.0..=1.0).text("sharpness"));
         }
@@ -697,4 +835,16 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
         }
     });
     Ok(())
+}
+
+/// The level's light from everywhere and its lights as they are now (strangeness and all), in
+/// tiles, for lighting the dreamed height from where they are: the sun from far off (towards it).
+fn level_lights(scene: &engine::world::scene::Scene, cam: &Camera) -> ([f32; 3], Vec<Light>) {
+    let t = engine::render::TF;
+    let (ambient, sun_dir, sun, points) = scene.lights_now(cam.pos.map(|c| c as f32));
+    let mut lights: Vec<Light> = points.into_iter().map(|(pos, colour, radius)| Light { pos: pos.map(|c| c / t), colour, radius: radius / t }).collect();
+    if sun.iter().any(|&c| c > 1e-3) {
+        lights.push(Light { pos: sun_dir.map(|c| -c), colour: sun, radius: 0.0 });
+    }
+    (ambient, lights)
 }

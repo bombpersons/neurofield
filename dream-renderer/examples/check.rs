@@ -6,7 +6,7 @@
 //! Then the G-buffer the renderer makes from a level drawn on the GPU against one made on the
 //! CPU, as game/src/dream_atlas.rs `surfaces` makes it.
 
-use dream_renderer::{Config, DreamRenderer, Face, Motion, Step, Surface, View};
+use dream_renderer::{Config, DreamRenderer, Edge, Face, LevelTri, Motion, Pushed, Step, Surface, View};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -20,7 +20,9 @@ fn device(bytes: u64) -> (wgpu::Device, wgpu::Queue, String) {
     let mut limits = wgpu::Limits::default();
     limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(bytes);
     limits.max_buffer_size = limits.max_buffer_size.max(bytes);
-    let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).expect("a device");
+    // Timestamps for GAME_DREAM_PROFILE, where the adapter has them.
+    let timing = adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+    let (d, q) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, required_features: timing, ..Default::default() })).expect("a device");
     (d, q, adapter.get_info().name)
 }
 
@@ -55,14 +57,19 @@ fn main() {
     let (shape, rgb) = &f["rgb"];
     let (h, w) = (shape[0] as u32, shape[1] as u32);
 
-    let wanted = ["conv1", "maxpool1", "conv3", "maxpool2", "inception3a", "inception4c"];
-    let (g, acts) = dr.input_gradient(rgb, h, w, &["inception4c"], &wanted).expect("gradient");
+    // GoogLeNet's fixture (train/export_googlenet.py) or ResNet's (train/export_resnet.py).
+    let (wanted, one, two): (&[&str], &[&str], &[&str]) = if f.contains_key("grad_layer3.5") {
+        (&["conv1", "maxpool", "layer1.0", "layer2.0", "layer3.5"], &["layer3.5"], &["layer2.3", "layer3.5"])
+    } else {
+        (&["conv1", "maxpool1", "conv3", "maxpool2", "inception3a", "inception4c"], &["inception4c"], &["inception3b", "inception4d"])
+    };
+    let (g, acts) = dr.input_gradient(rgb, h, w, one, wanted).expect("gradient");
     for (name, a) in wanted.iter().zip(&acts) {
         compare(&format!("activation {name}"), a, &f[&format!("act_{name}")].1);
     }
-    compare("gradient 4c", &g, &f["grad_inception4c"].1);
-    let (g, _) = dr.input_gradient(rgb, h, w, &["inception3b", "inception4d"], &[]).expect("gradient");
-    compare("gradient 3b + 4d", &g, &f["grad_inception3b+inception4d"].1);
+    compare(&format!("gradient {}", one.join(" + ")), &g, &f[&format!("grad_{}", one.join("+"))].1);
+    let (g, _) = dr.input_gradient(rgb, h, w, two, &[]).expect("gradient");
+    compare(&format!("gradient {}", two.join(" + ")), &g, &f[&format!("grad_{}", two.join("+"))].1);
 
     // A frame of dreaming on the fixture's picture, every pixel on one of a grid of pages.
     let picture: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [(p[0] * 255.0) as u8, (p[1] * 255.0) as u8, (p[2] * 255.0) as u8, 255]).collect();
@@ -70,7 +77,7 @@ fn main() {
         .map(|i| {
             let (x, y) = ((i % w) as f32, (i / w) as f32);
             let (px, py) = ((x / 64.0).floor(), (y / 64.0).floor());
-            Surface { page: py * 5.0 + px, uv: [x / 64.0 - px, y / 64.0 - py], duv_dx: [1.0 / 64.0, 0.0], duv_dy: [0.0, 1.0 / 64.0], strength: 1.0, slope: [0.3, -0.2] }
+            Surface { page: py * 5.0 + px, uv: [x / 64.0 - px, y / 64.0 - py], duv_dx: [1.0 / 64.0, 0.0], duv_dy: [0.0, 1.0 / 64.0], strength: 1.0, slope: [0.3, -0.2], pic: [x + 0.5, y + 0.5], dist: 2.0 }
         })
         .collect();
     let step = Step::default();
@@ -198,7 +205,7 @@ fn main() {
     println!("showing only (no dreaming): median {:.1} ms", times[times.len() / 2]);
     for (h, w) in [(240, 320), (360, 480)] {
         println!("profile at {w} x {h} (each dispatch waited on alone, so a little slower):");
-        for (k, ms, n) in dr.profile(h, w, &["inception4c"]).expect("profile") {
+        for (k, ms, n) in dr.profile(h, w, &[one[0]]).expect("profile") {
             println!("  {k:>16}: {ms:6.2} ms over {n}");
         }
     }
@@ -210,6 +217,54 @@ fn main() {
     std::fs::write(out, ppm).expect("write");
     println!("wrote {out}");
     gbuffer_check(&mut dr, &input, &output, w, h);
+    height_check(&mut dr, &picture, w, h, cfg.up);
+}
+
+/// The height's gradient through the dream lamp (shade_back) against the objective's change
+/// when a pixel's height is nudged either way, on the room's surfaces.
+fn height_check(dr: &mut DreamRenderer, picture: &[u8], w: u32, h: u32, up: u32) {
+    let (surfaces, _) = dr.read_gbuffer().expect("surfaces");
+    let (sw, sh) = (w * up, h * up);
+    // Smooth bumps, a few hundredths of a page high.
+    let heights: Vec<f32> = (0..sw * sh).map(|i| {
+        let (x, y) = ((i % sw) as f32, (i / sw) as f32);
+        0.02 * ((x * 0.05).sin() * (y * 0.07).cos() + 0.5 * (x * 0.13 + y * 0.11).sin())
+    }).collect();
+    for (what, lamp) in [("colour and shading", [0.4, -0.3, 0.866, 0.3, 1.0, 0.0]), ("shading alone", [-0.5, 0.2, 0.84, 0.3, 1.0, 1.0])] {
+        let (_, grad) = dr.lamp_gradient(picture, w, &surfaces, &heights, lamp).expect("gradient");
+        let mut rng = 12345u64;
+        let (mut worst, mut n, mut dots, mut na, mut nb) = (0.0f64, 0, 0.0f64, 0.0f64, 0.0f64);
+        let scale = grad.iter().map(|g| g.abs()).fold(0.0f32, f32::max) as f64;
+        while n < 24 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let (bx, by) = (2 + (rng >> 20) as u32 % (w - 4), 2 + (rng >> 40) as u32 % (h - 4));
+            let i = (by * w + bx) as usize;
+            if surfaces[i].page < 0.0 || grad[i].abs() < 0.05 * scale as f32 {
+                continue;
+            }
+            let eps: f32 = std::env::var("EPS").ok().and_then(|e| e.parse().ok()).unwrap_or(1e-4);
+            let mut obj = [0.0f64; 2];
+            for (k, sign) in [1.0f32, -1.0].into_iter().enumerate() {
+                let mut hh = heights.clone();
+                for y in by * up..(by + 1) * up {
+                    for x in bx * up..(bx + 1) * up {
+                        hh[(y * sw + x) as usize] += sign * eps;
+                    }
+                }
+                obj[k] = dr.lamp_gradient(picture, w, &surfaces, &hh, lamp).expect("gradient").0;
+            }
+            let fd = (obj[0] - obj[1]) / (2.0 * eps as f64);
+            let g = grad[i] as f64;
+            worst = worst.max((fd - g).abs() / scale);
+            dots += fd * g;
+            na += fd * fd;
+            nb += g * g;
+            n += 1;
+        }
+        println!("height gradient through the dream lamp ({what}) against nudging 24 pixels' heights: largest difference {:.2}% of the largest gradient, cosine {:.4}", 100.0 * worst, dots / (na * nb).sqrt());
+    }
 }
 
 type V3 = [f32; 3];
@@ -264,7 +319,7 @@ fn look(pos: V3, yaw: f32, pitch: f32, focal: f32) -> View {
     let f = [yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()];
     let r = unit(cross([0.0, 1.0, 0.0], f));
     let d = cross(f, r);
-    View { pos, axes: [r, d, f], focal, fog: [3.0, 12.0] }
+    View { pos, axes: [r, d, f], focal, fog: [3.0, 12.0], torch: [1.0, 0.8, 0.6, 3.0], fog_colour: [0.1, 0.0, 0.15], torch_at: [0.0; 3] }
 }
 
 /// game/src/dream_atlas.rs `surfaces`, the nearest triangle found by casting each pixel's ray:
@@ -335,6 +390,8 @@ fn cpu_gbuffer(tris: &[[f32; 9]], v: &View, w: u32, h: u32, last: Option<(&View,
                 duv_dy: others.map(|k| py[k] - p0[k]),
                 strength: 1.0 - fog,
                 slope: others.map(|k| eye[k] / rise),
+                pic: [x as f32 + 0.5, y as f32 + 0.5],
+                dist,
             };
             if let Some((l, near)) = last {
                 let [x0, y0, z] = was(l, p0);
@@ -359,7 +416,10 @@ fn gbuffer_check(dr: &mut DreamRenderer, input: &wgpu::Texture, output: &wgpu::T
     boxed(&mut tris, [1.0, 0.0, 4.0], [3.0, 0.5, 5.5], true);
     // A slope.
     quad(&mut tris, [[5.5, 0.0, 0.5], [6.5, 0.0, 0.5], [6.5, 1.0, 2.5], [5.5, 1.0, 2.5]], [0.0, 1.0, -0.5]);
-    dr.set_level(&tris).expect("level");
+    // Each triangle on its own grey texture, half lit by the level and taking all the torch.
+    let level: Vec<LevelTri> = tris.iter().map(|&pos| LevelTri { pos, uv: [0.0, 0.0, 1.0, 0.0, 0.0, 1.0], light: [1.0; 9], albedo: [1.0; 9], texture: 0 }).collect();
+    dr.set_level(&level).expect("level");
+    dr.set_textures(2, &[[96u8, 96, 96, 255].repeat(4)]).expect("textures");
     let focal = h as f32 / 2.0 / (0.5f32).tan();
     let a = look([1.2, 1.5, 0.8], 0.7, 0.15, focal);
     let b = look([1.3, 1.48, 0.86], 0.72, 0.16, focal);
@@ -407,4 +467,594 @@ fn gbuffer_check(dr: &mut DreamRenderer, input: &wgpu::Texture, output: &wgpu::T
     println!("  {shown} pixels show the level, {paged} with a page; {same_face} of those on the same face as the CPU's");
     println!("  largest difference where they agree: uv {:.2e}, uv a pixel on {:.2e}, strength {:.2e}, slope {:.2e} (relative)", worst[0], worst[1], worst[2], worst[3]);
     println!("  motion: {moved} pixels seen in the last view by the CPU, {moved_both} by both (only the CPU {}, only the GPU {}); largest difference {:.2e} pixels", only[0], only[1], worst[4]);
+    // Pushed out: each page its own height, so the faces' edges only meet if the vertices
+    // there take the mean of every face they're on. Closed, the room shows no holes.
+    let mut rng = 99u64;
+    let mut heights = vec![0.0f32; 512];
+    for h in &mut heights {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        *h = (rng >> 40) as f32 / (1u64 << 24) as f32 * 0.3 - 0.1;
+    }
+    let corner = look([3.3, 1.2, 2.2], 0.9, 0.05, focal);
+    let drawn = |dr: &mut DreamRenderer, step: &Step| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        dr.encode_view(&mut enc, input, w, Some(&corner), None, true, step, output).expect("encode_view");
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        (dr.read_gbuffer().expect("read").0, dr.read_triangles().expect("triangles"))
+    };
+    let (flat, flat_ids) = drawn(dr, &quiet);
+    let flat_dist: Vec<f32> = flat.iter().map(|s| s.dist).collect();
+    dr.fill_heights(|p| heights[p as usize]);
+    // Flat (displace 0, the dream's G-buffer): the height moves nothing.
+    let (raised, raised_ids) = drawn(dr, &quiet);
+    let same = |a: &Surface, b: &Surface| a.page == b.page && a.uv == b.uv && a.duv_dx == b.duv_dx && a.duv_dy == b.duv_dy && a.slope == b.slope && a.dist == b.dist && a.pic == b.pic;
+    let changed = flat.iter().zip(&raised).filter(|(a, b)| !same(a, b)).count() + flat_ids.iter().zip(&raised_ids).filter(|(a, b)| a != b).count();
+    println!("  flat, a height each page, close to the pillar's corner: {changed} of {} pixels' G-buffer changed by the height", flat.len());
+    let quiet = Step { displace: 1.0, ..quiet };
+    for (what, view) in [("from a", a), ("from b", b), ("close to the pillar's corner", look([3.3, 1.2, 2.2], 0.9, 0.05, focal)), ("close to a corner of the room", look([5.6, 2.3, 4.6], 0.8, -0.5, focal))] {
+        let mut enc = device.create_command_encoder(&Default::default());
+        dr.encode_view(&mut enc, input, w, Some(&view), None, true, &quiet, output).expect("encode_view");
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let ids = dr.read_triangles().expect("triangles");
+        let holes = ids.iter().filter(|&&t| t == 0).count();
+        println!("  pushed out -0.1..0.2 a page, a height each page, {what}: {holes} pixels show nothing");
+        if what.starts_with("close to the pillar") {
+            let d: Vec<f32> = dr.read_gbuffer().expect("read").0.iter().map(|s| s.dist).collect();
+            let moved = d.iter().zip(&flat_dist).filter(|(a, b)| (*a - *b).abs() > 0.01).count();
+            println!("    {moved} of {} pixels' distance changed from the flat level's by over a hundredth", d.len());
+            let mut ppm = format!("P5 {w} {h} 255\n").into_bytes();
+            ppm.extend(d.iter().map(|&x| (255.0 * (1.0 - x / 5.0)).clamp(0.0, 255.0) as u8));
+            let _ = std::fs::write(std::env::temp_dir().join("dream_pushed_depth.pgm"), ppm);
+        }
+    }
+    dr.fill_heights(|_| 0.0);
+    shell_check(dr, input, output, w, h, &tris, focal);
+}
+
+/// examples' `Step` for the shell: the march on, nothing dreamed.
+fn shell_step(limit: f32) -> Step {
+    Step { lr: 0.0, lr_fine: 0.0, shell: 1.0, height_max: limit, ..Step::default() }
+}
+
+/// shell.wgsl's march done finely on the CPU for the shown pixel (x, y): the nearest (view
+/// depth, triangle, foot, the hit's height above the plane) over every triangle's three
+/// tetrahedra (`pushes`), `reach` out and in (within each corner's cap).
+#[allow(clippy::too_many_arguments)]
+fn cpu_march(tris: &[[f32; 9]], pushes: &[Pushed], edges: &[[Edge; 3]], across: &[[Option<usize>; 3]], taper: f32, v: &View, up: u32, sw: u32, sh: u32, x: u32, y: u32, reach: f32, r: i32, far: f32, height: &dyn Fn(Face, [i32; 2]) -> Option<(f32, f32)>) -> Option<(f32, usize, V3, f32)> {
+    let f = v.focal * up as f32;
+    let dv = [(x as f32 + 0.5 - sw as f32 / 2.0) / f, (y as f32 + 0.5 - sh as f32 / 2.0) / f, 1.0];
+    let a = v.axes;
+    let d = [0, 1, 2].map(|k| a[0][k] * dv[0] + a[1][k] * dv[1] + a[2][k] * dv[2]);
+    let o = v.pos;
+    let mut best: Option<(f32, usize, V3, f32)> = None;
+    for (ti, t) in tris.iter().enumerate() {
+        let c = [0, 1, 2].map(|k| [t[3 * k], t[3 * k + 1], t[3 * k + 2]]);
+        let n = unit(cross(sub(c[1], c[0]), sub(c[2], c[0])));
+        let d0 = dot(c[0], n);
+        let push = &pushes[ti];
+        let reaches = push.cap.map(|cap| reach.min(cap));
+        let sides = [0, 1, 2].map(|k| {
+            let m = unit(cross(sub(c[(k + 1) % 3], c[k]), n));
+            (m, dot(m, c[k]))
+        });
+        // As shell.wgsl's raw_height: on the plane m . x = md, bilinear between the height
+        // cells of its grid, each from the page of the tile it's in, those with none left out.
+        let raw = |foot: V3, m: V3, md: f32| {
+            let axis = (0..3).max_by(|&p, &q| m[p].abs().total_cmp(&m[q].abs())).unwrap();
+            let orient = axis as i32 * 2 + (m[axis] > 0.0) as i32;
+            let pick = |p: V3| match axis {
+                0 => [p[1], p[2]],
+                1 => [p[0], p[2]],
+                _ => [p[0], p[1]],
+            };
+            let axes: [V3; 2] = match axis {
+                0 => [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                1 => [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                _ => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            };
+            let pf = pick(foot);
+            let g = pf.map(|c| c * r as f32 - 0.25);
+            let i0 = g.map(|c| c.floor() as i32);
+            let f = [g[0] - g[0].floor(), g[1] - g[1].floor()];
+            let (mut sum, mut wsum) = (0.0, 0.0);
+            for (di, dj) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let gi = [i0[0] + di, i0[1] + dj];
+                let c = gi.map(|q| (q as f32 + 0.25) / r as f32);
+                let mut q: V3 = std::array::from_fn(|k| foot[k] + axes[0][k] * (c[0] - pf[0]) + axes[1][k] * (c[1] - pf[1]));
+                let off = dot(m, q) - md;
+                q = std::array::from_fn(|k| q[k] - m[k] * off);
+                let cell = [0, 1, 2].map(|k| (q[k] - m[k] * 0.01).floor() as i32);
+                let local = [0, 1].map(|k| (gi[k] - c[k].floor() as i32 * r).clamp(0, r - 1));
+                if let Some((near, far_off)) = height([orient, cell[0], cell[1], cell[2]], local) {
+                    // As shell.wgsl's far_weight: smoothed more by the foot's view depth.
+                    let k = (far * dot(v.axes[2], sub(foot, v.pos)) / 4.0).clamp(0.0, 1.0);
+                    let v = near * (1.0 - k) + far_off * k;
+                    let w = (if di == 1 { f[0] } else { 1.0 - f[0] }) * (if dj == 1 { f[1] } else { 1.0 - f[1] });
+                    sum += w * v;
+                    wsum += w;
+                }
+            }
+            if wsum > 0.0 { sum / wsum } else { 0.0 }
+        };
+        let smooth = |x: f32, width: f32| {
+            let t = (x / width.max(1e-6)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        // As shell.wgsl's height_at: met at each crease by the wall beyond's, tapered to open
+        // edges.
+        let height_at = |foot: V3| {
+            let mut h = raw(foot, n, d0);
+            for k in 0..3 {
+                let Some(j) = across[ti][k].filter(|_| edges[ti][k].crease()) else { continue };
+                let dist = sides[k].1 - dot(sides[k].0, foot);
+                let e: V3 = std::array::from_fn(|q| foot[q] + sides[k].0[q] * dist);
+                let o = tris[j];
+                let m = unit(cross(sub([o[3], o[4], o[5]], [o[0], o[1], o[2]]), sub([o[6], o[7], o[8]], [o[0], o[1], o[2]])));
+                let toward = 0.5 * (raw(e, m, dot(m, [o[0], o[1], o[2]])) - raw(e, n, d0));
+                h += toward * (1.0 - smooth(dist.max(0.0), taper.max(toward.abs() * 2.0)));
+            }
+            h * (0..3).filter(|&k| edges[ti][k].tapers()).map(|k| smooth(sides[k].1 - dot(sides[k].0, foot), taper.max(h.abs() * 2.0))).product::<f32>()
+        };
+        // As shell.wgsl's mapping: x = sum_k b_k (corner_k + s dir_k reach_k), solved for s
+        // (Newton, in f64) and then b.
+        let f64s = |v: V3| v.map(|x| x as f64);
+        let cr = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let dt = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let add = |a: [f64; 3], b: [f64; 3], k: f64| [a[0] + b[0] * k, a[1] + b[1] * k, a[2] + b[2] * k];
+        let cs = c.map(f64s);
+        let dirs: [[f64; 3]; 3] = std::array::from_fn(|k| push.dir[k].map(|x| x as f64 * reaches[k] as f64));
+        let n64 = f64s(n);
+        let place_of = |x: [f64; 3], guess: f64| {
+            let q0 = add(x, cs[0], -1.0);
+            let corner = |k: usize, s: f64| add(cs[k], dirs[k], s);
+            let tri_at = |s: f64| {
+                let a0 = corner(0, s);
+                (add(corner(1, s), a0, -1.0), add(corner(2, s), a0, -1.0))
+            };
+            let f = |s: f64| {
+                let (e1, e2) = tri_at(s);
+                dt(cr(e1, e2), add(q0, dirs[0], -s))
+            };
+            let mut s = guess;
+            for _ in 0..30 {
+                let e = 1e-7;
+                let df = (f(s + e) - f(s - e)) / (2.0 * e);
+                if df.abs() < 1e-30 {
+                    break;
+                }
+                let step = f(s) / df;
+                s -= step;
+                if step.abs() < 1e-13 {
+                    break;
+                }
+            }
+            let (e1, e2) = tri_at(s);
+            let cc = cr(e1, e2);
+            let q = add(q0, dirs[0], -s);
+            let b1 = dt(cr(q, e2), cc) / dt(cc, cc);
+            let b2 = dt(cr(e1, q), cc) / dt(cc, cc);
+            ([1.0 - b1 - b2, b1, b2], s)
+        };
+        for tet in 0..3 {
+            // The tetrahedron's corners, and where the line of sight's inside it (in f64).
+            let p = push.tet(&c, tet, reach).map(f64s);
+            let (o64, d64) = (f64s(o), f64s(d));
+            let mut span = (0.02f64, v.fog[1] as f64);
+            for i in 0..4 {
+                let a0 = p[(i + 1) % 4];
+                let mut m = cr(add(p[(i + 2) % 4], a0, -1.0), add(p[(i + 3) % 4], a0, -1.0));
+                if dt(m, add(p[i], a0, -1.0)) < 0.0 {
+                    m = m.map(|x| -x);
+                }
+                let (dm, room) = (dt(m, d64), dt(m, add(o64, a0, -1.0)));
+                if dm.abs() < 1e-30 {
+                    if room < 0.0 {
+                        span = (1.0, 0.0);
+                    }
+                } else if dm > 0.0 {
+                    span.0 = span.0.max(-room / dm);
+                } else {
+                    span.1 = span.1.min(-room / dm);
+                }
+            }
+            if span.1 <= span.0 || best.is_some_and(|b| (b.0 as f64) < span.0) {
+                continue;
+            }
+            let xe = add(o64, d64, span.0);
+            let guess = (dt(n64, xe) - d0 as f64) / (dt(n64, add(add(dirs[0], dirs[1], 1.0), dirs[2], 1.0)) / 3.0).max(1e-9);
+            let probe = |t: f64| {
+                let (b, s) = place_of(add(o64, d64, t), guess);
+                let foot: V3 = std::array::from_fn(|k| (b[0] * cs[0][k] + b[1] * cs[1][k] + b[2] * cs[2][k]) as f32);
+                let lim = (b[0] * reaches[0] as f64 + b[1] * reaches[1] as f64 + b[2] * reaches[2] as f64) as f32;
+                (s as f32 * lim - height_at(foot).clamp(-lim, lim), foot, s)
+            };
+            const STEPS: u32 = 700;
+            let (mut t0, mut t1) = (span.0, span.0);
+            let mut met = probe(span.0).0 <= 0.0;
+            for i in 1..=STEPS {
+                if met {
+                    break;
+                }
+                let ti = span.0 + (span.1 - span.0) * i as f64 / STEPS as f64;
+                if probe(ti).0 <= 0.0 {
+                    t1 = ti;
+                    met = true;
+                } else {
+                    t0 = ti;
+                }
+            }
+            if !met {
+                // As shell.wgsl: out through the inner shell, met there.
+                if probe(span.1).2 > -1.0 + 1e-4 {
+                    continue;
+                }
+                (t0, t1) = (span.1, span.1);
+            }
+            for _ in 0..40 {
+                let tm = 0.5 * (t0 + t1);
+                if probe(tm).0 <= 0.0 { t1 = tm } else { t0 = tm }
+            }
+            let (_, foot, _) = probe(t1);
+            let t1 = t1 as f32;
+            let hit: V3 = std::array::from_fn(|k| o[k] + d[k] * t1);
+            if best.is_none_or(|b| t1 < b.0) {
+                best = Some((t1, ti, foot, dot(n, hit) - d0));
+            }
+        }
+    }
+    best
+}
+
+/// The shell (docs/shell_relief.md step 2): its march on the GPU against the CPU's at a few
+/// hundred shown pixels, flat and with a smooth bump on each page, and the pixels left with
+/// nothing (the room is closed, so none should be).
+fn shell_check(dr: &mut DreamRenderer, input: &wgpu::Texture, output: &wgpu::Texture, w: u32, h: u32, tris: &[[f32; 9]], focal: f32) {
+    let (device, queue) = (dr.device().clone(), dr.queue().clone());
+    let level: Vec<LevelTri> = tris.iter().map(|&pos| LevelTri { pos, ..Default::default() }).collect();
+    let edges = dream_renderer::edges(&level);
+    let pushes = dream_renderer::pushed(&level, &edges);
+    let beyond = dream_renderer::neighbours(&level);
+    let caps: Vec<f32> = pushes.iter().flat_map(|p| p.cap).filter(|&c| c < 1e5).collect();
+    let mitres: Vec<f32> = pushes.iter().flat_map(|p| p.dir).map(|d| dot(d, d).sqrt()).collect();
+    println!(
+        "shell: {} triangles; corners held to {} reaches, the least {:.3}, {} under 0.1; pushed up to {:.3} times the height",
+        tris.len(),
+        caps.len(),
+        caps.iter().copied().fold(f32::INFINITY, f32::min),
+        caps.iter().filter(|&&c| c < 0.1).count(),
+        mitres.iter().copied().fold(0.0, f32::max)
+    );
+    let taper = Step::default().shell_taper;
+    let up = 3;
+    let (sw, sh) = (w * up, h * up);
+    let (r, k) = (dr.height_cells(), r_k(dr));
+    let mut page_of: HashMap<Face, u32> = HashMap::new();
+    for p in 0..65536 {
+        if let Some(f) = dr.face_of_page(p) {
+            page_of.insert(f, p);
+        }
+    }
+    // A bump on each page, up or down by its own amount, nothing at its edges.
+    let amp = |p: u32| ((p.wrapping_mul(2654435761) >> 8) % 1000) as f32 / 1000.0 * 0.24 - 0.12;
+    let bump = move |p: u32, i: u32, j: u32| {
+        let (u, v) = ((2 * i) as f32 + 0.5, (2 * j) as f32 + 0.5);
+        amp(p) * (std::f32::consts::PI * u / k as f32).sin() * (std::f32::consts::PI * v / k as f32).sin()
+    };
+    let limit = 0.15;
+    let views = [
+        ("from a", look([1.2, 1.5, 0.8], 0.7, 0.15, focal)),
+        ("close to the pillar's corner", look([3.3, 1.2, 2.2], 0.9, 0.05, focal)),
+        ("glancing along a wall", look([0.3, 1.0, 0.4], 0.05, 0.1, focal)),
+    ];
+    // A bulge and a hollow across the pillar's corner (the edge x 4, z 3), by where each height
+    // cell's middle is in the level, so both walls give the same height at the edge.
+    let faces: Vec<Option<Face>> = (0..65536).map(|p| dr.face_of_page(p)).collect();
+    let across = move |p: u32, i: u32, j: u32| {
+        let Some(f) = faces[p as usize] else { return 0.0 };
+        let axis = (f[0] / 2) as usize;
+        let along = [[1, 2], [0, 2], [0, 1]][axis];
+        let mut x = [0.0f32; 3];
+        x[axis] = (f[1 + axis] + f[0] % 2) as f32;
+        for (q, c) in along.into_iter().zip([i, j]) {
+            x[q] = f[1 + q] as f32 + (c as f32 + 0.25) / r as f32;
+        }
+        let blob = |c: V3, a: f32| {
+            let d = sub(x, c);
+            a * (-dot(d, d) / (0.3f32 * 0.3)).exp()
+        };
+        blob([4.0, 1.2, 3.0], 0.12) + blob([4.0, 2.2, 3.0], -0.1)
+    };
+    // Smoothed (smooth.wgsl): two and a half levels, and two more by 4 / 0.6 tiles off.
+    let (smooth, far) = (2.5, 0.6);
+    for (what, case) in [("flat", 0), ("across the pillar's corner", 2), ("bumped", 1), ("bumped, smoothed", 3)] {
+        let field = |p: u32, i: u32, j: u32| match case {
+            0 => 0.0,
+            1 | 3 => bump(p, i, j),
+            _ => across(p, i, j),
+        };
+        let step = if case == 3 { Step { shell_smooth: smooth, shell_far: far, ..shell_step(limit) } } else { shell_step(limit) };
+        // Every face in sight given its page first, so the CPU knows them all (a page given a
+        // face later is clear on the GPU, where the CPU would leave it out).
+        for (_, v) in &views {
+            let mut enc = device.create_command_encoder(&Default::default());
+            dr.encode_view(&mut enc, input, w, Some(v), None, true, &step, output).expect("encode_view");
+            queue.submit([enc.finish()]);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        page_of = (0..65536).filter_map(|p| dr.face_of_page(p).map(|f| (f, p))).collect();
+        dr.fill_height_cells(field);
+        let smoothed = (case == 3).then(|| (cpu_smooth(&page_of, &field, r as usize, smooth), cpu_smooth(&page_of, &field, r as usize, smooth + 2.0)));
+        if let Some((near, far_off)) = &smoothed {
+            // The smoothing itself, against the CPU's, after a frame.
+            let mut enc = device.create_command_encoder(&Default::default());
+            dr.encode_view(&mut enc, input, w, Some(&views[0].1), None, true, &step, output).expect("encode_view");
+            queue.submit([enc.finish()]);
+            let mut worst = [0.0f32; 2];
+            let mut where_worst = None;
+            for (&p, want) in near {
+                let (gn, gf) = dr.read_shell_smoothed(p).expect("smoothed");
+                // (Near on the GPU has the far-off smoothing mixed in by the view: far alone.)
+                let _ = (&gn, want);
+                for (k, (g, c)) in [(1, (&gf, &far_off[&p]))] {
+                    for (i, (a, b)) in g.iter().zip(c.iter()).enumerate() {
+                        if (a - b).abs() > worst[k] {
+                            worst[k] = (a - b).abs();
+                            if k == 1 {
+                                where_worst = Some((p, i, *a, *b));
+                            }
+                        }
+                    }
+                }
+            }
+            println!("smoothed heights (two levels more, for far off) against the CPU's on {} pages: largest difference {:.2e} (at {:?})", near.len(), worst[1], where_worst.map(|(p, i, a, b)| (dr.face_of_page(p), i, a, b)));
+        }
+        for (view_name, v) in &views {
+            if case == 2 && !view_name.starts_with("close to the pillar") {
+                continue;
+            }
+            // As smooth.wgsl: the far-off smoothing mixed in by each cell's view depth (its
+            // middle, on an axis-aligned face's plane).
+            let height = |f: Face, c: [i32; 2]| {
+                page_of.get(&f).map(|&p| match &smoothed {
+                    Some((near, far_off)) => {
+                        let at = (c[1] * r as i32 + c[0]) as usize;
+                        let axis = (f[0] / 2) as usize;
+                        let along = [[1, 2], [0, 2], [0, 1]][axis];
+                        let mut x = [f[1] as f32, f[2] as f32, f[3] as f32];
+                        x[axis] += (f[0] % 2) as f32;
+                        for (q, i) in along.into_iter().zip(c) {
+                            x[q] += (i as f32 + 0.25) / r as f32;
+                        }
+                        let k = (far * dot(v.axes[2], sub(x, v.pos)) / 4.0).clamp(0.0, 1.0);
+                        let m = near[&p][at] * (1.0 - k) + far_off[&p][at] * k;
+                        (m, m)
+                    }
+                    None => {
+                        let v = field(p, c[0] as u32, c[1] as u32);
+                        (v, v)
+                    }
+                })
+            };
+            let mut enc = device.create_command_encoder(&Default::default());
+            dr.encode_view(&mut enc, input, w, Some(v), None, true, &step, output).expect("encode_view");
+            queue.submit([enc.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            // SHELL_TIME: the whole frame's time from this view on these heights, for comparing
+            // the march's speed on heights that stay put (the game's grow differently each run).
+            if std::env::var_os("SHELL_TIME").is_some() {
+                let mut times: Vec<f32> = (0..30)
+                    .map(|_| {
+                        let t0 = std::time::Instant::now();
+                        let mut enc = device.create_command_encoder(&Default::default());
+                        dr.encode_view(&mut enc, input, w, Some(v), None, true, &step, output).expect("encode_view");
+                        queue.submit([enc.finish()]);
+                        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+                        t0.elapsed().as_secs_f32() * 1000.0
+                    })
+                    .collect();
+                times.sort_by(f32::total_cmp);
+                println!("  frame from this view: median {:.2} ms, best {:.2}", times[15], times[0]);
+            }
+            let hits = dr.read_shell().expect("shell");
+            // The prisms reach just past the largest height on any page.
+            let reach = dr.shell_reach(&step).expect("reach");
+            let holes = hits.iter().filter(|s| s.tri == 0).count();
+            let mut rng = 7u64;
+            let mut examples = Vec::new();
+            let (mut same, mut both_none, mut same_point, mut differ) = (0, 0, 0, 0);
+            let mut worst = [0.0f32; 3];
+            const PIXELS: u32 = 400;
+            for _ in 0..PIXELS {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let (x, y) = ((rng >> 20) as u32 % sw, (rng >> 40) as u32 % sh);
+                let g = hits[(y * sw + x) as usize];
+                match cpu_march(tris, &pushes, &edges, &beyond, taper, v, up, sw, sh, x, y, reach, r as i32, 0.0, &height) {
+                    None if g.tri == 0 => both_none += 1,
+                    Some((t, ti, foot, hh)) if g.tri == ti as u32 + 1 => {
+                        same += 1;
+                        let df = (0..3).map(|q| (foot[q] - g.foot[q]).abs()).fold(0.0, f32::max);
+                        worst[0] = worst[0].max(df);
+                        worst[1] = worst[1].max((g.depth - t).abs() / t);
+                        if (g.height - hh).abs() > worst[2] && (g.height - hh).abs() > 0.01 {
+                            examples.push(format!("    height at ({x}, {y}): the GPU's {:.4} (depth {:.4}, foot {:?}), the CPU's {hh:.4} (depth {t:.4}, foot {foot:?})", g.height, g.depth, g.foot));
+                        }
+                        worst[2] = worst[2].max((g.height - hh).abs());
+                    }
+                    Some((t, _, foot, _)) if g.tri != 0 && (g.depth - t).abs() / t < 2e-3 && (0..3).all(|q| (foot[q] - g.foot[q]).abs() < 2e-3) => same_point += 1,
+                    c => {
+                        differ += 1;
+                        if differ <= 3 {
+                            examples.push(format!("    at ({x}, {y}): the GPU's triangle {} at depth {:.4} foot {:?} h {:.4}, the CPU's {:?}", g.tri, g.depth, g.foot, g.height, c.map(|c| (c.1 + 1, c.0, c.2, c.3))));
+                        }
+                    }
+                }
+            }
+            println!("shell, {what}, {view_name}: reaching {reach:.3}, {holes} of {} shown pixels meet nothing", hits.len());
+            if case == 2 {
+                // Neighbouring pixels either side of the corner (on the pillar's two walls, near
+                // the edge): how far apart their hits are, against a height cell.
+                let f = v.focal * up as f32;
+                let hit_at = |x: u32, y: u32| {
+                    let g = hits[(y * sw + x) as usize];
+                    let dv = [(x as f32 + 0.5 - sw as f32 / 2.0) / f, (y as f32 + 0.5 - sh as f32 / 2.0) / f, 1.0];
+                    let p: V3 = std::array::from_fn(|k| v.pos[k] + (v.axes[0][k] * dv[0] + v.axes[1][k] * dv[1] + v.axes[2][k] * dv[2]) * g.depth);
+                    (g.tri, p)
+                };
+                let normal_of = |t: u32| {
+                    let c = tris[t as usize - 1];
+                    unit(cross(sub([c[3], c[4], c[5]], [c[0], c[1], c[2]]), sub([c[6], c[7], c[8]], [c[0], c[1], c[2]])))
+                };
+                let (mut pairs, mut over, mut widest) = (0, 0, 0.0f32);
+                for y in 0..sh - 1 {
+                    for x in 0..sw - 1 {
+                        let (ta, pa) = hit_at(x, y);
+                        for (tb, pb) in [hit_at(x + 1, y), hit_at(x, y + 1)] {
+                            if ta == 0 || tb == 0 || ta == tb || dot(normal_of(ta), normal_of(tb)) > 0.99 {
+                                continue;
+                            }
+                            let near = |p: V3| ((p[0] - 4.0).powi(2) + (p[2] - 3.0).powi(2)).sqrt() < 0.4 && p[0] > 3.6 && p[2] > 2.6;
+                            if !near(pa) || !near(pb) {
+                                continue;
+                            }
+                            let gap = sub(pa, pb);
+                            let gap = dot(gap, gap).sqrt();
+                            pairs += 1;
+                            widest = widest.max(gap);
+                            if gap > 1.0 / r as f32 {
+                                over += 1;
+                            }
+                        }
+                    }
+                }
+                println!("  either side of the corner: {pairs} neighbouring pixels' hits on its two walls, {over} further apart than a height cell ({:.4}), the furthest {widest:.4}", 1.0 / r as f32);
+            }
+            println!("  against the CPU's march at {PIXELS} pixels: {same} on the same triangle, {same_point} the same point on another (two meeting), {both_none} nothing for both, {differ} differ");
+            println!("  largest differences on the same triangle: foot {:.2e} tiles, depth {:.3}%, height {:.2e} tiles", worst[0], 100.0 * worst[1], worst[2]);
+            for e in examples {
+                println!("{e}");
+            }
+        }
+    }
+    // At the height 0 the shell's frame is the flat one: the wall's colour now taken at each
+    // shown pixel's own point (the texture sampled there, not at its base pixel's), so it
+    // differs along the texels' edges, a pixel at most.
+    dr.fill_heights(|_| 0.0);
+    for (view_name, v) in &views {
+        let mut shown = Vec::new();
+        for shell in [0.0, 1.0] {
+            let mut enc = device.create_command_encoder(&Default::default());
+            dr.encode_view(&mut enc, input, w, Some(v), None, true, &Step { shell, ..shell_step(limit) }, output).expect("encode_view");
+            queue.submit([enc.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            shown.push(dr.read_shown().expect("shown"));
+        }
+        let channel = |c: u32, k: u32| ((c >> (8 * k)) & 255) as i32;
+        let diffs: Vec<i32> = shown[0].iter().zip(&shown[1]).map(|(&a, &b)| (0..3).map(|k| (channel(a, k) - channel(b, k)).abs()).max().unwrap()).collect();
+        let mean = diffs.iter().map(|&d| d as f64).sum::<f64>() / diffs.len() as f64;
+        let near = diffs.iter().filter(|&&d| d <= 4).count();
+        // Off by more only where a neighbour 3 pixels away (a base pixel) is the same as the other.
+        let (sw, sh) = (w * 3, h * 3);
+        let edge = (0..diffs.len())
+            .filter(|&i| diffs[i] > 4)
+            .filter(|&i| {
+                let (x, y) = ((i as u32 % sw) as i32, (i as u32 / sw) as i32);
+                (-3..=3).flat_map(|dy| (-3..=3).map(move |dx| (dx, dy))).any(|(dx, dy)| {
+                    let (qx, qy) = (x + dx, y + dy);
+                    qx >= 0 && qy >= 0 && qx < sw as i32 && qy < sh as i32 && {
+                        let j = (qy as u32 * sw + qx as u32) as usize;
+                        (0..3).all(|k| (channel(shown[0][j], k) - channel(shown[1][i], k)).abs() <= 4)
+                    }
+                })
+            })
+            .count();
+        println!("shown, height 0, {view_name}: with the shell against without, mean difference {mean:.2} of 255; {near} of {} pixels within 4, {edge} more within a base pixel's reach", diffs.len());
+        if view_name.starts_with("from a") {
+            let mut ppm = format!("P6 {sw} {} 255\n", 2 * sh).into_bytes();
+            for frame in &shown {
+                ppm.extend(frame.iter().flat_map(|&c| [c as u8, (c >> 8) as u8, (c >> 16) as u8]));
+            }
+            let _ = std::fs::write(std::env::temp_dir().join("dream_shell_flat.ppm"), ppm);
+        }
+    }
+}
+
+/// smooth.wgsl's smoothing on the CPU, of the heights `field` (page, cell i, j) on the pages of
+/// `page_of`, `r` cells a side: each page's mips, then each cell from level `l` (fractions
+/// mixing two) by a cubic B-spline across its tile's edges into the neighbouring tiles' pages.
+fn cpu_smooth(page_of: &HashMap<Face, u32>, field: &dyn Fn(u32, u32, u32) -> f32, r: usize, l: f32) -> HashMap<u32, Vec<f32>> {
+    let top = (1..).take_while(|&k| r >> k >= 2).last().unwrap_or(0);
+    let mips: HashMap<u32, Vec<Vec<f32>>> = page_of
+        .values()
+        .map(|&p| {
+            let mut levels = vec![(0..r * r).map(|c| field(p, (c % r) as u32, (c / r) as u32)).collect::<Vec<f32>>()];
+            for k in 1..=top {
+                let (n, prev) = (r >> k, &levels[k - 1]);
+                let pn = 2 * n;
+                let next = (0..n * n)
+                    .map(|c| {
+                        let o = 2 * (c / n) * pn + 2 * (c % n);
+                        0.25 * (prev[o] + prev[o + 1] + prev[o + pn] + prev[o + pn + 1])
+                    })
+                    .collect();
+                levels.push(next);
+            }
+            (p, levels)
+        })
+        .collect();
+    let bspline = |t: f32| {
+        let (t2, s) = (t * t, 1.0 - t);
+        [s * s * s, 3.0 * t2 * t - 6.0 * t2 + 4.0, -3.0 * t2 * t + 3.0 * t2 + 3.0 * t + 1.0, t2 * t].map(|w| w / 6.0)
+    };
+    let mut out = HashMap::new();
+    for (&f, &p) in page_of {
+        let axes: [[i32; 3]; 2] = match f[0] / 2 {
+            0 => [[0, 1, 0], [0, 0, 1]],
+            1 => [[1, 0, 0], [0, 0, 1]],
+            _ => [[1, 0, 0], [0, 1, 0]],
+        };
+        let around: [Option<u32>; 9] = std::array::from_fn(|k| {
+            let (dx, dy) = (k as i32 % 3 - 1, k as i32 / 3 - 1);
+            page_of.get(&[f[0], f[1] + axes[0][0] * dx + axes[1][0] * dy, f[2] + axes[0][1] * dx + axes[1][1] * dy, f[3] + axes[0][2] * dx + axes[1][2] * dy]).copied()
+        });
+        let at_level = |k: usize, i: i32, j: i32| -> f32 {
+            if k == 0 {
+                return mips[&p][0][j as usize * r + i as usize];
+            }
+            let (n, s) = ((r >> k) as i32, (1 << k) as f32);
+            let g = [(i as f32 + 0.5) / s - 0.5, (j as f32 + 0.5) / s - 0.5];
+            let (wx, wy) = (bspline(g[0] - g[0].floor()), bspline(g[1] - g[1].floor()));
+            let g0 = g.map(|x| x.floor() as i32);
+            let tap = |qx: i32, qy: i32| {
+                let side = |q: i32| if q < 0 { -1 } else if q >= n { 1 } else { 0 };
+                let (dx, dy) = (side(qx), side(qy));
+                match around[((dy + 1) * 3 + dx + 1) as usize] {
+                    Some(q) => mips[&q][k][((qy - dy * n) * n + qx - dx * n) as usize],
+                    None => mips[&p][k][(qy.clamp(0, n - 1) * n + qx.clamp(0, n - 1)) as usize],
+                }
+            };
+            (0..4).map(|b| wy[b] * (0..4).map(|a| wx[a] * tap(g0[0] - 1 + a as i32, g0[1] - 1 + b as i32)).sum::<f32>()).sum()
+        };
+        let lc = l.clamp(0.0, top as f32);
+        let (l0, fr) = (lc.floor() as usize, lc - lc.floor());
+        let v = (0..r * r)
+            .map(|c| {
+                let (i, j) = ((c % r) as i32, (c / r) as i32);
+                let a = at_level(l0, i, j);
+                if fr <= 0.0 { a } else { a * (1.0 - fr) + at_level(l0 + 1, i, j) * fr }
+            })
+            .collect();
+        out.insert(p, v);
+    }
+    out
+}
+
+/// The pages' texels a side (as the renderer was configured).
+fn r_k(dr: &DreamRenderer) -> u32 {
+    dr.height_cells() * 2
 }

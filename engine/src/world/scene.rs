@@ -769,6 +769,17 @@ impl Scene {
         cur
     }
 
+    /// The lights `shade` bakes, as they are now (their colours turned as lurid as the
+    /// strangeness where each is; the ambient and sun as at `at`), positions in world units:
+    /// the ambient, the sun's direction (as it travels) and colour, and each point light's
+    /// position, colour and radius.
+    pub fn lights_now(&self, at: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3], Vec<([f32; 3], [f32; 3], f32)>) {
+        let mix = |a: [f32; 3], b: [f32; 3], w: f32| [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * w);
+        let w = ramp(self.strange.lurid, self.strange.at(at));
+        let lights = self.lights.iter().map(|l| (l.pos, mix(l.col, l.weird, ramp(self.strange.lurid, self.strange.at(l.pos))), l.radius)).collect();
+        (mix(self.ambient, self.strange.ambient, w), self.sun_dir, mix(self.sun_col, self.strange.sun, w), lights)
+    }
+
     /// Baked vertex colour: ambient + sun + point lights, times tint, with a
     /// small per-position wobble so shared vertices stay consistent.
     pub(crate) fn shade(&self, p: [i32; 3], n: [f32; 3], tint: [f32; 3]) -> [u8; 3] {

@@ -20,14 +20,27 @@
 //!     another texture's place).
 //!     `--dream-atlas runs/dream/googlenet.safetensors`: in place of the level network, DeepDream
 //!     grows on the dungeon's walls over the PS1 picture (dream_atlas.rs; train/export_googlenet.py
-//!     makes the weights); `--dream-layers 4c` and `--dream-fine-layers 3b,4d` pick what each
-//!     octave dreams with, `--dream-colour 0.25` how much colour it may change (0: light and
+//!     makes the weights; several, by commas, to switch between in the panel: train/export_resnet.py
+//!     makes the robust ResNet-50's, `runs/dream/robust_resnet50.safetensors`, `--dream-net 1`
+//!     to start with the second); `--dream-layers 4c` and `--dream-fine-layers 3b,4d` pick what each
+//!     octave dreams with (each network's by semicolons: `4c;layer2,layer3`; ResNet's are
+//!     `layer1`..`layer4` or a block of one, `layer3.2`; by default `4c` and `layer3`), `--dream-colour 0.25` how much colour it may change (0: light and
 //!     shade only), `--dream-relief 0.1` how far (in tiles) the dream stands off the walls where
 //!     it has taken them over (0: flat), `--dream-mode reproject` where it grows: `walls`
 //!     always on the walls, `still` (the default) on the screen while the view rests and laid
 //!     on the walls as it moves, `reproject` always on the screen, carried along as the view
 //!     moves (`--dream-remember 4`: put on the walls over 4 frames as it goes, so what comes
-//!     back into sight is as it was; 0 forgets). Its knobs are in the panel (h).
+//!     back into sight is as it was; 0 forgets); `--dream-scale 0.5` and `--dream-fine-scale 2`
+//!     how big the things it dreams are (the picture shrunk to that before the network sees it, at
+//!     each octave: smaller dreams bigger; 1 and 3 by default), `--dream-step 0.012,0.008` how
+//!     much colour each octave adds a step; and while carried along it sculpts as well as
+//!     paints (`--dream-height 0.0005`: how far, in tiles, it raises or sinks the surface a step,
+//!     0 for flat; the network sees the height under a dream lamp moved every step, and the
+//!     frame is shaded by it as the torch lights it; `--dream-show-height` shows the height
+//!     alone, so lit, in grey). The level under the dream is drawn by the dream renderer itself,
+//!     bulging with the height (`--dream-picture ps1` takes the PS1 picture's colours instead;
+//!     `--dream-still-life` doesn't dream, to compare them; `--dream-eye-light` lights the height
+//!     from the eye, not from the torch in hand and the level's lights). Its knobs are in the panel (h).
 //!     `--view raster` (or `both`) starts on the rasteriser instead of the network.
 //!     `--strangeness 0.7` sets how strange each level is (otherwise random).
 //!     `--affliction 0.7` starts the player that afflicted, to try how it looks.
@@ -1095,6 +1108,11 @@ fn main() {
     };
     let (mcp, headless, software) = (flag("--mcp"), flag("--headless"), flag("--software"));
     let peaceful = flag("--peaceful");
+    let show_height = flag("--dream-show-height");
+    let still_life = flag("--dream-still-life");
+    let eye_light = flag("--dream-eye-light");
+    let show_shell = flag("--dream-show-shell");
+    let uncentred = flag("--dream-height-uncentred");
     if mcp && !cfg!(feature = "dev-mcp") {
         eprintln!("--mcp needs a developer build: cargo run -p game --features dev-mcp -- --mcp");
         std::process::exit(2);
@@ -1306,10 +1324,17 @@ fn main() {
         app.insert_non_send(layer);
     }
     if let Some(weights) = opts.get("dream-atlas") {
-        let list = |k: &str| opts.get(k).map_or(Vec::new(), |v| v.split(',').map(str::to_string).collect::<Vec<_>>());
+        // A network's layers by commas, the networks' by semicolons.
+        let list = |k: &str| {
+            opts.get(k).map_or(Vec::new(), |v| v.split(';').map(|n| n.split(',').filter(|l| !l.is_empty()).map(str::to_string).collect::<Vec<_>>()).collect::<Vec<_>>())
+        };
+        let weights: Vec<PathBuf> = weights.split(',').map(PathBuf::from).collect();
         let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let mut atlas = dream_atlas::DreamAtlas::new(Path::new(weights), &list("dream-layers"), &list("dream-fine-layers"), &mut images)
+        let mut atlas = dream_atlas::DreamAtlas::new(&weights, &list("dream-layers"), &list("dream-fine-layers"), &mut images)
             .unwrap_or_else(|e| panic!("the dream atlas: {e}"));
+        if let Some(n) = opts.get("dream-net") {
+            atlas.switch_net(n.parse().expect("--dream-net 1 (which of --dream-atlas's networks, from 0)"));
+        }
         if let Some(c) = opts.get("dream-colour") {
             atlas.step.colour = c.parse().expect("--dream-colour 0..1");
         }
@@ -1322,6 +1347,65 @@ fn main() {
         if let Some(r) = opts.get("dream-relief") {
             atlas.step.relief = r.parse().expect("--dream-relief 0.1 (tiles)");
         }
+        if let Some(r) = opts.get("dream-step") {
+            let v: Vec<f32> = r.split(',').map(|v| v.parse().expect("--dream-step 0.012,0.008 (colour a step, coarse and fine)")).collect();
+            atlas.step.lr = v[0];
+            atlas.step.lr_fine = *v.get(1).unwrap_or(&v[0]);
+        }
+        if let Some(r) = opts.get("dream-grad-blur") {
+            atlas.step.grad_blur = r.parse().expect("--dream-grad-blur 1.5 (net pixels)");
+        }
+        if let Some(r) = opts.get("dream-scale") {
+            atlas.step.scale = r.parse().expect("--dream-scale 0.5 (0.25..1.5: smaller dreams bigger)");
+        }
+        if let Some(r) = opts.get("dream-fine-scale") {
+            atlas.step.fine_scale = r.parse().expect("--dream-fine-scale 2 (1..3: smaller dreams bigger)");
+        }
+        if let Some(r) = opts.get("dream-height-spread") {
+            atlas.step.height_spread = r.parse().expect("--dream-height-spread 4 (sizes the height's step is blurred at)");
+        }
+        if let Some(r) = opts.get("dream-height-power") {
+            atlas.step.height_power = r.parse().expect("--dream-height-power 1 (how much more the bigger sizes weigh)");
+        }
+        if let Some(r) = opts.get("dream-height-colour") {
+            atlas.step.height_from_colour = r.parse().expect("--dream-height-colour 0.5 (-1..1: the height rises where the dream brightens)");
+        }
+        if let Some(r) = opts.get("dream-height-max") {
+            atlas.step.height_max = r.parse().expect("--dream-height-max 0.6 (tiles)");
+        }
+        atlas.step.lights = !eye_light;
+        if let Some(r) = opts.get("dream-wrap") {
+            atlas.step.show_wrap = r.parse().expect("--dream-wrap 0.5 (0: hard Lambert, 1: soft, matte)");
+        }
+        if let Some(r) = opts.get("dream-shell") {
+            atlas.step.shell = r.parse().expect("--dream-shell 1 (the relief marched in shells; 0: none)");
+        }
+        if let Some(r) = opts.get("dream-shell-smooth") {
+            atlas.step.shell_smooth = r.parse().expect("--dream-shell-smooth 3 (the relief smoothed, levels each twice the last's size; 0: none)");
+        }
+        if let Some(r) = opts.get("dream-shell-far") {
+            atlas.step.shell_far = r.parse().expect("--dream-shell-far 0.5 (smoothed two levels more by 4 / this tiles off; 0: none)");
+        }
+        atlas.step.show_shell = show_shell;
+        atlas.step.height_centred = !uncentred;
+        if let Some(r) = opts.get("dream-displace") {
+            atlas.step.displace = r.parse().expect("--dream-displace 1 (the walls pushed out by the height, subdivided; 0: flat)");
+        }
+        if let Some(r) = opts.get("dream-height-decay") {
+            atlas.step.height_decay = r.parse().expect("--dream-height-decay 0.01 (share let go a step)");
+        }
+        if let Some(r) = opts.get("dream-height") {
+            atlas.step.height = r.parse().expect("--dream-height 0.0005 (tiles a step)");
+        }
+        atlas.step.show_height = show_height;
+        if let Some(p) = opts.get("dream-picture") {
+            atlas.step.own_picture = match p.as_str() {
+                "own" => true,
+                "ps1" => false,
+                _ => panic!("--dream-picture own or ps1"),
+            };
+        }
+        atlas.dreaming = !still_life;
         dream_atlas::setup(&mut app, &atlas);
         app.insert_non_send(atlas);
     }

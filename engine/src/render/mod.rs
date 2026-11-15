@@ -211,6 +211,12 @@ impl LevelTextures {
         LevelTextures { base: tex::make_all(), drawn: tex::make_drawn(), materials: HashMap::new() }
     }
 
+    /// Texture `id` as 64x64 RGBA8 (sRGB-encoded), from the drawn textures for the waking
+    /// world (`plain`).
+    pub fn rgba(&self, id: u8, plain: bool) -> Option<Vec<u8>> {
+        tex::level_texture(if plain { &self.drawn } else { &self.base }, id).map(|t| t.rgba())
+    }
+
     /// Texture `id`'s material, from the drawn textures for the waking world (`plain`).
     fn material(&mut self, id: u8, plain: bool, images: &mut Assets<Image>, materials: &mut Assets<PsxMaterial>) -> Option<Handle<PsxMaterial>> {
         if let Some(m) = self.materials.get(&(id, plain)) {
