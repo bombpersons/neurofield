@@ -237,6 +237,11 @@ pub(crate) struct Shell {
     /// The smoothed heights again, HEIGHTS_ROW pages a row (smooth_faces writes them as it
     /// writes `near`), so the march fetches a sample's four cells at once (textureGather).
     heights: wgpu::TextureView,
+    /// The march's hits (triangle + 1, two barycentrics, view depth), the nearest kept by the
+    /// depth test, and `resolve` (resolve.wgsl) finishing them into `tris` and `looks`.
+    marched: wgpu::TextureView,
+    marched_bind: wgpu::BindGroup,
+    resolve: wgpu::RenderPipeline,
     gather: wgpu::Sampler,
     smooth0_layout: wgpu::BindGroupLayout,
     /// The largest |height| smoothed this frame (f32 bits), which sets the reach while
@@ -297,7 +302,7 @@ impl Shell {
             "{}\n@group(1) @binding(0) var<storage, read> toward: array<f32>;\n@group(1) @binding(1) var<storage, read> near: array<f32>;\n@group(1) @binding(3) var inner: texture_depth_2d;\n@group(1) @binding(4) var<storage, read> homes: array<vec4<i32>>;\n{}",
             include_str!("shell.wgsl"),
             FOUR_CELLS
-        );
+        ) + include_str!("resolve.wgsl");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shell.wgsl"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let crease_source = format!("{}\n{}", include_str!("shell.wgsl"), include_str!("crease.wgsl"));
         let crease_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("crease.wgsl"), source: wgpu::ShaderSource::Wgsl(crease_source.into()) });
@@ -418,6 +423,27 @@ impl Shell {
                 module: &module,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba32Uint, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let marched_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dream shell marched"),
+            entries: &[entry(0, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false })],
+        });
+        let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("dream shell resolve"), bind_group_layouts: &[Some(&layout), Some(&toward_layout), Some(&marched_layout)], immediate_size: 0 });
+        let resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("dream shell resolve"),
+            layout: Some(&resolve_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("resolve"),
+                compilation_options: Default::default(),
                 targets: &[
                     Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba32Uint, blend: None, write_mask: wgpu::ColorWrites::ALL }),
                     Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba32Uint, blend: None, write_mask: wgpu::ColorWrites::ALL }),
@@ -442,6 +468,12 @@ impl Shell {
         let tris = texture("dream shell triangles", wgpu::TextureFormat::Rgba32Uint, copied);
         let looks = texture("dream shell looks", wgpu::TextureFormat::Rgba32Uint, copied);
         let depth = texture("dream shell depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let marched = texture("dream shell marched", wgpu::TextureFormat::Rgba32Uint, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let marched_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dream shell marched"),
+            layout: &marched_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&marched) }],
+        });
         let inner = texture("dream shell inner depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
         let caps_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("dream shell inner caps"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let caps = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -485,7 +517,7 @@ impl Shell {
         })
         .create_view(&Default::default());
         let gather = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("dream shell heights"), ..Default::default() });
-        Shell { pipeline, layout, inner, caps, homes, bind: None, creases, toward_layout, crease_layout, toward: None, mip_pages, smooth_faces, smooth_layout, smooth0_layout, smooth_bound, mips, near, far, smoothing: None, pages, uniform, tris, looks, depth, vertices: None, bound: None, textures: None, sampler, heights, gather }
+        Shell { pipeline, layout, inner, caps, homes, bind: None, creases, toward_layout, crease_layout, toward: None, mip_pages, smooth_faces, smooth_layout, smooth0_layout, smooth_bound, mips, near, far, smoothing: None, pages, uniform, tris, looks, depth, vertices: None, bound: None, textures: None, sampler, heights, gather, resolve, marched, marched_bind }
     }
 
     /// The tetrahedra of the level's triangles' prisms (`tris`, as `level` was built from), the
@@ -737,7 +769,7 @@ impl Shell {
         };
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("dream shell"),
-            color_attachments: &[target(&tris), target(&looks)],
+            color_attachments: &[target(&self.marched)],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &depth,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
@@ -756,6 +788,22 @@ impl Shell {
         pass.draw(0..*n, 0..1);
         drop(pass);
         stamp(enc, "shell march");
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("dream shell resolve"),
+            color_attachments: &[target(&tris), target(&looks)],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+        pass.set_pipeline(&self.resolve);
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_bind_group(1, toward, &[]);
+        pass.set_bind_group(2, &self.marched_bind, &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        stamp(enc, "shell resolve");
     }
 }
 

@@ -404,12 +404,18 @@ struct Hit {
     // light, the torch's albedo (each RGBA8, halved) and the texture at the foot, as
     // raster.wgsl's.
     @location(1) look: vec4<u32>,
+}
+
+// What the march found at a pixel, for resolve.wgsl to finish once the nearest is known:
+// triangle + 1 (0 for none), the hit's barycentrics 1 and 2 and its view depth (bits).
+struct Marched {
+    @location(0) found: vec4<u32>,
     @builtin(frag_depth) depth: f32,
 }
 
-@fragment
-fn fs(in: Out) -> Hit {
-    let ta = in.tri * TRI;
+// The triangle's state the march and its finishing both work from.
+fn begin(tri: u32) {
+    let ta = tri * TRI;
     let a = corners[ta];
     let b = corners[ta + 1u];
     let c = corners[ta + 2u];
@@ -423,7 +429,7 @@ fn fs(in: Out) -> Hit {
     orient = own.orient;
     own_cell = vec3<i32>(-2147483647);
     other_cell = own_cell;
-    let home = homes[in.tri];
+    let home = homes[tri];
     home_cell = home.xyz;
     home_page = bitcast<f32>(home.w);
     let lim = reach();
@@ -436,6 +442,13 @@ fn fs(in: Out) -> Hit {
     }
     mapping();
     tri_at = ta;
+}
+
+@fragment
+fn fs(in: Out) -> Marched {
+    begin(in.tri);
+    let ta = in.tri * TRI;
+    let info = corners[ta + 3u];
     // The tetrahedron's corners.
     let order = bitcast<u32>(info.x);
     let tet = TETS[in.tet];
@@ -525,6 +538,18 @@ fn fs(in: Out) -> Hit {
             }
         }
     }
+    var out: Marched;
+    out.found = vec4<u32>(in.tri + 1u, bitcast<u32>(w.y), bitcast<u32>(w.z), bitcast<u32>(t1));
+    out.depth = NEAR / t1;
+    return out;
+}
+
+// The march's hit on triangle `tri` (begun) at barycentrics w and view depth t1, finished: the
+// height's slope there, its page, and what the raster would have at the foot.
+fn finish(tri: u32, w: vec4<f32>, t1: f32) -> Hit {
+    let ta = tri * TRI;
+    let info = corners[ta + 3u];
+    let cells = f32(u.o.w / HEIGHT_CELL);
     let foot = foot_of(w.xyz);
     let held = dot(w.xyz, reaches);
     // The height's slope along the page (tiles a tile), a height cell either side along the
@@ -552,7 +577,6 @@ fn fs(in: Out) -> Hit {
     var out: Hit;
     let place = pick(foot - floor(foot), axis);
     out.look = vec4<u32>(pack2x16unorm(place), pack4x8unorm(vec4<f32>(0.5 * light, 1.0)), pack4x8unorm(vec4<f32>(0.5 * albedo, 1.0)), pack4x8unorm(vec4<f32>(texel, 1.0)));
-    out.tri = vec4<u32>(in.tri + 1u, pack2x16float(slope), bitcast<u32>(t1), select(NONE, u32(page), page >= 0.0) & PAGE_BITS);
-    out.depth = NEAR / t1;
+    out.tri = vec4<u32>(tri + 1u, pack2x16float(slope), bitcast<u32>(t1), select(NONE, u32(page), page >= 0.0) & PAGE_BITS);
     return out;
 }
