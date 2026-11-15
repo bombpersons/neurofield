@@ -70,6 +70,15 @@ fn main() {
     compare(&format!("gradient {}", one.join(" + ")), &g, &f[&format!("grad_{}", one.join("+"))].1);
     let (g, _) = dr.input_gradient(rgb, h, w, two, &[]).expect("gradient");
     compare(&format!("gradient {}", two.join(" + ")), &g, &f[&format!("grad_{}", two.join("+"))].1);
+    // A class's logit's (ResNet's fixture: its classifier's).
+    for (name, (_, want)) in f.iter().filter(|(k, _)| k.starts_with("grad_class_")) {
+        let class = name["grad_class_".len()..].parse().expect("class");
+        let (g, sure) = dr.class_gradient(rgb, h, w, class).expect("class gradient");
+        compare(&format!("gradient of class {class}'s logit"), &g, want);
+        if let Some((_, p)) = f.get(&format!("p_class_{class}")) {
+            println!("how sure of class {class}: {sure:.6}, PyTorch's {:.6}", p[0]);
+        }
+    }
 
     // A frame of dreaming on the fixture's picture, every pixel on one of a grid of pages.
     let picture: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [(p[0] * 255.0) as u8, (p[1] * 255.0) as u8, (p[2] * 255.0) as u8, 255]).collect();

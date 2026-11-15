@@ -4,7 +4,7 @@ members = ["psx-bevy", "engine", "training-data-gen", "game", "editor", "dream-r
 # The psx submodule is a workspace of its own.
 exclude = ["external"]
 
-# psx-bevy (the psx template's crate, see docs/template.md) inherits these.
+# psx-bevy (ours, forked from the psx template at 0.3.8) inherits these.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

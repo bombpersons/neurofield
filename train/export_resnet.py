@@ -24,6 +24,7 @@ from safetensors.torch import load_file, save_file
 ROBUST = Path.home() / ".cache/neurofield/robust_resnet50_l2_eps3.safetensors"
 MEAN = torch.tensor([0.485, 0.456, 0.406])
 STD = torch.tensor([0.229, 0.224, 0.225])
+CLASS = 799
 
 
 def fold(conv, bn):
@@ -45,6 +46,9 @@ def weights(net):
             put(f"{n}.conv3", blk.conv3, blk.bn3)
             if blk.downsample is not None:
                 put(f"{n}.downsample", blk.downsample[0], blk.downsample[1])
+    # The classifier, for dreaming towards a class: its logit's gradient at layer4's last block
+    # is its row of fc, over the pixels (the mean pooling).
+    out["fc.weight"], out["fc.bias"] = net.fc.weight.detach().contiguous(), net.fc.bias.detach().contiguous()
     return out
 
 
@@ -77,6 +81,9 @@ def main():
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     save_file(weights(net), a.out)
     print("wrote", a.out)
+    names = Path(a.out).with_name("imagenet_classes.txt")
+    names.write_text("\n".join(torchvision.models.ResNet50_Weights.IMAGENET1K_V1.meta["categories"]) + "\n")
+    print("wrote", names)
     if not a.fixture:
         return
     img = np.asarray(Image.open(a.frame).convert("RGB"), np.float32) / 255
@@ -91,6 +98,13 @@ def main():
         if spec == ["layer3.5"]:
             for n in ("conv1", "maxpool", "layer1.0", "layer2.0", "layer3.5"):
                 out["act_" + n] = hwc(acts[n].detach())
+    # A class's logit (CLASS, the sliding door): through layer4 and its mean pooling.
+    rgb = torch.tensor(img).permute(2, 0, 1)[None].requires_grad_(True)
+    x = net.layer4(run(net, rgb, "layer3.5")["layer3.5"])
+    z = net.fc(torch.flatten(net.avgpool(x), 1))[0]
+    z[CLASS].backward()
+    out[f"grad_class_{CLASS}"] = hwc(rgb.grad)
+    out[f"p_class_{CLASS}"] = z.softmax(0)[CLASS].detach().reshape(1)
     save_file(out, a.fixture)
     print("wrote", a.fixture, {k: tuple(v.shape) for k, v in out.items()})
 

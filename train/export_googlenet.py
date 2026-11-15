@@ -1,8 +1,10 @@
 """GoogLeNet (torchvision IMAGENET1K_V1) for the dream renderer (dream-renderer/), up to
-inception4e, with each BasicConv2d's BatchNorm folded into its convolution:
+inception5b, with each BasicConv2d's BatchNorm folded into its convolution, and its classifier:
 
     {name}.weight [cout, cin, k, k], {name}.bias [cout]
-    names: conv1, conv2, conv3, inception{3a..4e}.branch{1, 2.0, 2.1, 3.0, 3.1, 4.1}
+    names: conv1, conv2, conv3, inception{3a..5b}.branch{1, 2.0, 2.1, 3.0, 3.1, 4.1}
+    fc.weight [1000, 1024], fc.bias [1000]: for dreaming towards a class (and
+    imagenet_classes.txt beside the weights, the classes' names)
 
     python train/export_googlenet.py --out runs/dream/googlenet.safetensors [--fixture FILE]
 
@@ -21,7 +23,9 @@ import torchvision
 from PIL import Image
 from safetensors.torch import save_file
 
-BLOCKS = ["inception3a", "inception3b", "inception4a", "inception4b", "inception4c", "inception4d", "inception4e"]
+BLOCKS = ["inception3a", "inception3b", "inception4a", "inception4b", "inception4c", "inception4d", "inception4e",
+          "inception5a", "inception5b"]
+CLASS = 799
 
 
 def fold(conv_bn):
@@ -45,11 +49,15 @@ def weights(net):
         put(f"{b}.branch3.0", blk.branch3[0])
         put(f"{b}.branch3.1", blk.branch3[1])
         put(f"{b}.branch4.1", blk.branch4[1])
+    # The classifier: its logit's gradient at inception5b is its row of fc, over the pixels (the
+    # mean pooling; the dropout before it is off when dreaming).
+    out["fc.weight"], out["fc.bias"] = net.fc.weight.detach().contiguous(), net.fc.bias.detach().contiguous()
     return out
 
 
 ORDER = ["conv1", "maxpool1", "conv2", "conv3", "maxpool2", "inception3a", "inception3b", "maxpool3",
-         "inception4a", "inception4b", "inception4c", "inception4d", "inception4e"]
+         "inception4a", "inception4b", "inception4c", "inception4d", "inception4e", "maxpool4",
+         "inception5a", "inception5b"]
 
 
 def run(net, rgb, layers):
@@ -73,6 +81,9 @@ def main():
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     save_file(weights(net), a.out)
     print("wrote", a.out)
+    names = Path(a.out).with_name("imagenet_classes.txt")
+    names.write_text("\n".join(torchvision.models.GoogLeNet_Weights.IMAGENET1K_V1.meta["categories"]) + "\n")
+    print("wrote", names)
     if not a.fixture:
         return
     img = np.asarray(Image.open(a.frame).convert("RGB"), np.float32) / 255
@@ -87,6 +98,13 @@ def main():
         if spec == ["inception4c"]:
             for n in ("conv1", "maxpool1", "conv3", "maxpool2", "inception3a", "inception4c"):
                 out["act_" + n] = hwc(acts[n].detach())
+    # A class's logit (CLASS, the sliding door): through inception5b and its mean pooling.
+    rgb = torch.tensor(img).permute(2, 0, 1)[None].requires_grad_(True)
+    x = run(net, rgb, ["inception5b"])["inception5b"]
+    z = net.fc(torch.flatten(net.avgpool(x), 1))[0]
+    z[CLASS].backward()
+    out[f"grad_class_{CLASS}"] = hwc(rgb.grad)
+    out[f"p_class_{CLASS}"] = z.softmax(0)[CLASS].detach().reshape(1)
     save_file(out, a.fixture)
     print("wrote", a.fixture, {k: tuple(v.shape) for k, v in out.items()})
 

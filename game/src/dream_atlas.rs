@@ -30,6 +30,11 @@ use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::renderer::{PendingCommandBuffers, RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
+use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d};
+use bevy::core_pipeline::{Core3d, Core3dSystems};
+use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
+use bevy::render::renderer::{RenderContext, ViewQuery};
+use bevy::render::view::{ViewDepthStencilTexture, ViewTarget};
 use bevy::render::RenderApp;
 use bevy_egui::{egui, EguiContexts};
 use dream_renderer::{Config, DreamRenderer, Light, LevelTri, NetConfig, Motion, Step, Surface, View};
@@ -42,6 +47,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// The dream's frame shown at this times the PS1 screen's size by default (`--dream-up`).
 const UP: u32 = 3;
 /// dream_renderer::Config's default `max_touched`.
 const MAX_TOUCHED: u32 = 128;
@@ -73,6 +79,10 @@ struct Job {
     step: Step,
     /// Wake from the dream.
     wake: bool,
+    /// The automata for walls and for floors and ceilings (`--dream-nca`; -1: none).
+    nca_models: [i32; 2],
+    /// Drawn in the PS1 camera's own pass (`--dream-psx`, psx_pass), not over its picture.
+    psx_pass: bool,
     /// The level's light from everywhere and its lights, as they are now.
     lights: ([f32; 3], Vec<Light>),
     /// GAME_DREAM_CHECK: the CPU's G-buffer of this view.
@@ -90,8 +100,10 @@ struct Check {
 #[derive(Default)]
 struct Shared {
     job: Option<Job>,
-    /// The renderer's setup, taken when the render world makes it.
+    /// The renderer's setup, taken when the render world makes it; and its automata's file and
+    /// cells a page side (`--dream-nca`).
     config: Option<Config>,
+    nca: Option<(PathBuf, u32)>,
     ms: f32,
     pages_seen: usize,
     pages_in_use: usize,
@@ -107,6 +119,10 @@ pub struct DreamGraph;
 struct DreamGpu {
     shared: Arc<Mutex<Shared>>,
     renderer: Option<DreamRenderer>,
+    /// Drawing in the PS1 camera's pass (psx_pass): the last job's width, view and step, to
+    /// draw again on a frame with no new job (the walls are the shell's alone there).
+    last_psx: Option<(u32, View, Step)>,
+    psx_drawn: bool,
     /// The CPU's G-buffer of the last frame drawn, to compare once its work is done.
     check: Option<Check>,
 }
@@ -154,11 +170,23 @@ pub struct DreamAtlas {
     /// and gradient blur, kept as it was left when switching away.
     net_names: Vec<String>,
     net_steps: Vec<[f32; 3]>,
+    /// The ImageNet classes' names (`imagenet_classes.txt` beside the weights, from
+    /// train/export_resnet.py), for `step.class`; and the panel's search through them.
+    pub class_names: Vec<String>,
+    class_search: String,
     /// The dream sharp only when the camera rests (else always).
     pub settle: bool,
     /// Off: the PS1 picture through the renderer with no dreaming.
     pub dreaming: bool,
     pub mode: DreamMode,
+    /// The frame shown at this times the PS1 screen's size (1: the PS1's own).
+    up: u32,
+    /// Drawn in the PS1 camera's own pass (`--dream-psx`; psx_pass): the shell is the level's
+    /// walls there, the level's own meshes hidden, the dream's picture not shown over it.
+    pub psx_pass: bool,
+    /// The automata's names (`set_nca`) and those for walls and for floors and ceilings.
+    nca_names: Vec<String>,
+    nca_models: [i32; 2],
     /// The camera and width of the last picture dreamed on.
     drawn: Option<(Camera, u32)>,
     pub stills: u64,
@@ -189,6 +217,22 @@ pub struct DreamAtlas {
 
 impl DreamAtlas {
     /// Dream with network `i` of those given, with its own steps.
+    /// Grow the walls with the neural cellular automata in `path` (dream_renderer::nca, from
+    /// train/meshnca_export.py), `cells` a page side, by name for walls and for floors and
+    /// ceilings, in place of dreaming: the walls' own colour and the shell's height.
+    pub fn set_nca(&mut self, path: &Path, cells: u32, walls: &str, floors: &str) -> Result<(), String> {
+        self.nca_names = dream_renderer::nca::read_models(path)?.into_iter().map(|m| m.0).collect();
+        let find = |n: &str| self.nca_names.iter().position(|m| m == n).map(|i| i as i32).ok_or(format!("no automaton {n} in {} ({})", path.display(), self.nca_names.join(", ")));
+        self.nca_models = [find(walls)?, find(floors)?];
+        self.shared.lock().unwrap().nca = Some((path.to_path_buf(), cells));
+        self.mode = DreamMode::Walls;
+        (self.step.lr, self.step.lr_fine, self.step.height) = (0.0, 0.0, 0.0);
+        self.step.nca = 0.25;
+        self.step.nca_steps = 1;
+        self.step.shell_smooth = 0.5;
+        Ok(())
+    }
+
     pub fn switch_net(&mut self, i: usize) {
         let i = i.min(self.net_names.len() - 1);
         let old = self.step.net.min(self.net_steps.len() - 1);
@@ -199,7 +243,8 @@ impl DreamAtlas {
 
     /// Each network's weights, and the layers each octave dreams with (none: the network's own;
     /// the fine octave's none: as the coarse).
-    pub fn new(weights: &[PathBuf], layers: &[Vec<String>], fine_layers: &[Vec<String>], images: &mut Assets<Image>) -> Result<DreamAtlas, String> {
+    pub fn new(weights: &[PathBuf], layers: &[Vec<String>], fine_layers: &[Vec<String>], up: Option<u32>, images: &mut Assets<Image>) -> Result<DreamAtlas, String> {
+        let up = up.unwrap_or(UP);
         let mut cfg = Config::new("");
         cfg.nets = weights
             .iter()
@@ -214,10 +259,10 @@ impl DreamAtlas {
         let net_names: Vec<String> = weights.iter().map(|w| w.file_stem().map_or("?".into(), |s| s.to_string_lossy().into_owned())).collect();
         cfg.max_width = MAX_W;
         cfg.height = H;
-        cfg.up = UP;
+        cfg.up = up;
         cfg.max_touched = MAX_TOUCHED;
         let max_pages = cfg.max_pages as usize;
-        let size = Extent3d { width: MAX_W * UP, height: H * UP, depth_or_array_layers: 1 };
+        let size = Extent3d { width: MAX_W * up, height: H * up, depth_or_array_layers: 1 };
         let mut image = Image::new_fill(size, TextureDimension::D2, &[0, 0, 0, 255], TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::default());
         image.sampler = ImageSampler::nearest();
         Ok(DreamAtlas {
@@ -231,12 +276,18 @@ impl DreamAtlas {
                     if n.contains("resnet") { [0.004, 0.003, 2.0] } else { [d.lr, d.lr_fine, d.grad_blur] }
                 })
                 .collect(),
+            class_names: weights.iter().find_map(|w| std::fs::read_to_string(w.with_file_name("imagenet_classes.txt")).ok()).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default(),
+            class_search: String::new(),
             net_names,
             torch_at: [0.22, 0.2, 0.3],
             // The relief shell-mapped (docs/shell_relief.md), deep and in as far as out.
             step: Step { fine_split: 4, fine_every: 2, relief: 0.0, height: 0.001, height_max: 0.5, shell: 1.0, shell_smooth: 3.0, shell_far: 0.5, shell_pixel: 0.25, glint: 0.2, rough_dry: 0.8, rough_wet: 0.4, ..Step::default() },
             settle: false,
             mode: DreamMode::Still,
+            up,
+            psx_pass: false,
+            nca_names: Vec::new(),
+            nca_models: [-1, -1],
             drawn: None,
             stills: 0,
             dreaming: true,
@@ -475,10 +526,32 @@ pub fn setup(app: &mut App, atlas: &DreamAtlas) {
         ));
     });
     app.add_systems(Update, display_after);
+    if atlas.psx_pass {
+        app.add_plugins(ExtractComponentPlugin::<ShellView>::default());
+        app.add_systems(Update, (mark_level_camera, hide_level_meshes));
+        app.sub_app_mut(RenderApp).add_systems(Core3d, psx_pass.after(main_opaque_pass_3d).before(main_transparent_pass_3d).in_set(Core3dSystems::MainPass));
+    }
     app.sub_app_mut(RenderApp)
-        .insert_resource(DreamGpu { shared, renderer: None, check: None })
+        .insert_resource(DreamGpu { shared, renderer: None, last_psx: None, psx_drawn: false, check: None })
         .init_schedule(DreamGraph)
         .add_systems(DreamGraph, dream);
+}
+
+/// The level's camera marked for the dream to draw in its pass (psx_pass).
+fn mark_level_camera(mut commands: Commands, cams: Query<Entity, (With<engine::render::LevelCamera>, Without<ShellView>)>) {
+    for c in &cams {
+        commands.entity(c).insert(ShellView);
+    }
+}
+
+/// The walked level's own meshes hidden: the shell draws its walls (psx_pass). Levels placed
+/// beside it (seen through doorways) keep theirs.
+fn hide_level_meshes(mut parts: Query<&mut Visibility, (With<engine::render::LevelPart>, Without<engine::render::Placed>)>) {
+    for mut v in &mut parts {
+        if *v != Visibility::Hidden {
+            *v = Visibility::Hidden;
+        }
+    }
 }
 
 fn display_after(mut cams: Query<(&mut bevy::camera::Camera, Option<&RenderLayers>)>) {
@@ -493,17 +566,12 @@ fn display_after(mut cams: Query<(&mut bevy::camera::Camera, Option<&RenderLayer
 /// the PS1 screen's, before the window's).
 fn dream(mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<RenderQueue>, images: Res<RenderAssets<GpuImage>>, mut pending: ResMut<PendingCommandBuffers>) {
     let gpu = &mut *gpu;
-    let mut shared = gpu.shared.lock().unwrap();
-    if gpu.renderer.is_none() {
-        let Some(cfg) = shared.config.take() else { return };
-        match DreamRenderer::new(device.wgpu_device().clone(), (**queue).clone(), cfg) {
-            Ok(r) => gpu.renderer = Some(r),
-            Err(e) => {
-                eprintln!("dream atlas: {e}");
-                shared.error = Some(e);
-                return;
-            }
-        }
+    let shared_arc = gpu.shared.clone();
+    let mut shared = shared_arc.lock().unwrap();
+    make_renderer(gpu, &mut shared, &device, &queue);
+    // Drawn in the PS1 camera's pass instead (psx_pass).
+    if shared.job.as_ref().is_some_and(|j| j.psx_pass) {
+        return;
     }
     let Some(r) = gpu.renderer.as_mut() else { return };
     if let Some(check) = gpu.check.take() {
@@ -512,15 +580,7 @@ fn dream(mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<Render
     let (Some(job), Some(_), Some(_)) = (shared.job.as_ref(), shared.job.as_ref().and_then(|j| images.get(j.screen)), shared.job.as_ref().and_then(|j| images.get(j.out))) else { return };
     let (screen, out) = (images.get(job.screen).unwrap(), images.get(job.out).unwrap());
     let job = shared.job.take().unwrap();
-    if let Some((tris, textures)) = &job.level {
-        if let Err(e) = r.set_textures(64, textures).and_then(|_| r.set_level(tris)) {
-            eprintln!("dream atlas: {e}");
-        }
-    }
-    if job.wake {
-        let _ = r.wake();
-    }
-    r.set_lights(job.lights.0, &job.lights.1);
+    take_level(r, &job);
     let mut enc = device.wgpu_device().create_command_encoder(&Default::default());
     if let Err(e) = r.encode_view(&mut enc, &screen.texture, job.width, job.view.as_ref(), job.creatures.as_deref(), job.carry, &job.step, &out.texture) {
         eprintln!("dream atlas: {e}");
@@ -531,6 +591,79 @@ fn dream(mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<Render
     shared.ms = shared.ms * 0.9 + 0.1 * r.last_ms;
     shared.pages_seen = r.pages_seen;
     shared.pages_in_use = r.pages_in_use();
+}
+
+/// The level's camera, whose pass the dream draws in (psx_pass).
+#[derive(Component, Clone, Copy, ExtractComponent)]
+#[extract_app(RenderApp)]
+pub struct ShellView;
+
+/// In the PS1 camera's pass, after its opaque meshes (`--dream-psx`): the level's walls are the
+/// shell's, marched into the camera's own depth (so what's drawn there hides it where nearer,
+/// and what's drawn after is hidden by its bulges) and laid into its frame, PS1-shaded.
+fn psx_pass(view: ViewQuery<(&ViewTarget, &ViewDepthStencilTexture), With<ShellView>>, mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<RenderQueue>, mut ctx: RenderContext) {
+    let gpu = &mut *gpu;
+    let shared_arc = gpu.shared.clone();
+    let mut shared = shared_arc.lock().unwrap();
+    make_renderer(gpu, &mut shared, &device, &queue);
+    let Some(r) = gpu.renderer.as_mut() else { return };
+    if shared.job.as_ref().is_some_and(|j| j.psx_pass) {
+        let job = shared.job.take().unwrap();
+        take_level(r, &job);
+        if let Some(v) = job.view {
+            gpu.last_psx = Some((job.width, v, job.step));
+        }
+    }
+    let Some((width, v, step)) = gpu.last_psx else { return };
+    if !gpu.psx_drawn {
+        gpu.psx_drawn = true;
+        eprintln!("dream atlas: drawing the walls in the PS1 camera's pass");
+    }
+    let (target, depth) = view.into_inner();
+    let depth = depth.texture().create_view(&Default::default());
+    if let Err(e) = r.encode_psx(ctx.command_encoder(), width, &v, &step, target.main_texture_view(), target.main_texture_format(), &depth) {
+        eprintln!("dream atlas: {e}");
+        return;
+    }
+    shared.ms = shared.ms * 0.9 + 0.1 * r.last_ms;
+    shared.pages_seen = r.pages_seen;
+    shared.pages_in_use = r.pages_in_use();
+}
+
+/// A job's level, lights and automata given to the renderer.
+fn take_level(r: &mut DreamRenderer, job: &Job) {
+    if let Some((tris, textures)) = &job.level {
+        if let Err(e) = r.set_textures(64, textures).and_then(|_| r.set_level(tris)) {
+            eprintln!("dream atlas: {e}");
+        }
+    }
+    if job.wake {
+        let _ = r.wake();
+    }
+    r.set_nca_models(job.nca_models[0], job.nca_models[1]);
+    r.set_lights(job.lights.0, &job.lights.1);
+}
+
+/// The renderer, made on Bevy's device the first time it's wanted.
+fn make_renderer(gpu: &mut DreamGpu, shared: &mut Shared, device: &RenderDevice, queue: &RenderQueue) {
+    if gpu.renderer.is_none() {
+        let Some(cfg) = shared.config.take() else { return };
+        match DreamRenderer::new(device.wgpu_device().clone(), (**queue).clone(), cfg) {
+            Ok(mut r) => {
+                if let Some((path, cells)) = shared.nca.take() {
+                    if let Err(e) = r.set_nca(&path, cells) {
+                        eprintln!("dream atlas: the automata: {e}");
+                    }
+                }
+                gpu.renderer = Some(r)
+            }
+            Err(e) => {
+                eprintln!("dream atlas: {e}");
+                shared.error = Some(e);
+                return;
+            }
+        }
+    }
 }
 
 /// GAME_DREAM_CHECK: the renderer's G-buffer of the last frame against the CPU's.
@@ -709,6 +842,8 @@ pub fn draw(
         carry: atlas.mode == DreamMode::Reproject,
         step,
         wake,
+        nca_models: atlas.nca_models,
+        psx_pass: atlas.psx_pass,
         check,
         lights: level_lights(&sim.level.scene, &cam),
     };
@@ -742,7 +877,7 @@ pub fn draw(
         if sprite.image != atlas.image {
             sprite.image = atlas.image.clone();
         }
-        sprite.rect = Some(Rect::new(0.0, 0.0, (width * UP) as f32, (H * UP) as f32));
+        sprite.rect = Some(Rect::new(0.0, 0.0, (width * atlas.up) as f32, (H * atlas.up) as f32));
     }
 }
 
@@ -756,6 +891,21 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
         ui.label(format!("{:.1} ms a frame dreaming, {:.1} ms the main world's part", a.ms, a.gbuffer_ms));
         ui.label(format!("{} pages in sight (up to {MAX_TOUCHED} dreamed a frame), {} in all", a.pages_seen, a.pages_in_use));
         ui.checkbox(&mut a.dreaming, "dreaming");
+        if !a.nca_names.is_empty() {
+            ui.add(egui::Slider::new(&mut a.step.nca, 0.0..=1.0).text("automata's height (tiles; 0: off, the dream as before)"));
+            ui.add(egui::Slider::new(&mut a.step.nca_steps, 0..=dream_renderer::nca::MAX_STEPS).text("automata's steps a frame (their speed)"));
+            ui.add(egui::Slider::new(&mut a.step.nca_lift, 0.0..=1.0).text("of their height taken off (walls sink as well as rise)"));
+            ui.checkbox(&mut a.step.psx, "drawn as the PS1 drew (chunky texels, 15-bit dithered)");
+            for (k, label) in ["walls", "floors and ceilings"].into_iter().enumerate() {
+                let now = usize::try_from(a.nca_models[k]).ok().and_then(|i| a.nca_names.get(i)).map_or("none", |n| n.as_str()).to_string();
+                egui::ComboBox::from_label(format!("automaton on the {label}")).selected_text(now).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut a.nca_models[k], -1, "none");
+                    for (i, n) in a.nca_names.iter().enumerate() {
+                        ui.selectable_value(&mut a.nca_models[k], i as i32, n.as_str());
+                    }
+                });
+            }
+        }
         if a.net_names.len() > 1 {
             ui.horizontal(|ui| {
                 ui.label("dreaming with");
@@ -767,6 +917,30 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
                     a.switch_net(net);
                 }
             });
+        }
+        if !a.class_names.is_empty() {
+            let now = usize::try_from(a.step.class).ok().and_then(|c| a.class_names.get(c)).map_or("none: its layers".to_string(), |n| format!("{} ({})", n, a.step.class));
+            ui.horizontal(|ui| {
+                ui.label(format!("dreaming towards {now} (the robust ResNet only)"));
+                if ui.button("none").clicked() {
+                    a.step.class = -1;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("find a class");
+                ui.text_edit_singleline(&mut a.class_search);
+            });
+            let search = a.class_search.to_lowercase();
+            if !search.is_empty() {
+                let found: Vec<(usize, String)> = a.class_names.iter().enumerate().filter(|(_, n)| n.to_lowercase().contains(&search)).take(12).map(|(i, n)| (i, n.clone())).collect();
+                ui.horizontal_wrapped(|ui| {
+                    for (i, n) in found {
+                        if ui.button(n).clicked() {
+                            a.step.class = i as i32;
+                        }
+                    }
+                });
+            }
         }
         ui.add(egui::Slider::new(&mut a.step.scale, 0.25..=1.5).text("coarse: the picture seen at (smaller dreams bigger)"));
         ui.add(egui::Slider::new(&mut a.step.fine_scale, 1.0..=3.0).text("fine: the picture seen at (smaller dreams bigger)"));

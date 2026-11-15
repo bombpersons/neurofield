@@ -223,6 +223,8 @@ struct Sim {
     panel: bool,
     /// The dream atlas draws the network's view (`--dream-atlas`), not the level network.
     dream_atlas: bool,
+    /// It draws in the PS1 camera's own pass (`--dream-psx --dream-nca ...`): the PS1 picture is shown.
+    dream_in_psx: bool,
     /// The glitch panel's knobs, held where they are set.
     glitch: effects::Glitch,
     net_ms: f32,
@@ -1112,6 +1114,7 @@ fn main() {
     let still_life = flag("--dream-still-life");
     let eye_light = flag("--dream-eye-light");
     let show_shell = flag("--dream-show-shell");
+    let psx_look = flag("--dream-psx");
     let uncentred = flag("--dream-height-uncentred");
     if mcp && !cfg!(feature = "dev-mcp") {
         eprintln!("--mcp needs a developer build: cargo run -p game --features dev-mcp -- --mcp");
@@ -1212,6 +1215,7 @@ fn main() {
         effects: [None; effects::EFFECTS.len()],
         panel: false,
         dream_atlas: opts.contains_key("dream-atlas"),
+        dream_in_psx: opts.contains_key("dream-atlas") && opts.contains_key("dream-nca") && psx_look,
         glitch: glitch_from_env(),
         net_ms: 0.0,
         herd: Default::default(),
@@ -1330,13 +1334,27 @@ fn main() {
         };
         let weights: Vec<PathBuf> = weights.split(',').map(PathBuf::from).collect();
         let mut images = app.world_mut().resource_mut::<Assets<Image>>();
-        let mut atlas = dream_atlas::DreamAtlas::new(&weights, &list("dream-layers"), &list("dream-fine-layers"), &mut images)
+        // In the PS1 camera's own pass (--dream-psx) the frame is the PS1 screen's size.
+        let up = if psx_look { Some(1) } else { opts.get("dream-up").map(|u| u.parse().expect("--dream-up 1 (the frame at the PS1 screen's size; 3 by default)")) };
+        let mut atlas = dream_atlas::DreamAtlas::new(&weights, &list("dream-layers"), &list("dream-fine-layers"), up, &mut images)
             .unwrap_or_else(|e| panic!("the dream atlas: {e}"));
         if let Some(n) = opts.get("dream-net") {
             atlas.switch_net(n.parse().expect("--dream-net 1 (which of --dream-atlas's networks, from 0)"));
         }
+        if let Some(c) = opts.get("dream-class") {
+            atlas.step.class = c.parse().ok().or_else(|| atlas.class_names.iter().position(|n| n.eq_ignore_ascii_case(c)).map(|i| i as i32)).unwrap_or_else(|| panic!("--dream-class \"sliding door\" or 799 (an ImageNet class, by name or number; runs/dream/imagenet_classes.txt)"));
+        }
         if let Some(c) = opts.get("dream-colour") {
             atlas.step.colour = c.parse().expect("--dream-colour 0..1");
+        }
+        if let Some(c) = opts.get("dream-colour-blur") {
+            atlas.step.colour_blur = c.parse().expect("--dream-colour-blur 3 (the colour kept spread this many times wider than the brightness)");
+        }
+        if let Some(d) = opts.get("dream-decay") {
+            atlas.step.decay = d.parse().expect("--dream-decay 0.002 (share of the dream let go a frame)");
+        }
+        if let Some(l) = opts.get("dream-limit") {
+            atlas.step.limit = l.parse().expect("--dream-limit 0.6 (the most the dream may add or take away)");
         }
         if let Some(m) = opts.get("dream-mode") {
             atlas.mode = dream_atlas::DreamMode::parse(m).expect("--dream-mode walls, still or reproject");
@@ -1415,6 +1433,20 @@ fn main() {
             };
         }
         atlas.dreaming = !still_life;
+        if let Some(f) = opts.get("dream-nca") {
+            let cells = opts.get("dream-nca-cells").map_or(64, |c| c.parse().expect("--dream-nca-cells 64 (a page side)"));
+            let walls = opts.get("dream-nca-walls").map_or("Abstract_Organic_006", |s| s.as_str());
+            let floors = opts.get("dream-nca-floors").map_or("Stone_Path_007", |s| s.as_str());
+            atlas.set_nca(Path::new(f), cells, walls, floors).unwrap_or_else(|e| panic!("--dream-nca: {e}"));
+            if let Some(d) = opts.get("dream-nca-depth") {
+                atlas.step.nca = d.parse().expect("--dream-nca-depth 0.25 (tiles)");
+            }
+            atlas.step.psx = psx_look;
+            atlas.psx_pass = psx_look;
+            if let Some(n) = opts.get("dream-nca-steps") {
+                atlas.step.nca_steps = n.parse().expect("--dream-nca-steps 1 (a frame)");
+            }
+        }
         dream_atlas::setup(&mut app, &atlas);
         app.insert_non_send(atlas);
     }
@@ -2728,7 +2760,8 @@ fn layout(
     ns.custom_size = Some(size * scale);
     nt.translation.x = half;
     let portal = sim.stair.is_some_and(|s| s.through.is_some());
-    *nv = if mode == Mode::Raster && !portal { Visibility::Hidden } else { Visibility::Visible };
+    // The dream drawn in the PS1 camera's own pass (--dream-psx) is in the PS1 picture.
+    *nv = if (mode == Mode::Raster && !portal) || sim.dream_in_psx { Visibility::Hidden } else { Visibility::Visible };
     let opaque = if sim.mode == Mode::Network { 1.0 - sim.veil } else { 1.0 };
     if ns.color.alpha() != opaque {
         ns.color = Color::WHITE.with_alpha(opaque);

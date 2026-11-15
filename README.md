@@ -25,7 +25,7 @@ One Cargo workspace:
 - `training-data-gen/`: the `datagen` command, training data drawn by `engine::render`.
 - `game/`: the game.
 - `editor/`: the level editor.
-- `psx-bevy/`: the psx template's crate, unedited (see `docs/template.md`).
+- `psx-bevy/`: the PS1 renderer, launcher and dev MCP: forked from the psx template at 0.3.8, ours since 2026-11-15 (`psx-bevy/AGENTS.md`).
 
 ## Training data (`training-data-gen/`)
 

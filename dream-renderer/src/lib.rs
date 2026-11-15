@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod level;
+pub mod nca;
 mod profile;
 mod shell;
 use shell::Shell;
@@ -274,6 +275,16 @@ pub struct Step {
     pub shell_follow: f32,
     /// The shell's hit shown alone, in grey by its height and lit by its slope (red: none).
     pub show_shell: bool,
+    /// The pages grown by neural cellular automata (nca.rs, `DreamRenderer::set_nca`) instead:
+    /// their height's depth in tiles (0: none, the dream as before), steps a frame (their speed,
+    /// up to nca::MAX_STEPS; 0: still), and how much of the height's range is taken off it (so
+    /// walls sink as well as rise). Their colour is the wall's own, lit as the level lights it.
+    pub nca: f32,
+    pub nca_steps: u32,
+    pub nca_lift: f32,
+    /// Drawn as the PS1 drew: the automata's cells sampled nearest (chunky texels), and the
+    /// frame shown in 15-bit colour with the PS1's 4x4 ordered dither.
+    pub psx: bool,
     /// The torch (at the eye)'s glint off the surface: how bright (0: none), how far it
     /// reaches (pages), and how rough the surface is where the dream doesn't own it and where
     /// it does (0..1: wet and glossy towards 0).
@@ -291,6 +302,10 @@ pub struct Step {
     pub fine_scale: f32,
     /// Which of `Config::nets` dreams.
     pub net: usize,
+    /// The ImageNet class the network dreams towards (its logit's gradient; < 0: its layers,
+    /// as `NetConfig::layers`), where it has a classifier (the robust ResNet's): recognisable
+    /// things, a dog, a sliding door, brain coral, rather than strokes and patterns.
+    pub class: i32,
     /// The coarse octave dreams every `coarse_every` frames; the fine one a 1/`fine_split` by
     /// 1/`fine_split` piece of the frame at `up` times the picture's size (a different piece
     /// each time) every `fine_every` frames, `fine_offset` frames after the coarse one (so
@@ -303,7 +318,7 @@ pub struct Step {
 
 impl Default for Step {
     fn default() -> Step {
-        Step { lr: 0.012, lr_fine: 0.008, decay: 0.002, limit: 0.6, jitter: 4, jitter_fine: 6, sharpness: 1.0, colour: 0.25, colour_blur: 3, grad_blur: 0.0, take_over: 0.01, own_max: 1.0, relief: 0.0, relief_rate: 0.05, remember_every: 4, height: 0.0, height_max: 0.15, height_blur: 3, height_spread: 1, height_power: 1.0, height_from_colour: 0.0, height_decay: 0.0, height_centred: true, lamp: 1.0, lamp_ambient: 0.3, shade_only_every: 3, show_shade: 1.0, show_wrap: 0.5, lights: true, dream_lit: 1.0, show_height: false, displace: 0.0, shell: 0.0, shell_taper: 0.15, shell_smooth: 0.0, shell_far: 0.0, shell_pixel: 0.0, shell_lean: 0.0, shell_follow: 0.02, show_shell: false, glint: 0.0, torch_reach: 6.0, rough_dry: 0.6, rough_wet: 0.2, own_picture: true, scale: 1.0, fine_scale: 3.0, net: 0, coarse_every: 1, fine_split: 2, fine_every: 1, fine_offset: 0 }
+        Step { lr: 0.012, lr_fine: 0.008, decay: 0.002, limit: 0.6, jitter: 4, jitter_fine: 6, sharpness: 1.0, colour: 0.25, colour_blur: 3, grad_blur: 0.0, take_over: 0.01, own_max: 1.0, relief: 0.0, relief_rate: 0.05, remember_every: 4, height: 0.0, height_max: 0.15, height_blur: 3, height_spread: 1, height_power: 1.0, height_from_colour: 0.0, height_decay: 0.0, height_centred: true, lamp: 1.0, lamp_ambient: 0.3, shade_only_every: 3, show_shade: 1.0, show_wrap: 0.5, lights: true, dream_lit: 1.0, show_height: false, displace: 0.0, shell: 0.0, shell_taper: 0.15, shell_smooth: 0.0, shell_far: 0.0, shell_pixel: 0.0, shell_lean: 0.0, shell_follow: 0.02, show_shell: false, nca: 0.0, nca_steps: 1, nca_lift: 0.3, psx: false, glint: 0.0, torch_reach: 6.0, rough_dry: 0.6, rough_wet: 0.2, own_picture: true, scale: 1.0, fine_scale: 3.0, net: 0, class: -1, coarse_every: 1, fine_split: 2, fine_every: 1, fine_offset: 0 }
     }
 }
 
@@ -321,6 +336,10 @@ const FILL: u32 = 16;
 /// dream.wgsl's SHOW_HEIGHT, LAMP and HEIGHT_CELL.
 const SHOW_HEIGHT: u32 = 32;
 const LAMP: u32 = 64;
+/// dream.wgsl's CLASS: seed's gradient a class's logit's (its row of the classifier).
+const CLASS: u32 = 128;
+/// dream.wgsl's PSX: show draws in 15-bit colour, dithered as the PS1 did.
+const PSX: u32 = 256;
 const HEIGHT_CELL: u32 = 2;
 /// The results slot of the height's mean |gradient|.
 const HEIGHT_MEAN: u32 = RESULTS - 4;
@@ -328,6 +347,9 @@ const HEIGHT_MEAN: u32 = RESULTS - 4;
 const HEIGHT_SIGNED: u32 = RESULTS - 6;
 /// The results slot of the largest |height| on any page (how far the shell's prisms reach).
 const HEIGHT_BOUND: u32 = RESULTS - 8;
+/// The results slot of how sure the network was of the class at the last coarse octave
+/// (dream.wgsl confidence), which the fine octave's steps go by.
+const SURE: u32 = RESULTS - 10;
 /// dream.wgsl's LAMP_SLOT and LAMP_AUX: floats of a dream lamp's slot, and where its work starts.
 const LAMP_SLOT: usize = 12;
 const LAMP_AUX: u32 = 24;
@@ -407,10 +429,11 @@ enum Kernel {
     HeightMix,
     MatmulBig,
     MatmulSum,
+    Confidence,
 }
-const KERNELS: [&str; 32] = [
+const KERNELS: [&str; 33] = [
     "matmul", "im2col", "col2im", "maxpool", "maxpool_back", "relu_back", "clear", "reduce", "reduce_finish", "seed",
-    "prepare", "scatter", "clear_acc", "apply", "clear_pages", "show", "blur_picture", "raise", "screen_step", "bake", "warp", "store", "gbuffer", "shade_back", "blur_height", "displace", "own_picture", "elementwise", "blur_grad", "height_mix", "matmul_big", "matmul_sum",
+    "prepare", "scatter", "clear_acc", "apply", "clear_pages", "show", "blur_picture", "raise", "screen_step", "bake", "warp", "store", "gbuffer", "shade_back", "blur_height", "displace", "own_picture", "elementwise", "blur_grad", "height_mix", "matmul_big", "matmul_sum", "confidence",
 ];
 /// dream.wgsl's `elementwise` modes.
 const EW_INPUT: u32 = 0;
@@ -470,8 +493,8 @@ struct Bottleneck {
 enum Block {
     /// A convolution and ReLU.
     Conv(Conv),
-    /// A 3x3 max pool, PyTorch's ceil_mode (GoogLeNet) or not (ResNet).
-    Pool { stride: u32, pad: u32, ceil: bool },
+    /// A size x size max pool, PyTorch's ceil_mode (GoogLeNet) or not (ResNet).
+    Pool { size: u32, stride: u32, pad: u32, ceil: bool },
     Inception(Inception),
     Bottleneck(Bottleneck),
 }
@@ -485,6 +508,11 @@ struct Net {
     input: u32,
     layers: Vec<usize>,
     fine_layers: Vec<usize>,
+    /// Its classifier, where it has one (the robust ResNet's `fc`): each class's weights over
+    /// the last block's channels (their mean over the pixels), and where in `mem` the class
+    /// dreamed towards has its row (`Step::class`); and where all of it (each class's row) and
+    /// its biases are in `mem`, for how sure it is (dream.wgsl confidence).
+    classes: Option<Classifier>,
 }
 
 impl Net {
@@ -513,6 +541,15 @@ impl Net {
     }
 }
 
+#[derive(Clone, Debug)]
+struct Classifier {
+    w: Vec<f32>,
+    row: u32,
+    all: u32,
+    bias: u32,
+    count: u32,
+}
+
 /// HWC planes, by their place relative to the activations' (and gradients') start.
 #[derive(Clone, Copy, Debug)]
 struct T {
@@ -526,7 +563,7 @@ struct T {
 enum Layer {
     /// `out`'s channels from `c0` are conv(inp), after ReLU if `relu` (or added to what's there).
     Conv { conv: Conv, inp: T, out: T, c0: u32, relu: bool },
-    Pool { inp: T, out: T, idx: u32, stride: u32, pad: u32 },
+    Pool { inp: T, out: T, idx: u32, size: u32, stride: u32, pad: u32 },
     /// `out` = `inp`, the same shape (a residual's shortcut).
     Copy { inp: T, out: T },
     /// `t` = ReLU(`t`), in place.
@@ -540,6 +577,8 @@ enum Layer {
 struct Plan {
     ops: Vec<(Kernel, Params, [u32; 3])>,
     input: T,
+    /// The last block's output, where it dreams towards a class.
+    last: Option<T>,
 }
 
 /// Where a set of slot tables is in `mem`: each page's slot (-1 for none), each slot's page,
@@ -614,6 +653,14 @@ struct Layout {
     floats: u32,
 }
 
+/// Where a frame drawn on the GPU goes: an RGBA8 texture of its own (the frame shown), or a
+/// camera's frame and depth (`encode_psx`).
+#[derive(Clone, Copy)]
+enum Out<'a> {
+    Texture(&'a wgpu::Texture),
+    Psx { colour: &'a wgpu::TextureView, format: wgpu::TextureFormat, depth: &'a wgpu::TextureView },
+}
+
 pub struct DreamRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -663,8 +710,11 @@ pub struct DreamRenderer {
     cfg: Config,
     at: Layout,
     nets: Vec<Net>,
-    /// Each octave's plan by its size, whether it's the fine one, and the network.
-    plans: HashMap<(u32, u32, bool, usize), Plan>,
+    /// Each octave's plan by its size, whether it's the fine one, the network and whether it
+    /// dreams towards a class.
+    plans: HashMap<(u32, u32, bool, usize, bool), Plan>,
+    /// The class whose row of each network's classifier is in `mem` (Net::classes).
+    class_rows: Vec<Option<u32>>,
     /// Frame count, and the frame each page was last dreamed on.
     frames: u64,
     last: Vec<u64>,
@@ -676,6 +726,15 @@ pub struct DreamRenderer {
     /// This frame's work so far, the pages to clear, and the next free set of slot tables.
     ops: Vec<(Kernel, Params, [u32; 3])>,
     clears: Vec<u32>,
+    /// The automata growing the pages (`set_nca`), their models' names, the model for walls and
+    /// for floors and ceilings, and whether the pages' table needs writing again.
+    nca: Option<nca::Nca>,
+    nca_names: Vec<String>,
+    nca_models: [i32; 2],
+    nca_dirty: bool,
+    /// The pipeline laying the shell's pixels into a camera's frame (`encode_psx`), by the
+    /// frame's format: it, its bind group and its uniform.
+    blit: Option<(wgpu::TextureFormat, wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer)>,
     next_set: usize,
     /// Milliseconds the last frame took, start to finish, waiting for the GPU.
     pub last_ms: f32,
@@ -741,9 +800,9 @@ fn conv_out(n: u32, k: u32, s: u32, pad: u32) -> u32 {
     (n + 2 * pad - k) / s + 1
 }
 
-/// PyTorch's ceil_mode size for a 3x3 pool, whose last window must start inside the input.
-fn pool_out(n: u32, s: u32, pad: u32) -> u32 {
-    let mut o = (n + 2 * pad - 3).div_ceil(s) + 1;
+/// PyTorch's ceil_mode size for a k x k pool, whose last window must start inside the input.
+fn pool_out(n: u32, k: u32, s: u32, pad: u32) -> u32 {
+    let mut o = (n + 2 * pad - k).div_ceil(s) + 1;
     if (o - 1) * s >= n + pad {
         o -= 1;
     }
@@ -840,11 +899,11 @@ impl Builder {
         out
     }
 
-    fn pool(&mut self, inp: T, stride: u32, pad: u32, ceil: bool) -> T {
-        let size = |n| if ceil { pool_out(n, stride, pad) } else { conv_out(n, 3, stride, pad) };
-        let out = self.alloc(size(inp.h), size(inp.w), inp.c);
+    fn pool(&mut self, inp: T, size: u32, stride: u32, pad: u32, ceil: bool) -> T {
+        let out_of = |n| if ceil { pool_out(n, size, stride, pad) } else { conv_out(n, size, stride, pad) };
+        let out = self.alloc(out_of(inp.h), out_of(inp.w), inp.c);
         let idx = self.alloc(out.h, out.w, out.c).off;
-        self.layers.push(Layer::Pool { inp, out, idx, stride, pad });
+        self.layers.push(Layer::Pool { inp, out, idx, size, stride, pad });
         let r = rows(out.h * out.w);
         let p = Params {
             m: out.h,
@@ -856,6 +915,7 @@ impl Builder {
             x0: inp.c,
             x1: inp.h,
             x2: inp.w,
+            x3: size,
             x4: stride,
             x5: pad,
             ..Default::default()
@@ -872,7 +932,7 @@ impl Builder {
         self.conv(b.b2[1], t2, out, c1);
         let t3 = self.conv_new(b.b3[0], x);
         self.conv(b.b3[1], t3, out, c1 + c2);
-        let pooled = self.pool(x, 1, 1, true);
+        let pooled = self.pool(x, 3, 1, 1, true);
         self.conv(b.b4, pooled, out, c1 + c2 + c3);
         out
     }
@@ -953,7 +1013,7 @@ impl Builder {
                         self.push(Kernel::Col2im, p, [64, r[0], r[1]]);
                     }
                 }
-                Layer::Pool { inp, out, idx, stride, pad } => {
+                Layer::Pool { inp, out, idx, size, stride, pad } => {
                     let r = rows(inp.h * inp.w);
                     let p = Params {
                         m: out.h,
@@ -965,6 +1025,7 @@ impl Builder {
                         x0: inp.c,
                         x1: inp.h,
                         x2: inp.w,
+                        x3: size,
                         x4: stride,
                         x5: pad,
                         ..Default::default()
@@ -1023,7 +1084,7 @@ fn load_net(cfg: &NetConfig, data: &mut Vec<f32>) -> Result<Net> {
     let resnet = t.contains_key("layer1.0.conv1.weight");
     if resnet {
         order.push(("conv1".to_string(), Block::Conv(conv(&mut t, "conv1", 2)?)));
-        order.push(("maxpool".to_string(), Block::Pool { stride: 2, pad: 1, ceil: false }));
+        order.push(("maxpool".to_string(), Block::Pool { size: 3, stride: 2, pad: 1, ceil: false }));
         for i in 1..=4 {
             for j in 0.. {
                 let n = format!("layer{i}.{j}");
@@ -1039,12 +1100,19 @@ fn load_net(cfg: &NetConfig, data: &mut Vec<f32>) -> Result<Net> {
         }
     } else {
         order.push(("conv1".to_string(), Block::Conv(conv(&mut t, "conv1", 2)?)));
-        order.push(("maxpool1".to_string(), Block::Pool { stride: 2, pad: 0, ceil: true }));
+        order.push(("maxpool1".to_string(), Block::Pool { size: 3, stride: 2, pad: 0, ceil: true }));
         order.push(("conv2".to_string(), Block::Conv(conv(&mut t, "conv2", 1)?)));
         order.push(("conv3".to_string(), Block::Conv(conv(&mut t, "conv3", 1)?)));
-        order.push(("maxpool2".to_string(), Block::Pool { stride: 2, pad: 0, ceil: true }));
-        for name in ["3a", "3b", "4a", "4b", "4c", "4d", "4e"] {
+        order.push(("maxpool2".to_string(), Block::Pool { size: 3, stride: 2, pad: 0, ceil: true }));
+        for name in ["3a", "3b", "4a", "4b", "4c", "4d", "4e", "5a", "5b"] {
             let n = format!("inception{name}");
+            // Older exports stop at 4e (5a and 5b are only for dreaming towards a class).
+            if !t.contains_key(&format!("{n}.branch1.weight")) {
+                break;
+            }
+            if name == "5a" {
+                order.push(("maxpool4".to_string(), Block::Pool { size: 2, stride: 2, pad: 0, ceil: true }));
+            }
             let block = Inception {
                 b1: conv(&mut t, &format!("{n}.branch1"), 1)?,
                 b2: [conv(&mut t, &format!("{n}.branch2.0"), 1)?, conv(&mut t, &format!("{n}.branch2.1"), 1)?],
@@ -1053,7 +1121,7 @@ fn load_net(cfg: &NetConfig, data: &mut Vec<f32>) -> Result<Net> {
             };
             order.push((n, Block::Inception(block)));
             if name == "3b" {
-                order.push(("maxpool3".to_string(), Block::Pool { stride: 2, pad: 0, ceil: true }));
+                order.push(("maxpool3".to_string(), Block::Pool { size: 3, stride: 2, pad: 0, ceil: true }));
             }
         }
     }
@@ -1063,7 +1131,14 @@ fn load_net(cfg: &NetConfig, data: &mut Vec<f32>) -> Result<Net> {
     let scale = t.remove("input.scale").map(|v| v.1).unwrap_or(vec![2.0; 3]);
     let offset = t.remove("input.offset").map(|v| v.1).unwrap_or(vec![-1.0; 3]);
     let input = push(&[scale, offset].concat());
-    let mut net = Net { order, input, layers: Vec::new(), fine_layers: Vec::new() };
+    let classes = match (t.remove("fc.weight"), t.remove("fc.bias")) {
+        (Some((shape, w)), Some((_, b))) if shape[1] <= 2048 && shape[0] <= 1024 => {
+            let (row, all, bias) = (push(&vec![0.0; shape[1]]), push(&w), push(&b));
+            Some(Classifier { w, row, all, bias, count: shape[0] as u32 })
+        }
+        _ => None,
+    };
+    let mut net = Net { order, input, layers: Vec::new(), fine_layers: Vec::new(), classes };
     let default = if resnet { "layer3" } else { "inception4c" };
     let layers = if cfg.layers.is_empty() { vec![default.to_string()] } else { cfg.layers.clone() };
     let fine = if cfg.fine_layers.is_empty() { layers.clone() } else { cfg.fine_layers.clone() };
@@ -1280,6 +1355,7 @@ impl DreamRenderer {
             queue,
             readback,
             at,
+            class_rows: vec![None; nets.len()],
             nets,
             plans: HashMap::new(),
             frames: 0,
@@ -1289,6 +1365,11 @@ impl DreamRenderer {
             view_flip: false,
             ops: Vec::new(),
             clears: Vec::new(),
+            nca: None,
+            nca_names: Vec::new(),
+            nca_models: [-1, -1],
+            nca_dirty: false,
+            blit: None,
             next_set: 1,
             last_ms: 0.0,
             profiler: std::sync::Mutex::new(profiler),
@@ -1315,7 +1396,7 @@ impl DreamRenderer {
         for (_, block) in net.order.iter().take(deepest + 1) {
             x = match block {
                 Block::Conv(c) => b.conv_new(*c, x),
-                Block::Pool { stride, pad, ceil } => b.pool(x, *stride, *pad, *ceil),
+                Block::Pool { size, stride, pad, ceil } => b.pool(x, *size, *stride, *pad, *ceil),
                 Block::Inception(i) => b.inception(i, x),
                 Block::Bottleneck(k) => b.bottleneck(k, x),
             };
@@ -1325,8 +1406,13 @@ impl DreamRenderer {
     }
 
     /// One octave's dispatches for an h x w input dreaming with network `net` and its `layers`
-    /// (places in its order).
-    fn plan(&self, net: usize, h: u32, w: u32, layers: &[usize]) -> (Plan, Vec<T>) {
+    /// (places in its order), or towards the class whose row is in `mem` (`class`: the gradient
+    /// of its logit, which at the last block is that row at every pixel, the classifier reading
+    /// their mean).
+    fn plan(&self, net: usize, h: u32, w: u32, layers: &[usize], class: bool) -> (Plan, Vec<T>) {
+        let last = [self.nets[net].order.len() - 1];
+        let class_at = self.nets[net].classes.as_ref().map(|c| c.row).filter(|_| class);
+        let layers = if class_at.is_some() { &last[..] } else { layers };
         let deepest = *layers.iter().max().unwrap();
         let (mut b, outs) = Self::build_net(&self.nets[net], self.at, h, w, deepest);
         let input = T { off: 0, h, w, c: 3 };
@@ -1335,13 +1421,19 @@ impl DreamRenderer {
         for (i, &l) in layers.iter().enumerate() {
             let t = outs[l];
             let n = t.h * t.w * t.c;
+            if let Some(at) = class_at {
+                let r = rows(n.div_ceil(4096));
+                b.push(Kernel::Seed, Params { m: n, a_off: at, k: t.c, flags: CLASS, c_off: b.grad(t), ..Default::default() }, [64, r[0], r[1]]);
+                continue;
+            }
             b.reduce(0, b.act(t), n, i as u32);
             let r = rows(n.div_ceil(4096));
             let p = Params { m: n, a_off: b.act(t), b_off: self.at.results + i as u32 * 2, c_off: b.grad(t), ..Default::default() };
             b.push(Kernel::Seed, p, [64, r[0], r[1]]);
         }
         b.backward();
-        (Plan { ops: b.ops, input }, outs)
+        let last = class_at.map(|_| outs[layers[0]]);
+        (Plan { ops: b.ops, input, last }, outs)
     }
 
     fn random(&mut self) -> u32 {
@@ -1435,7 +1527,7 @@ impl DreamRenderer {
             Some(s) => Given::Cpu(s, motion),
             None => Given::Still,
         };
-        self.encode_given(encoder, picture, width, given, step, out)
+        self.encode_given(encoder, Some(picture), width, given, step, Out::Texture(out))
     }
 
     /// As `encode`, with the G-buffer made on the GPU from the level given (`set_level`) as
@@ -1474,14 +1566,95 @@ impl DreamRenderer {
             }
             None => Given::Still,
         };
-        self.encode_given(encoder, picture, width, given, step, out)
+        self.encode_given(encoder, Some(picture), width, given, step, Out::Texture(out))
+    }
+
+    /// The level's walls drawn into a camera's own frame, as part of its pass (the PS1
+    /// renderer's: `Config::up` 1, the frame `width` by `Config::height`): the shell marched
+    /// against `depth` (Depth32Float, reversed: NEAR / z, as the march's own), what's drawn
+    /// there already in front of it hiding it and the march's depth left for what's drawn
+    /// after, and its pixels shaded as `show` shades them laid into `colour` (of `format`),
+    /// the rest left as the camera drew them. As `encode_view` otherwise, with no picture
+    /// under the dream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_psx(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, view: &View, step: &Step, colour: &wgpu::TextureView, format: wgpu::TextureFormat, depth: &wgpu::TextureView) -> Result<()> {
+        if self.level.is_none() {
+            return Err("no level given".into());
+        }
+        if self.cfg.up != 1 {
+            return Err(format!("drawn into a camera's frame at {} times its size, not 1", self.cfg.up));
+        }
+        if step.shell <= 0.0 {
+            return Err("drawn into a camera's frame with no shell".into());
+        }
+        if let Some(bits) = self.feedback.as_mut().and_then(|f| f.poll(&self.device)) {
+            self.take_report(&bits);
+        }
+        self.encode_given(encoder, None, width, Given::Gpu { view: *view, carry: false, creatures: false }, step, Out::Psx { colour, format, depth })
+    }
+
+    /// The shell's pixels laid into a camera's frame (psx_blit.wgsl), its pipeline made for the
+    /// frame's format when first asked for.
+    fn blit(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, colour: &wgpu::TextureView, format: wgpu::TextureFormat) {
+        let h = self.cfg.height;
+        if self.blit.as_ref().is_none_or(|b| b.0 != format) {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("psx_blit.wgsl"), source: wgpu::ShaderSource::Wgsl(include_str!("psx_blit.wgsl").into()) });
+            let uniform = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dream blit"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("dream blit"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                    wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                ],
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dream blit"),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.img.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() }],
+            });
+            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("dream blit"),
+                layout: Some(&self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("dream blit"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 })),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(format.into())] }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.blit = Some((format, pipeline, bind, uniform));
+        }
+        let Some((_, pipeline, bind, uniform)) = &self.blit else { return };
+        let rows = point_rows(width);
+        self.queue.write_buffer(uniform, 0, bytemuck::cast_slice(&[self.shown_at, padded(width), self.shell_at, rows]));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("dream blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: colour, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_viewport(0.0, 0.0, width as f32, h as f32, 0.0, 1.0);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_given(&mut self, encoder: &mut wgpu::CommandEncoder, picture: &wgpu::Texture, width: u32, given: Given, step: &Step, out: &wgpu::Texture) -> Result<()> {
+    fn encode_given(&mut self, encoder: &mut wgpu::CommandEncoder, picture: Option<&wgpu::Texture>, width: u32, given: Given, step: &Step, out: Out) -> Result<()> {
         let (h, up) = (self.cfg.height, self.cfg.up);
-        if width > self.cfg.max_width || picture.width() < width || picture.height() < h || out.width() < width * up || out.height() < h * up {
-            return Err(format!("a {width} x {h} frame from a {} x {} picture into {} x {}", picture.width(), picture.height(), out.width(), out.height()));
+        if width > self.cfg.max_width {
+            return Err(format!("a {width} wide frame, {} at most", self.cfg.max_width));
+        }
+        if let Some(picture) = picture.filter(|p| p.width() < width || p.height() < h) {
+            return Err(format!("a {width} x {h} frame from a {} x {} picture", picture.width(), picture.height()));
+        }
+        if let Out::Texture(out) = out
+            && (out.width() < width * up || out.height() < h * up)
+        {
+            return Err(format!("a {width} x {h} frame into {} x {}", out.width(), out.height()));
         }
         let t0 = std::time::Instant::now();
         if let Some(p) = self.profiler.get_mut().unwrap().as_mut() {
@@ -1499,12 +1672,24 @@ impl DreamRenderer {
         }
         self.shell_live = drawn.is_some() && self.level.is_some() && step.shell > 0.0;
         let ops = self.run(width, given, step, padded(width), padded(sw))?;
+        if step.nca > 0.0 {
+            self.record_nca(encoder, step);
+        }
         let copy = |rows: u32, offset: u64| wgpu::TexelCopyBufferInfo {
             buffer: &self.img,
             layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(rows * 4), rows_per_image: None },
         };
         let size = |width: u32, height: u32| wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-        encoder.copy_texture_to_buffer(picture.as_image_copy(), copy(padded(width), 0), size(width, h));
+        if let Some(picture) = picture {
+            encoder.copy_texture_to_buffer(picture.as_image_copy(), copy(padded(width), 0), size(width, h));
+        }
+        let outside = match out {
+            Out::Psx { depth, .. } => Some(depth),
+            Out::Texture(_) => None,
+        };
+        // Marching into a camera's depth, the march's hits are its size.
+        let (mw, mh) = if outside.is_some() { (width, h) } else { (self.cfg.max_width * up, h * up) };
+        self.shell.fit_marched(&self.device, mw, mh);
         if let (Some(view), Some(level)) = (drawn, self.level.as_ref()) {
             // The level drawn (pushed out by the height first, if it is), then the frame's work.
             let displaced = step.displace > 0.0;
@@ -1527,7 +1712,7 @@ impl DreamRenderer {
                             p.stamp(enc, label);
                         }
                     };
-                    self.shell.record(&self.queue, enc, &view, self.cfg.up, sw, sh, level, step.height_max * step.shell, step.shell, self.at.results + HEIGHT_BOUND * 2, step.shell_taper, self.at.page_height, self.cfg.page_res, step.shell_smooth, step.shell_far, step.shell_pixel, step.shell_lean, step.shell_follow, &mut stamp);
+                    self.shell.record(&self.queue, enc, &view, self.cfg.up, sw, sh, level, step.height_max * step.shell, step.shell, self.at.results + HEIGHT_BOUND * 2, step.shell_taper, self.at.page_height, self.cfg.page_res, step.shell_smooth, step.shell_far, step.shell_pixel, step.shell_lean, step.shell_follow, outside, &mut stamp);
                     let rows = point_rows(sw);
                     for (k, t) in [&self.shell.tris, &self.shell.looks].into_iter().enumerate() {
                         enc.copy_texture_to_buffer(t.as_image_copy(), copy(rows, (self.shell_at + k as u32 * rows * sh) as u64 * 4), size(sw, sh));
@@ -1552,7 +1737,10 @@ impl DreamRenderer {
         if let (Given::Gpu { .. }, Some(f)) = (given, self.feedback.as_mut()) {
             f.copy(encoder, &self.seen_buf);
         }
-        encoder.copy_buffer_to_texture(copy(padded(sw), self.shown_at as u64 * 4), out.as_image_copy(), size(sw, h * up));
+        match out {
+            Out::Texture(out) => encoder.copy_buffer_to_texture(copy(padded(sw), self.shown_at as u64 * 4), out.as_image_copy(), size(sw, h * up)),
+            Out::Psx { colour, format, .. } => self.blit(encoder, width, colour, format),
+        }
         if let Some(p) = self.profiler.get_mut().unwrap().as_mut() {
             p.stamp(encoder, "copies");
             p.end(encoder);
@@ -1699,7 +1887,53 @@ impl DreamRenderer {
         };
         self.owner[p] = Some(face);
         self.page_of.insert(face, p as u32);
+        if let Some(n) = self.nca.as_mut() {
+            n.reset(p as u32);
+        }
+        self.nca_dirty = true;
         Some(p as u32)
+    }
+
+    /// Grow the pages with the neural cellular automata in `path` (nca::read_models; `r` cells a
+    /// page side) while `Step::nca` is above 0: returns their names, for `set_nca_models`.
+    pub fn set_nca(&mut self, path: &Path, r: u32) -> Result<Vec<String>> {
+        let models = nca::read_models(path)?;
+        self.nca_names = models.iter().map(|m| m.0.clone()).collect();
+        self.nca = Some(nca::Nca::new(&self.device, &self.queue, &models, r, self.cfg.max_pages, &self.atlas, &self.mem));
+        self.nca_dirty = true;
+        Ok(self.nca_names.clone())
+    }
+
+    /// The automata (by index in `set_nca`'s names, -1 for none) for walls and for floors and
+    /// ceilings; the pages changing start afresh.
+    pub fn set_nca_models(&mut self, walls: i32, floors: i32) {
+        if self.nca_models == [walls, floors] {
+            return;
+        }
+        self.nca_models = [walls, floors];
+        if let Some(n) = self.nca.as_mut() {
+            n.reset_all();
+        }
+        self.nca_dirty = true;
+    }
+
+    /// The automata's steps on the pages in sight (the rest kept), and their colour and height
+    /// laid on the pages.
+    fn record_nca(&mut self, encoder: &mut wgpu::CommandEncoder, step: &Step) {
+        let Some(n) = self.nca.as_mut() else { return };
+        if self.nca_dirty {
+            let models = self.nca_models;
+            n.set_pages(&self.queue, &self.owner, &self.page_of, |f| models[(f[0] / 2 == 1) as usize]);
+            self.nca_dirty = false;
+        }
+        let active: Vec<u32> = self.view_pages.iter().map(|&p| p as u32).collect();
+        let mut all: Vec<u32> = self.page_of.values().copied().collect();
+        all.sort();
+        let r = self.cfg.page_res;
+        n.record(&self.queue, encoder, &active, &all, step.nca_steps, 0.5, step.nca, step.nca_lift, step.psx, r, self.at.page_height, r / HEIGHT_CELL);
+        if let Some(p) = self.profiler.get_mut().unwrap().as_mut() {
+            p.stamp(encoder, "nca");
+        }
     }
 
     /// The face a page is given to (with `encode_view`), if any.
@@ -1715,6 +1949,10 @@ impl DreamRenderer {
     /// Forget every page's dream and the screen layer's, and which face has which page.
     pub fn wake(&mut self) -> Result<()> {
         self.clears.extend(0..self.cfg.max_pages);
+        if let Some(n) = self.nca.as_mut() {
+            n.reset_all();
+        }
+        self.nca_dirty = true;
         self.page_of.clear();
         self.owner.iter_mut().for_each(|o| *o = None);
         self.write_page_table();
@@ -2131,10 +2369,11 @@ impl DreamRenderer {
         if n_slots > 0 || (still && !self.view_pages.is_empty()) {
             for (oi, (scale, crop, size, roll, lr, fine, decay_at)) in octaves.into_iter().enumerate() {
                 let net = step.net.min(self.nets.len() - 1);
-                let key = (size[1], size[0], fine, net);
+                let class = self.class_row(net, step.class);
+                let key = (size[1], size[0], fine, net, class);
                 if !self.plans.contains_key(&key) {
                     let layers = if fine { self.nets[net].fine_layers.clone() } else { self.nets[net].layers.clone() };
-                    let (plan, _) = self.plan(net, size[1], size[0], &layers);
+                    let (plan, _) = self.plan(net, size[1], size[0], &layers, class);
                     self.plans.insert(key, plan);
                 }
                 let plan = &self.plans[&key];
@@ -2160,6 +2399,10 @@ impl DreamRenderer {
                 let px = size[0] * size[1];
                 ops.push((Kernel::Reduce, Params { m: px, a_off: gx, b_off: self.at.lookup, c_off: self.at.partials, x0: 1, ..Default::default() }, [PARTIALS, 1, 1]));
                 ops.push((Kernel::ReduceFinish, Params { m: PARTIALS, a_off: self.at.partials, c_off: self.at.results + mean * 2, ..Default::default() }, [1, 1, 1]));
+                if let (true, Some(c), Some(t)) = (class, &self.nets[net].classes, plan.last) {
+                    let p = Params { m: t.h * t.w, k: t.c, a_off: self.at.acts + t.off, b_off: c.all, x0: c.bias, x1: self.class_rows[net].unwrap_or(0), x2: c.count, x3: self.at.results + SURE * 2, x4: fine as u32, c_off: self.at.results + mean * 2, ..Default::default() };
+                    ops.push((Kernel::Confidence, p, [1, 1, 1]));
+                }
                 if lamp {
                     let g = [size[0].div_ceil(16), size[1].div_ceil(16), 1];
                     ops.push((Kernel::ShadeBack, Params { m: size[1], n: size[0], a_off: gx, bias_off: self.at.shade, x5: roll[0], x6: roll[1], ..Default::default() }, g));
@@ -2272,7 +2515,7 @@ impl DreamRenderer {
             f32::from_bits(self.shell_at + rows * sh),
             f32::from_bits(rows),
             step.height_max * step.shell,
-            0.0,
+            (step.nca > 0.0 && self.nca.is_some()) as u32 as f32,
             step.show_shell as u32 as f32,
             f32::from_bits(self.at.views),
             f32::from_bits(if creatures { self.at.creatures } else { 0 }),
@@ -2287,12 +2530,12 @@ impl DreamRenderer {
             c_off: self.shown_at,
             b_rs: shown_rows,
             f0: step.sharpness,
-            f2: if self.reprojecting { step.show_shade } else { 0.0 },
+            f2: if self.reprojecting || (step.nca > 0.0 && self.nca.is_some()) { step.show_shade } else { 0.0 },
             g2: step.show_wrap,
             // The lights, where each pixel's lit from where they are (else the eye's).
             x3: if self.lit_ready && step.lights { self.at.lights } else { 0 },
             x4: self.at.lit,
-            flags: frame.flags | if step.show_height && self.reprojecting { SHOW_HEIGHT } else { 0 },
+            flags: frame.flags | if step.show_height && self.reprojecting { SHOW_HEIGHT } else { 0 } | if step.psx { PSX } else { 0 },
             ..frame
         };
         if self.shell_live {
@@ -2392,9 +2635,9 @@ impl DreamRenderer {
         let mut slot = [0.0f32; LAMP_SLOT];
         slot[..6].copy_from_slice(&lamp);
         self.queue.write_buffer(&self.mem, self.at.shade as u64 * 4, bytemuck::cast_slice(&slot));
-        let key = (h, width, false, 0);
+        let key = (h, width, false, 0, false);
         if !self.plans.contains_key(&key) {
-            let (plan, _) = self.plan(0, h, width, &self.nets[0].layers.clone());
+            let (plan, _) = self.plan(0, h, width, &self.nets[0].layers.clone(), false);
             self.plans.insert(key, plan);
         }
         let plan = &self.plans[&key];
@@ -2547,7 +2790,7 @@ impl DreamRenderer {
     /// itself, its milliseconds totalled by kernel (by shape too with PROFILE_SHAPES set).
     pub fn profile(&mut self, h: u32, w: u32, layers: &[&str]) -> Result<Vec<(String, f32, usize)>> {
         let layers = self.nets[0].indices(layers)?;
-        let (plan, _) = self.plan(0, h, w, &layers);
+        let (plan, _) = self.plan(0, h, w, &layers, false);
         self.submit(&plan.ops, None)?;
         let mut total: HashMap<String, (f32, usize)> = HashMap::new();
         let by_shape = std::env::var_os("PROFILE_SHAPES").is_some();
@@ -2571,7 +2814,7 @@ impl DreamRenderer {
     /// `wanted` layers, HWC.
     pub fn input_gradient(&mut self, rgb: &[f32], h: u32, w: u32, layers: &[&str], wanted: &[&str]) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
         let layers = self.nets[0].indices(layers)?;
-        let (plan, outs) = self.plan(0, h, w, &layers);
+        let (plan, outs) = self.plan(0, h, w, &layers, false);
         self.queue.write_buffer(&self.mem, (self.at.acts + plan.input.off) as u64 * 4, bytemuck::cast_slice(rgb));
         self.submit(&plan.ops, None)?;
         let g = self.read_mem(self.at.grads + plan.input.off, h * w * 3)?;
@@ -2582,5 +2825,44 @@ impl DreamRenderer {
         }
         // The objective's mean square has a factor 2 the seed leaves out.
         Ok((g.iter().map(|v| v * 2.0).collect(), acts))
+    }
+
+    /// For checks: the gradient of `class`'s logit with respect to `rgb` (HWC, 0..1, h x w), and
+    /// how sure of it the network is (dream.wgsl confidence's softmax).
+    pub fn class_gradient(&mut self, rgb: &[f32], h: u32, w: u32, class: u32) -> Result<(Vec<f32>, f32)> {
+        if !self.class_row(0, class as i32) {
+            return Err(format!("no classifier, or no class {class}"));
+        }
+        let (plan, outs) = self.plan(0, h, w, &[], true);
+        self.queue.write_buffer(&self.mem, (self.at.acts + plan.input.off) as u64 * 4, bytemuck::cast_slice(rgb));
+        self.submit(&plan.ops, None)?;
+        // The seed leaves out the mean pooling's 1 / pixels.
+        let t = outs[self.nets[0].order.len() - 1];
+        let g = self.read_mem(self.at.grads + plan.input.off, h * w * 3)?;
+        // confidence divides 1 by 1 - p.
+        let c = self.nets[0].classes.as_ref().unwrap();
+        let slot = self.at.results + (RESULTS - 2) * 2;
+        self.queue.write_buffer(&self.mem, slot as u64 * 4, bytemuck::cast_slice(&[1.0f32, 1.0]));
+        let p = Params { m: t.h * t.w, k: t.c, a_off: self.at.acts + t.off, b_off: c.all, x0: c.bias, x1: class, x2: c.count, x3: self.at.results + SURE * 2, c_off: slot, ..Default::default() };
+        self.submit(&[(Kernel::Confidence, p, [1, 1, 1])], None)?;
+        let sure = 1.0 - 1.0 / self.read_mem(slot, 1)?[0];
+        Ok((g.iter().map(|v| v / (t.h * t.w) as f32).collect(), sure))
+    }
+
+    /// Whether network `net` dreams towards `class` (< 0: none), its row of the classifier put
+    /// in `mem` if it isn't already.
+    fn class_row(&mut self, net: usize, class: i32) -> bool {
+        let Some(Classifier { w, row: at, count, .. }) = &self.nets[net].classes else { return false };
+        // A row a class, a weight for each of the last block's channels.
+        let channels = w.len() / *count as usize;
+        if class < 0 || class as u32 >= *count {
+            return false;
+        }
+        if self.class_rows[net] != Some(class as u32) {
+            let row = &w[class as usize * channels..(class as usize + 1) * channels];
+            self.queue.write_buffer(&self.mem, *at as u64 * 4, bytemuck::cast_slice(row));
+            self.class_rows[net] = Some(class as u32);
+        }
+        true
     }
 }

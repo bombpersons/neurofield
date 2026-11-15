@@ -299,6 +299,8 @@ pub(crate) struct Shell {
     /// depth test, and `resolve` (resolve.wgsl) finishing them into `tris` and `looks`.
     marched: wgpu::TextureView,
     marched_bind: wgpu::BindGroup,
+    marched_layout: wgpu::BindGroupLayout,
+    marched_size: (u32, u32),
     resolve: wgpu::RenderPipeline,
     gather: wgpu::Sampler,
     smooth0_layout: wgpu::BindGroupLayout,
@@ -601,7 +603,7 @@ impl Shell {
             cache: None,
         });
         let lean_uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dream shell lean"), size: LEAN_UNIFORM, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Shell { pipeline, layout, inner, caps, homes, bind: None, creases, toward_layout, crease_layout, toward: None, mip_pages, smooth_faces, smooth_layout, smooth0_layout, smooth_bound, mips, near, far, smoothing: None, pages, uniform, tris, looks, depth, vertices: None, bound: None, textures: None, sampler, heights, gather, resolve, marched, marched_bind, lean_pipeline, lean_layout, lean_uniform, lean: None }
+        Shell { pipeline, layout, inner, caps, homes, bind: None, creases, toward_layout, crease_layout, toward: None, mip_pages, smooth_faces, smooth_layout, smooth0_layout, smooth_bound, mips, near, far, smoothing: None, pages, uniform, tris, looks, depth, vertices: None, bound: None, textures: None, sampler, heights, gather, resolve, marched, marched_bind, marched_layout, marched_size: (max_width, height), lean_pipeline, lean_layout, lean_uniform, lean: None }
     }
 
     /// The tetrahedra of the level's triangles' prisms (`tris`, as `level` was built from), the
@@ -798,7 +800,33 @@ impl Shell {
     /// corner leaned `lean` of the way (0 none, 1 all) along the way it's been looked at from,
     /// which turns `follow` of the way to the eye a frame where it's in sight (lean.wgsl).
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, view: &View, up: u32, width: u32, height: u32, level: &Level, limit: f32, gain: f32, bound: u32, taper: f32, page_height: u32, page_res: u32, smooth: f32, far: f32, pixel: f32, lean: f32, follow: f32, stamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, &str)) {
+    /// The march's hits made `width` by `height`: as big as the frame at most, or (marching
+    /// into an outside depth) the same size as it.
+    pub fn fit_marched(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if self.marched_size == (width, height) {
+            return;
+        }
+        self.marched_size = (width, height);
+        self.marched = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("dream shell marched"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Uint,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        self.marched_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dream shell marched"),
+            layout: &self.marched_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.marched) }],
+        });
+    }
+
+    pub fn record(&self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, view: &View, up: u32, width: u32, height: u32, level: &Level, limit: f32, gain: f32, bound: u32, taper: f32, page_height: u32, page_res: u32, smooth: f32, far: f32, pixel: f32, lean: f32, follow: f32, outside: Option<&wgpu::TextureView>, stamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, &str)) {
         let a = view.axes;
         let f = |x: f32| x.to_bits();
         let u: [u32; 32] = [
@@ -896,10 +924,11 @@ impl Shell {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("dream shell"),
             color_attachments: &[target(&self.marched)],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                stencil_ops: None,
+            // Into an outside depth (a camera's, `fit_marched` to its size) the march meets
+            // what's drawn there already and is met by what's drawn after.
+            depth_stencil_attachment: Some(match outside {
+                Some(view) => wgpu::RenderPassDepthStencilAttachment { view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None },
+                None => wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }), stencil_ops: None },
             }),
             timestamp_writes: None,
             occlusion_query_set: None,

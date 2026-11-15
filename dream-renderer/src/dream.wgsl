@@ -45,6 +45,11 @@ const FILL: u32 = 16u;
 const SHOW_HEIGHT: u32 = 32u;
 // prepare: the network's input shaded by the dream lamp from the dreamed height (below).
 const LAMP: u32 = 64u;
+// seed: a class's logit's gradient, its row of the classifier (a_off, k channels) at every
+// pixel (the classifier reads their mean; the 1 / pixels left out).
+const CLASS: u32 = 128u;
+// show: 15-bit colour with the PS1's 4x4 ordered dither (psx-bevy's psx_material.wesl).
+const PSX: u32 = 256u;
 // Texels of a page a side to each of its height's.
 const HEIGHT_CELL: u32 = 2u;
 // The dream lamp's slots (one an octave: its direction along the page and off it, the ambient
@@ -374,10 +379,10 @@ fn col2im(@builtin(global_invocation_id) gid: vec3<u32>) {
     mem[p.c_off + ipx * p.c_rs + c] += sum;
 }
 
-// ---- Max pooling (3x3) ----------------------------------------------------------------------
+// ---- Max pooling (x3 by x3) -------------------------------------------------------------------
 // In: x1 by x2 pixels at a_off, row stride a_rs, channels x0; out: m by n at c_off, contiguous;
-// the winner's input pixel at b_off (same layout as out). Stride x4, padding x5 (padding never
-// wins, as PyTorch's -inf).
+// the winner's input pixel at b_off (same layout as out). Window x3 across, stride x4, padding
+// x5 (padding never wins, as PyTorch's -inf).
 
 @compute @workgroup_size(64)
 fn maxpool(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -388,10 +393,11 @@ fn maxpool(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x0 = i32((px % p.n) * p.x4) - i32(p.x5);
     var best = -3.4e38;
     var at = 0u;
-    for (var dy = 0; dy < 3; dy++) {
+    let k = i32(p.x3);
+    for (var dy = 0; dy < k; dy++) {
         let y = y0 + dy;
         if (y < 0 || y >= i32(p.x1)) { continue; }
-        for (var dx = 0; dx < 3; dx++) {
+        for (var dx = 0; dx < k; dx++) {
             let x = x0 + dx;
             if (x < 0 || x >= i32(p.x2)) { continue; }
             let i = u32(y) * p.x2 + u32(x);
@@ -412,9 +418,10 @@ fn maxpool_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iy = i32(ipx / p.x2) + i32(p.x5);
     let ix = i32(ipx % p.x2) + i32(p.x5);
     let s = i32(p.x4);
-    let lo_y = max((iy - 2 + s - 1) / s, 0);
+    let k = i32(p.x3);
+    let lo_y = max((iy - (k - 1) + s - 1) / s, 0);
     let hi_y = min(iy / s, i32(p.m) - 1);
-    let lo_x = max((ix - 2 + s - 1) / s, 0);
+    let lo_x = max((ix - (k - 1) + s - 1) / s, 0);
     let hi_x = min(ix / s, i32(p.n) - 1);
     var sum = 0.0;
     for (var oy = lo_y; oy <= hi_y; oy++) {
@@ -535,7 +542,66 @@ fn reduce_finish(@builtin(local_invocation_id) lid: vec3<u32>) {
 @compute @workgroup_size(64)
 fn seed(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = row_of(gid) * 4096u + gid.x;
-    if (i < p.m) { mem[p.c_off + i] += mem[p.a_off + i] / max(mem[p.b_off], 1e-12); }
+    if (i >= p.m) { return; }
+    if ((p.flags & CLASS) != 0u) {
+        mem[p.c_off + i] += mem[p.a_off + i % p.k];
+        return;
+    }
+    mem[p.c_off + i] += mem[p.a_off + i] / max(mem[p.b_off], 1e-12);
+}
+
+// How sure the network is of the class dreamed towards, and its steps shrunk by how unsure it
+// still is: the last block's activations (a_off, m pixels of k channels, HWC) averaged, the
+// classifier (b_off: x2 classes' rows of k; their biases at x0) on them, softmax; p of class
+// x1. The mean |gradient| the steps are divided by (c_off: sum, count) is divided by 1 - p, so
+// a class's dream stops pushing once it's recognisable, rather than for ever, more contrast
+// always scoring higher. p is kept at x3; with x4 set, that kept p (the whole view's, from the
+// coarse octave) is used rather than worked out (the fine octave's pieces each see too little to
+// be sure). One workgroup; k at most 2048, x2 at most 1024.
+var<workgroup> pooled: array<f32, 2048>;
+var<workgroup> scores: array<f32, 1024>;
+
+@compute @workgroup_size(256)
+fn confidence(@builtin(local_invocation_index) li: u32) {
+    if (p.x4 != 0u) {
+        if (li == 0u) { mem[p.c_off] /= max(1.0 - mem[p.x3], 1e-4); }
+        return;
+    }
+    for (var c = li; c < p.k; c += 256u) {
+        var s = 0.0;
+        for (var i = 0u; i < p.m; i++) { s += mem[p.a_off + i * p.k + c]; }
+        pooled[c] = s / f32(max(p.m, 1u));
+    }
+    workgroupBarrier();
+    var most = -3.0e38;
+    for (var j = li; j < p.x2; j += 256u) {
+        var z = mem[p.x0 + j];
+        let row = p.b_off + j * p.k;
+        for (var c = 0u; c < p.k; c++) { z += mem[row + c] * pooled[c]; }
+        scores[j] = z;
+        most = max(most, z);
+    }
+    red[li] = vec2<f32>(most, 0.0);
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { red[li].x = max(red[li].x, red[li + s].x); }
+        workgroupBarrier();
+    }
+    let top = red[0].x;
+    workgroupBarrier();
+    var sum = 0.0;
+    for (var j = li; j < p.x2; j += 256u) { sum += exp(scores[j] - top); }
+    red[li] = vec2<f32>(sum, 0.0);
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { red[li].x += red[li + s].x; }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        let sure = exp(scores[p.x1] - top) / max(red[0].x, 1e-30);
+        mem[p.x3] = sure;
+        mem[p.c_off] /= max(1.0 - sure, 1e-4);
+    }
 }
 
 // ---- The dream layer ----------------------------------------------------------------------
@@ -805,6 +871,10 @@ fn seen(bx: u32, by: u32, off: vec2<f32>, at: vec2<u32>, block: bool) -> Seen {
     // The dream changes the wall's own colour, so it's lit as the wall is.
     let light = light_on(at_pic.x, at_pic.y);
     out.colour += d.rgb * out.strength * light;
+    // Grown by the automata (globals 6, nca.rs): the page's colour is the wall's own.
+    if (mem[6] > 0.0 && d.a > 0.0) {
+        out.colour = d.rgb * light;
+    }
     out.colour += layer.rgb * light;
     return out;
 }
@@ -1222,6 +1292,10 @@ fn shell_seen(at: vec2<u32>) -> ShellSeen {
         var lit = vec3<f32>(1.0);
         if (bitcast<u32>(mem[0]) != 0u && mem[1] > 0.0) { lit = mix(vec3<f32>(1.0), light, mem[1]); }
         s.colour += (d.rgb * s.strength + layer.rgb) * lit;
+        // Grown by the automata (globals 6, nca.rs): the page's colour is the wall's own.
+        if (mem[6] > 0.0 && d.a > 0.0) {
+            s.colour = mix(min(d.rgb * light, vec3<f32>(1.0)), fog_colour, fog);
+        }
     }
     out.seen = s;
     return out;
@@ -1309,6 +1383,12 @@ fn show(@builtin(global_invocation_id) gid: vec3<u32>) {
             let lit = 0.55 + 0.45 * dot(normalize(vec3<f32>(-g, 1.0)), normalize(vec3<f32>(0.45, 0.55, 0.7)));
             c = vec3<f32>(clamp(0.5 + 0.5 * h / max(mem[5], 1e-6), 0.0, 1.0) * lit);
         }
+    }
+    if ((p.flags & PSX) != 0u) {
+        var matrix = array<f32, 16>(-4.0, 0.0, -3.0, 1.0, 2.0, -2.0, 3.0, -1.0, -3.0, 1.0, -4.0, 0.0, 3.0, -1.0, 2.0, -2.0);
+        let d = (gid.xy / p.x2) % vec2<u32>(4u);
+        let q = floor(clamp(round(c * 255.0) + matrix[d.y * 4u + d.x], vec3<f32>(0.0), vec3<f32>(255.0)) / 8.0);
+        c = (q * 8.0 + floor(q / 4.0)) / 255.0;
     }
     img[p.c_off + gid.y * p.b_rs + gid.x] = pack4x8unorm(vec4<f32>(c, 1.0));
 }
