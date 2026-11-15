@@ -8,6 +8,7 @@ struct U {
     pos: vec4<f32>,
     // The view's axes as rows: right, down, forward.
     r0: vec4<f32>,
+    // (r1.w: the halvings' stop, of a pixel; shell.rs record's `pixel`.)
     r1: vec4<f32>,
     r2: vec4<f32>,
     // Focal length in shown pixels, half the shown width and height, the fog's far end.
@@ -526,8 +527,12 @@ fn fs(in: Out) -> Marched {
         t1 = t.y;
         w = last;
     }
+    // Halved no finer than u.r1.w of a pixel's width (0: all HALVINGS), along the line of
+    // sight, where it matters as finely as the eye has it and no finer.
+    let fine = u.r1.w / (u.k.x * length(d));
     if (t1 > t0) {
         for (var i = 0u; i < HALVINGS; i++) {
+            if (t1 - t0 < fine * t0) { break; }
             let tm = 0.5 * (t0 + t1);
             let wm = place_at(tm);
             if (above_place(wm) <= 0.0) {

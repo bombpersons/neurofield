@@ -261,6 +261,10 @@ pub struct Step {
     /// And smoothed more with the distance, up to two levels more: all of it at 4 / this tiles
     /// off (0: none), where the dream's laid thinner.
     pub shell_far: f32,
+    /// The march stops halving where the stretch of the line of sight it's narrowed the
+    /// relief to is under this much of a pixel's width there (0: always all 8 halvings, the
+    /// finest).
+    pub shell_pixel: f32,
     /// The shell's hit shown alone, in grey by its height and lit by its slope (red: none).
     pub show_shell: bool,
     /// The torch (at the eye)'s glint off the surface: how bright (0: none), how far it
@@ -292,7 +296,7 @@ pub struct Step {
 
 impl Default for Step {
     fn default() -> Step {
-        Step { lr: 0.012, lr_fine: 0.008, decay: 0.002, limit: 0.6, jitter: 4, jitter_fine: 6, sharpness: 1.0, colour: 0.25, colour_blur: 3, grad_blur: 0.0, take_over: 0.01, own_max: 1.0, relief: 0.0, relief_rate: 0.05, remember_every: 4, height: 0.0, height_max: 0.15, height_blur: 3, height_spread: 1, height_power: 1.0, height_from_colour: 0.0, height_decay: 0.0, height_centred: true, lamp: 1.0, lamp_ambient: 0.3, shade_only_every: 3, show_shade: 1.0, show_wrap: 0.5, lights: true, dream_lit: 1.0, show_height: false, displace: 0.0, shell: 0.0, shell_taper: 0.15, shell_smooth: 0.0, shell_far: 0.0, show_shell: false, glint: 0.0, torch_reach: 6.0, rough_dry: 0.6, rough_wet: 0.2, own_picture: true, scale: 1.0, fine_scale: 3.0, net: 0, coarse_every: 1, fine_split: 2, fine_every: 1, fine_offset: 0 }
+        Step { lr: 0.012, lr_fine: 0.008, decay: 0.002, limit: 0.6, jitter: 4, jitter_fine: 6, sharpness: 1.0, colour: 0.25, colour_blur: 3, grad_blur: 0.0, take_over: 0.01, own_max: 1.0, relief: 0.0, relief_rate: 0.05, remember_every: 4, height: 0.0, height_max: 0.15, height_blur: 3, height_spread: 1, height_power: 1.0, height_from_colour: 0.0, height_decay: 0.0, height_centred: true, lamp: 1.0, lamp_ambient: 0.3, shade_only_every: 3, show_shade: 1.0, show_wrap: 0.5, lights: true, dream_lit: 1.0, show_height: false, displace: 0.0, shell: 0.0, shell_taper: 0.15, shell_smooth: 0.0, shell_far: 0.0, shell_pixel: 0.0, show_shell: false, glint: 0.0, torch_reach: 6.0, rough_dry: 0.6, rough_wet: 0.2, own_picture: true, scale: 1.0, fine_scale: 3.0, net: 0, coarse_every: 1, fine_split: 2, fine_every: 1, fine_offset: 0 }
     }
 }
 
@@ -1516,7 +1520,7 @@ impl DreamRenderer {
                             p.stamp(enc, label);
                         }
                     };
-                    self.shell.record(&self.queue, enc, &view, self.cfg.up, sw, sh, level, step.height_max * step.shell, step.shell, self.at.results + HEIGHT_BOUND * 2, step.shell_taper, self.at.page_height, self.cfg.page_res, step.shell_smooth, step.shell_far, &mut stamp);
+                    self.shell.record(&self.queue, enc, &view, self.cfg.up, sw, sh, level, step.height_max * step.shell, step.shell, self.at.results + HEIGHT_BOUND * 2, step.shell_taper, self.at.page_height, self.cfg.page_res, step.shell_smooth, step.shell_far, step.shell_pixel, &mut stamp);
                     let rows = point_rows(sw);
                     for (k, t) in [&self.shell.tris, &self.shell.looks].into_iter().enumerate() {
                         enc.copy_texture_to_buffer(t.as_image_copy(), copy(rows, (self.shell_at + k as u32 * rows * sh) as u64 * 4), size(sw, sh));

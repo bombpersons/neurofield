@@ -689,15 +689,16 @@ impl Shell {
     /// page (at `bound` in mem) times `gain`, within `limit`, against the pages' heights (at
     /// `page_height` in mem, pages `page_res` texels a side) times `gain`, tapered to nothing
     /// over `taper` towards open edges; smoothed `smooth` levels (each twice the last's size,
-    /// 0 none), and more far off by `far` (two levels more at 4 / `far` tiles).
+    /// 0 none), and more far off by `far` (two levels more at 4 / `far` tiles); the halvings
+    /// stopped once the hit's narrowed to `pixel` of a pixel's width (0: all of them).
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, view: &View, up: u32, width: u32, height: u32, level: &Level, limit: f32, gain: f32, bound: u32, taper: f32, page_height: u32, page_res: u32, smooth: f32, far: f32, stamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, &str)) {
+    pub fn record(&self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, view: &View, up: u32, width: u32, height: u32, level: &Level, limit: f32, gain: f32, bound: u32, taper: f32, page_height: u32, page_res: u32, smooth: f32, far: f32, pixel: f32, stamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, &str)) {
         let a = view.axes;
         let f = |x: f32| x.to_bits();
         let u: [u32; 32] = [
             f(view.pos[0]), f(view.pos[1]), f(view.pos[2]), f(smooth.max(0.0)),
             f(a[0][0]), f(a[0][1]), f(a[0][2]), f(far.max(0.0)),
-            f(a[1][0]), f(a[1][1]), f(a[1][2]), 0,
+            f(a[1][0]), f(a[1][1]), f(a[1][2]), f(pixel.max(0.0)),
             f(a[2][0]), f(a[2][1]), f(a[2][2]), 0,
             f(view.focal * up as f32), f(width as f32 / 2.0), f(height as f32 / 2.0), f(view.fog[1]),
             f(limit), f(gain), bound, f(taper),

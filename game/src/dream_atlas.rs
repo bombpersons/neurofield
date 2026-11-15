@@ -234,7 +234,7 @@ impl DreamAtlas {
             net_names,
             torch_at: [0.22, 0.2, 0.3],
             // The relief shell-mapped (docs/shell_relief.md), deep and in as far as out.
-            step: Step { fine_split: 4, fine_every: 2, relief: 0.0, height: 0.001, height_max: 0.5, shell: 1.0, shell_smooth: 3.0, shell_far: 0.5, glint: 0.2, rough_dry: 0.8, rough_wet: 0.4, ..Step::default() },
+            step: Step { fine_split: 4, fine_every: 2, relief: 0.0, height: 0.001, height_max: 0.5, shell: 1.0, shell_smooth: 3.0, shell_far: 0.5, shell_pixel: 0.25, glint: 0.2, rough_dry: 0.8, rough_wet: 0.4, ..Step::default() },
             settle: false,
             mode: DreamMode::Still,
             drawn: None,
@@ -814,6 +814,7 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
         ui.add(egui::Slider::new(&mut a.step.shell, 0.0..=2.0).text("the relief marched in shells over the flat walls (0: none)"));
         ui.add(egui::Slider::new(&mut a.step.shell_smooth, 0.0..=6.0).text("the relief smoothed (levels, each twice as broad; 0: as dreamed)"));
         ui.add(egui::Slider::new(&mut a.step.shell_far, 0.0..=2.0).text("and smoother far off (two levels more at 4 / this tiles; 0: none)"));
+        ui.add(egui::Slider::new(&mut a.step.shell_pixel, 0.0..=1.0).text("the relief found to this much of a pixel (0: as finely as it goes)"));
         ui.checkbox(&mut a.step.show_shell, "show the shells' relief alone (grey by height, red: nothing met)");
         ui.checkbox(&mut a.step.own_picture, "the level drawn by the dream renderer (not the PS1 picture) under the dream");
         ui.label("the torch, held (tiles from the eye):");

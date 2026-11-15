@@ -1386,6 +1386,9 @@ fn main() {
         if let Some(r) = opts.get("dream-shell-far") {
             atlas.step.shell_far = r.parse().expect("--dream-shell-far 0.5 (smoothed two levels more by 4 / this tiles off; 0: none)");
         }
+        if let Some(r) = opts.get("dream-shell-pixel") {
+            atlas.step.shell_pixel = r.parse().expect("--dream-shell-pixel 0.25 (the relief found to this much of a pixel; 0: as finely as it goes)");
+        }
         atlas.step.show_shell = show_shell;
         atlas.step.height_centred = !uncentred;
         if let Some(r) = opts.get("dream-displace") {

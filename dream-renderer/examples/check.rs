@@ -517,7 +517,9 @@ fn gbuffer_check(dr: &mut DreamRenderer, input: &wgpu::Texture, output: &wgpu::T
 
 /// examples' `Step` for the shell: the march on, nothing dreamed.
 fn shell_step(limit: f32) -> Step {
-    Step { lr: 0.0, lr_fine: 0.0, shell: 1.0, height_max: limit, ..Step::default() }
+    // SHELL_PIXEL: the halvings' stop (Step::shell_pixel), to see what it costs in accuracy.
+    let shell_pixel = std::env::var("SHELL_PIXEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    Step { lr: 0.0, lr_fine: 0.0, shell: 1.0, height_max: limit, shell_pixel, ..Step::default() }
 }
 
 /// shell.wgsl's march done finely on the CPU for the shown pixel (x, y): the nearest (view
