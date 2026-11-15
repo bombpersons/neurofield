@@ -12,8 +12,8 @@ use crate::level::{normal, Face, Level, LevelTri, View};
 use std::collections::HashMap;
 
 /// A tetrahedron's corner: on its triangle, the way that corner is pushed (`Pushed::dir`),
-/// which way (-1 in, +1 out), the most it's pushed (`Pushed::cap`), the level triangle and which
-/// of its prism's tetrahedra.
+/// which way (-1 in, +1 out), the most it's pushed (`Pushed::cap`), the level triangle, which
+/// of its prism's tetrahedra and its welded corner (whose lean, lean.wgsl, it's pushed by too).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Corner {
@@ -23,17 +23,75 @@ struct Corner {
     cap: f32,
     tri: u32,
     tet: u32,
+    weld: u32,
 }
 
 /// vec4s of a triangle in the march's buffer (shell.wgsl TRI): its corners (the normal in their
 /// w); the corners' order by welded place, its texture, the open edges the height tapers to and
 /// the creases; its corners' places on the texture; their light; their torch albedo; the way
 /// each corner is pushed and the most it's pushed; for each crease, the points along it where
-/// its height's met and where they are in toward.
-const TRI: u32 = 18;
+/// its height's met and where they are in toward; its corners' welded corners (lean.wgsl).
+const TRI: u32 = 19;
 
 /// The uniform's size (shell.wgsl U).
 const UNIFORM: u64 = 128;
+
+/// The lean's uniform's size (lean.wgsl L).
+const LEAN_UNIFORM: u64 = 96;
+
+/// The most walls a welded corner leans between (lean.wgsl's base): one with more doesn't lean.
+const LEAN_WALLS: usize = 4;
+
+/// Each corner's welded corner (as `key`), and each welded corner's place, the unit mean of the
+/// ways it's pushed with that mean's length, and the distinct normals of the walls meeting there
+/// that it's pushed off (LEAN_WALLS at most, w 1), and the shortest edge from it (its place's w;
+/// 0 where more walls meet, which doesn't lean; lean.wgsl's base).
+fn welds(tris: &[LevelTri], pushes: &[Pushed]) -> (Vec<[u32; 3]>, Vec<f32>) {
+    let corners = corners_of(tris);
+    let ns: Vec<[f32; 3]> = corners.iter().map(|c| normal(c).0).collect();
+    let mut ids: HashMap<[i64; 3], u32> = HashMap::new();
+    let mut sums: Vec<([f32; 3], [f32; 3], f32)> = Vec::new();
+    let mut walls: Vec<Vec<[f32; 3]>> = Vec::new();
+    let mut shortest: Vec<f32> = Vec::new();
+    let mut id = vec![[0u32; 3]; corners.len()];
+    for (i, (c, p)) in corners.iter().zip(pushes).enumerate() {
+        for k in 0..3 {
+            let next = ids.len() as u32;
+            let j = *ids.entry(key(c[k])).or_insert(next);
+            if j as usize == sums.len() {
+                sums.push((c[k], [0.0; 3], 0.0));
+                walls.push(Vec::new());
+                shortest.push(f32::INFINITY);
+            }
+            id[i][k] = j;
+            for e in [sub(c[(k + 1) % 3], c[k]), sub(c[(k + 2) % 3], c[k])] {
+                shortest[j as usize] = shortest[j as usize].min(dot(e, e).sqrt());
+            }
+            let s = &mut sums[j as usize];
+            s.1 = std::array::from_fn(|q| s.1[q] + p.dir[k][q]);
+            s.2 += 1.0;
+            let n = ns[i];
+            let w = &mut walls[j as usize];
+            if dot(n, n) > 0.5 && dot(p.dir[k], n) > 0.0 && !w.iter().any(|&m| dot(m, n) > 0.999) {
+                w.push(n);
+            }
+        }
+    }
+    let mut base = Vec::with_capacity(sums.len() * 4 * (2 + LEAN_WALLS));
+    for (((pos, sum, n), w), short) in sums.into_iter().zip(walls).zip(shortest) {
+        let len = dot(sum, sum).sqrt();
+        let (unit, along) = if len > 1e-6 { (sum.map(|x| x / len), len / n) } else { ([0.0; 3], 0.0) };
+        let still = w.len() > LEAN_WALLS;
+        base.extend([pos[0], pos[1], pos[2], if still { 0.0 } else { short }, unit[0], unit[1], unit[2], along]);
+        for q in 0..LEAN_WALLS {
+            match w.get(q) {
+                Some(m) if !still => base.extend([m[0], m[1], m[2], 1.0]),
+                _ => base.extend([0.0; 4]),
+            }
+        }
+    }
+    (id, base)
+}
 
 /// Floats of a crease in the creases' list (crease.wgsl): its start and the points along it,
 /// its end and where its points start in toward, the triangle's plane, the wall beyond's.
@@ -274,6 +332,13 @@ pub(crate) struct Shell {
     bound: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)>,
     textures: Option<wgpu::TextureView>,
     sampler: wgpu::Sampler,
+    /// Each frame before the march, each welded corner's way of looking at it turned a little
+    /// towards the eye where it's in sight, and the corner leaned that way (lean.wgsl): its
+    /// state (read by the march at 7), bind group and the welded corners' count.
+    lean_pipeline: wgpu::ComputePipeline,
+    lean_layout: wgpu::BindGroupLayout,
+    lean_uniform: wgpu::Buffer,
+    lean: Option<(wgpu::Buffer, wgpu::BindGroup, u32)>,
 }
 
 /// Pages a row of `Shell::heights` (shell.wgsl HEIGHTS_ROW).
@@ -318,6 +383,7 @@ impl Shell {
                 entry(4, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }),
                 entry(5, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
                 entry(6, wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE, read),
+                entry(7, wgpu::ShaderStages::VERTEX_FRAGMENT, read),
             ],
         });
         // The smoothing's (it writes the smoothed heights' bound, which the rest read at 6).
@@ -404,7 +470,7 @@ impl Shell {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Corner>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Uint32, 5 => Uint32],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Uint32, 5 => Uint32, 6 => Uint32],
                 })],
             },
             // The back faces (the tetrahedra's faces wound to face out, as the level's are):
@@ -486,7 +552,7 @@ impl Shell {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Corner>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Uint32, 5 => Uint32],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Uint32, 5 => Uint32, 6 => Uint32],
                 })],
             },
             // Seen from above only (wound as the triangle): reached from below, a line of
@@ -517,7 +583,25 @@ impl Shell {
         })
         .create_view(&Default::default());
         let gather = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("dream shell heights"), ..Default::default() });
-        Shell { pipeline, layout, inner, caps, homes, bind: None, creases, toward_layout, crease_layout, toward: None, mip_pages, smooth_faces, smooth_layout, smooth0_layout, smooth_bound, mips, near, far, smoothing: None, pages, uniform, tris, looks, depth, vertices: None, bound: None, textures: None, sampler, heights, gather, resolve, marched, marched_bind }
+        let lean_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("lean.wgsl"), source: wgpu::ShaderSource::Wgsl(include_str!("lean.wgsl").into()) });
+        let lean_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dream shell lean"),
+            entries: &[
+                entry(0, wgpu::ShaderStages::COMPUTE, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+                entry(1, wgpu::ShaderStages::COMPUTE, read),
+                entry(2, wgpu::ShaderStages::COMPUTE, write),
+            ],
+        });
+        let lean_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("dream shell lean"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("dream shell lean"), bind_group_layouts: &[Some(&lean_layout)], immediate_size: 0 })),
+            module: &lean_module,
+            entry_point: Some("lean_corners"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let lean_uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dream shell lean"), size: LEAN_UNIFORM, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        Shell { pipeline, layout, inner, caps, homes, bind: None, creases, toward_layout, crease_layout, toward: None, mip_pages, smooth_faces, smooth_layout, smooth0_layout, smooth_bound, mips, near, far, smoothing: None, pages, uniform, tris, looks, depth, vertices: None, bound: None, textures: None, sampler, heights, gather, resolve, marched, marched_bind, lean_pipeline, lean_layout, lean_uniform, lean: None }
     }
 
     /// The tetrahedra of the level's triangles' prisms (`tris`, as `level` was built from), the
@@ -533,6 +617,7 @@ impl Shell {
         let edges = edges(tris);
         let across = neighbours(tris);
         let pushes = pushed(tris, &edges);
+        let (weld, base) = welds(tris, &pushes);
         for (i, t) in tris.iter().enumerate() {
             let p = [0, 1, 2].map(|c| [t.pos[3 * c], t.pos[3 * c + 1], t.pos[3 * c + 2]]);
             let (n, _) = normal(&p);
@@ -572,6 +657,7 @@ impl Shell {
                 };
                 corners.extend(along);
             }
+            corners.extend([f32::from_bits(weld[i][0]), f32::from_bits(weld[i][1]), f32::from_bits(weld[i][2]), 0.0]);
             if n.iter().map(|x| x * x).sum::<f32>() < 0.5 {
                 continue;
             }
@@ -581,7 +667,7 @@ impl Shell {
             for (tet, corner) in TETS.iter().enumerate() {
                 let mut v = corner.map(|(o, out)| {
                     let k = push.order[o];
-                    Corner { pos: p[k], dir: push.dir[k], side: if out { 1.0 } else { -1.0 }, cap: push.cap[k], tri: i as u32, tet: tet as u32 }
+                    Corner { pos: p[k], dir: push.dir[k], side: if out { 1.0 } else { -1.0 }, cap: push.cap[k], tri: i as u32, tet: tet as u32, weld: weld[i][k] }
                 });
                 if push.odd() {
                     v.swap(1, 2);
@@ -599,7 +685,7 @@ impl Shell {
                 continue;
             }
             let push = &pushes[i];
-            prisms.extend([0, 1, 2].map(|k| Corner { pos: p[k], dir: push.dir[k], side: -1.0, cap: push.cap[k], tri: i as u32, tet: 0 }));
+            prisms.extend([0, 1, 2].map(|k| Corner { pos: p[k], dir: push.dir[k], side: -1.0, cap: push.cap[k], tri: i as u32, tet: 0, weld: weld[i][k] }));
         }
         self.vertices = (!prisms.is_empty()).then(|| {
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -658,6 +744,23 @@ impl Shell {
             entries: &[at(0, &self.uniform), at(2, level_buf), at(3, mem)],
         });
         self.smoothing = Some((view, smoothing, faces.len() as u32));
+        // Each welded corner first looked at straight on (along the unit mean, not leaning).
+        let stride = 4 * (2 + LEAN_WALLS);
+        let welded = base.len() / stride;
+        let mut state = vec![0.0f32; (welded * 8).max(8)];
+        for w in 0..welded {
+            state[8 * w..8 * w + 3].copy_from_slice(&base[stride * w + 4..stride * w + 7]);
+        }
+        let base_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dream shell welded corners"), size: base.len().max(stride) as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&base_buf, 0, bytemuck::cast_slice(&base));
+        let state_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dream shell lean"), size: state.len() as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&state_buf, 0, bytemuck::cast_slice(&state));
+        let lean_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dream shell lean"),
+            layout: &self.lean_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: self.lean_uniform.as_entire_binding() }, at(1, &base_buf), at(2, &state_buf)],
+        });
+        self.lean = Some((state_buf, lean_bind, welded as u32));
         self.rebind(device);
     }
 
@@ -668,7 +771,7 @@ impl Shell {
     }
 
     fn rebind(&mut self, device: &wgpu::Device) {
-        let (Some((corners, level, mem)), Some(textures)) = (&self.bound, &self.textures) else { return };
+        let (Some((corners, level, mem)), Some(textures), Some((lean, ..))) = (&self.bound, &self.textures, &self.lean) else { return };
         self.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("dream shell"),
             layout: &self.layout,
@@ -680,6 +783,7 @@ impl Shell {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(textures) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 at(6, &self.smooth_bound),
+                at(7, lean),
             ],
         }));
     }
@@ -690,9 +794,11 @@ impl Shell {
     /// `page_height` in mem, pages `page_res` texels a side) times `gain`, tapered to nothing
     /// over `taper` towards open edges; smoothed `smooth` levels (each twice the last's size,
     /// 0 none), and more far off by `far` (two levels more at 4 / `far` tiles); the halvings
-    /// stopped once the hit's narrowed to `pixel` of a pixel's width (0: all of them).
+    /// stopped once the hit's narrowed to `pixel` of a pixel's width (0: all of them); each
+    /// corner leaned `lean` of the way (0 none, 1 all) along the way it's been looked at from,
+    /// which turns `follow` of the way to the eye a frame where it's in sight (lean.wgsl).
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, view: &View, up: u32, width: u32, height: u32, level: &Level, limit: f32, gain: f32, bound: u32, taper: f32, page_height: u32, page_res: u32, smooth: f32, far: f32, pixel: f32, stamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, &str)) {
+    pub fn record(&self, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, view: &View, up: u32, width: u32, height: u32, level: &Level, limit: f32, gain: f32, bound: u32, taper: f32, page_height: u32, page_res: u32, smooth: f32, far: f32, pixel: f32, lean: f32, follow: f32, stamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, &str)) {
         let a = view.axes;
         let f = |x: f32| x.to_bits();
         let u: [u32; 32] = [
@@ -706,6 +812,25 @@ impl Shell {
             level.origin[0] as u32, level.origin[1] as u32, level.origin[2] as u32, page_res,
         ];
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&u));
+        if let Some((_, bind, welded)) = &self.lean
+            && *welded > 0
+        {
+            let l: [u32; 24] = [
+                f(view.pos[0]), f(view.pos[1]), f(view.pos[2]), f(follow.clamp(0.0, 1.0)),
+                f(a[0][0]), f(a[0][1]), f(a[0][2]), f(lean.max(0.0)),
+                f(a[1][0]), f(a[1][1]), f(a[1][2]), 0,
+                f(a[2][0]), f(a[2][1]), f(a[2][2]), 0,
+                f(view.focal * up as f32), f(width as f32 / 2.0), f(height as f32 / 2.0), 0,
+                *welded, 0, 0, 0,
+            ];
+            queue.write_buffer(&self.lean_uniform, 0, bytemuck::cast_slice(&l));
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("dream shell lean"), timestamp_writes: None });
+            pass.set_bind_group(0, bind, &[]);
+            pass.set_pipeline(&self.lean_pipeline);
+            pass.dispatch_workgroups(welded.div_ceil(64).min(65535), welded.div_ceil(64 * 65535), 1);
+            drop(pass);
+            stamp(enc, "shell lean");
+        }
         if let Some((view, smoothing, faces)) = &self.smoothing
             && (smooth > 0.0 || far > 0.0)
             && *faces > 0

@@ -519,7 +519,10 @@ fn gbuffer_check(dr: &mut DreamRenderer, input: &wgpu::Texture, output: &wgpu::T
 fn shell_step(limit: f32) -> Step {
     // SHELL_PIXEL: the halvings' stop (Step::shell_pixel), to see what it costs in accuracy.
     let shell_pixel = std::env::var("SHELL_PIXEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    Step { lr: 0.0, lr_fine: 0.0, shell: 1.0, height_max: limit, shell_pixel, ..Step::default() }
+    // SHELL_LEAN: the relief leaned the way it's looked at from (Step::shell_lean), turned
+    // straight to each view, for holes (the CPU's march doesn't lean).
+    let shell_lean = std::env::var("SHELL_LEAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    Step { lr: 0.0, lr_fine: 0.0, shell: 1.0, height_max: limit, shell_pixel, shell_lean, shell_follow: 1.0, ..Step::default() }
 }
 
 /// shell.wgsl's march done finely on the CPU for the shown pixel (x, y): the nearest (view

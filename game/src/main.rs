@@ -1389,6 +1389,12 @@ fn main() {
         if let Some(r) = opts.get("dream-shell-pixel") {
             atlas.step.shell_pixel = r.parse().expect("--dream-shell-pixel 0.25 (the relief found to this much of a pixel; 0: as finely as it goes)");
         }
+        if let Some(r) = opts.get("dream-shell-lean") {
+            atlas.step.shell_lean = r.parse().expect("--dream-shell-lean 0.5 (the relief leaned the way it was looked at from; 0: straight off the walls)");
+        }
+        if let Some(r) = opts.get("dream-shell-follow") {
+            atlas.step.shell_follow = r.parse().expect("--dream-shell-follow 0.02 (how far the lean turns towards the eye a frame; 0: frozen)");
+        }
         atlas.step.show_shell = show_shell;
         atlas.step.height_centred = !uncentred;
         if let Some(r) = opts.get("dream-displace") {

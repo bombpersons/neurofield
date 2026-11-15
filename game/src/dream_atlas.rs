@@ -815,6 +815,8 @@ pub fn panel(mut contexts: EguiContexts, sim: Res<Sim>, atlas: Option<NonSendMut
         ui.add(egui::Slider::new(&mut a.step.shell_smooth, 0.0..=6.0).text("the relief smoothed (levels, each twice as broad; 0: as dreamed)"));
         ui.add(egui::Slider::new(&mut a.step.shell_far, 0.0..=2.0).text("and smoother far off (two levels more at 4 / this tiles; 0: none)"));
         ui.add(egui::Slider::new(&mut a.step.shell_pixel, 0.0..=1.0).text("the relief found to this much of a pixel (0: as finely as it goes)"));
+        ui.add(egui::Slider::new(&mut a.step.shell_lean, 0.0..=1.0).text("the relief leaned the way it was looked at from (0: straight off the walls)"));
+        ui.add(egui::Slider::new(&mut a.step.shell_follow, 0.0..=0.2).logarithmic(true).text("which turns towards the eye this much a frame (0: frozen)"));
         ui.checkbox(&mut a.step.show_shell, "show the shells' relief alone (grey by height, red: nothing met)");
         ui.checkbox(&mut a.step.own_picture, "the level drawn by the dream renderer (not the PS1 picture) under the dream");
         ui.label("the torch, held (tiles from the eye):");

@@ -29,9 +29,9 @@ struct U {
 // to k + 1: bit k; shell.rs edges) and whether each is a crease; its corners' places on the
 // texture (two to a vec4); their light; their torch albedo; the way each corner is pushed, and
 // the most it's pushed in w; for each crease, how many points along it are in toward and where
-// they start (crease.wgsl).
+// they start (crease.wgsl); its corners' welded corners (lean).
 @group(0) @binding(1) var<storage, read> corners: array<vec4<f32>>;
-const TRI: u32 = 18u;
+const TRI: u32 = 19u;
 // A prism's tetrahedra (shell.rs TETS): each corner the triangle's corner by order (low two
 // bits), out (4) or in.
 const TETS = array<vec4<u32>, 3>(vec4<u32>(0u, 4u, 5u, 6u), vec4<u32>(0u, 1u, 6u, 5u), vec4<u32>(0u, 1u, 2u, 6u));
@@ -60,6 +60,18 @@ struct Out {
 
 // The largest |height| smoothed this frame (smooth.wgsl), f32 bits.
 @group(0) @binding(6) var<storage, read> smooth_bound: array<u32>;
+// Each welded corner's way it's been looked at from, and its offset across its pushes, added to
+// each (lean.wgsl; 0 where it doesn't lean), the shortest edge from it in w.
+@group(0) @binding(7) var<storage, read> lean: array<vec4<f32>>;
+// A corner pushed `r` leans across by no more than this of its shortest edge, so neighbouring
+// corners leaning by different amounts don't turn a small triangle's prism inside out.
+const SHORT_HOLD: f32 = 0.25;
+
+fn leaned(weld: u32, r: f32) -> vec3<f32> {
+    let o = lean[2u * weld + 1u];
+    let across = length(o.xyz) * r;
+    return o.xyz * select(1.0, SHORT_HOLD * o.w / across, across > SHORT_HOLD * o.w);
+}
 
 // How far the prisms reach out and in (shell.rs reach, LEAST_REACH): past the largest |height|
 // on any page, or smoothed, the largest smoothed one.
@@ -70,8 +82,9 @@ fn reach() -> f32 {
 }
 
 @vertex
-fn vs(@location(0) pos: vec3<f32>, @location(1) dir: vec3<f32>, @location(2) side: f32, @location(3) cap: f32, @location(4) tri: u32, @location(5) tet: u32) -> Out {
-    let d = pos + dir * side * min(reach(), cap) - u.pos.xyz;
+fn vs(@location(0) pos: vec3<f32>, @location(1) dir: vec3<f32>, @location(2) side: f32, @location(3) cap: f32, @location(4) tri: u32, @location(5) tet: u32, @location(6) weld: u32) -> Out {
+    let r = min(reach(), cap);
+    let d = pos + (dir + leaned(weld, r)) * side * r - u.pos.xyz;
     let q = vec3<f32>(dot(u.r0.xyz, d), dot(u.r1.xyz, d), dot(u.r2.xyz, d));
     var out: Out;
     // As raster.wgsl: screen x = w/2 + focal x/z, y = h/2 + focal y/z (y down); depth NEAR/z.
@@ -436,10 +449,11 @@ fn begin(tri: u32) {
     let lim = reach();
     frame_lim = lim;
     tc = array<vec3<f32>, 3>(a.xyz, b.xyz, c.xyz);
+    let welded = bitcast<vec4<u32>>(corners[ta + 18u]);
     for (var k = 0u; k < 3u; k++) {
         let pk = corners[ta + 12u + k];
         reaches[k] = min(lim, pk.w);
-        dirs[k] = pk.xyz * reaches[k];
+        dirs[k] = (pk.xyz + leaned(welded[k], reaches[k])) * reaches[k];
     }
     mapping();
     tri_at = ta;
