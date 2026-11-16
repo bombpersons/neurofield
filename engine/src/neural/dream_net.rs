@@ -43,7 +43,7 @@ const ACCUMULATE: u32 = 2;
 /// How far round each part the drawn box reaches, in its radii: nothing shows further out.
 const CROP_MARGIN: f32 = 2.5;
 /// Alpha at which the drawn layer starts and finishes being opaque (`edge`).
-const EDGE: (f32, f32) = (0.3, 0.7);
+const EDGE: (f32, f32) = (0.6, 0.9);
 /// Tiles of a crop the U-Net draws, in pixels of each of its scales: one workgroup.
 const TILE: usize = 16;
 /// How near a part a tile must be to be drawn: `TILE_MARGIN` radii and `TILE_PAD` pixels.
@@ -1058,7 +1058,7 @@ mod tests {
             h,
             data: (0..3 * h).flat_map(|_| [rgb[0], rgb[1], rgb[2], alpha, fog, depth]).collect(),
         };
-        let layers = [layer(0, [0.9, 0.2, 0.1], 0.6, 0.2, 2.0), layer(1, [0.1, 0.5, 0.8], 0.55, 0.0, 1.0), layer(1, [1.0; 3], 1.0, 0.0, 9.0)];
+        let layers = [layer(0, [0.9, 0.2, 0.1], 0.8, 0.2, 2.0), layer(1, [0.1, 0.5, 0.8], 0.75, 0.0, 1.0), layer(1, [1.0; 3], 1.0, 0.0, 9.0)];
         let depth = vec![5.0; w * h];
         let fog = [0.1, 0.1, 0.2];
         let picture: Vec<f32> = (0..w * h * 3).map(|i| (i % 7) as f32 / 7.0).collect();
