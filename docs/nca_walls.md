@@ -229,7 +229,7 @@ Plan, agreed in outline 2026-11-15 (branch `nca-walls`, from `dream-atlas`). Bui
 
 ### Step 2, first pass (2026-11-15)
 
-Running, uncommitted, with MeshNCA's demo models as stand-ins (their repo states no licence:
+Running, with MeshNCA's demo models as stand-ins (their repo states no licence:
 for testing only, not to ship). Try it with:
 
 ```sh
@@ -253,14 +253,24 @@ target/release/game --dream-atlas runs/dream/googlenet.safetensors --dream-nca r
   walls); doors, levers, things and creatures stay ordinary PS1 meshes and depth-test against
   the bulges. At 320×240, chunky nearest cells, the PS1's 15-bit colour and 4×4 dither.
 - **Cost on the RX 580:** NCA about 1.25 ms a step for ~18 pages in sight; the whole dream about
-  6.5 ms a frame in the PS1 pass (march ~1.1 ms) against 13.8 ms at 3× (march ~7.5 ms). The
-  game as a whole runs at 40-50 fps either way: something else holds it under 60, still to find.
-- **Not yet:** creatures hiding behind bulges is wired but unchecked (none came in sight in the
-  test walks); the old whole-screen dream's loop is still there (idle at step size 0); the
-  shell's lighting and fog are its own, close to but not exactly the PS1 material's; the premade
-  models don't move once grown (motion is step 4); psx-bevy is ours now (forked from the
-  template) but the shell's code lives in `dream-renderer` and `game/src/dream_atlas.rs`, to
-  be sorted out in the big review.
+  6.5 ms a frame in the PS1 pass (march ~1.1 ms) against 13.8 ms at 3× (march ~7.5 ms). With
+  nothing else using the CPU the game holds 60 fps with the walls as without them; the cellar's
+  big room (about 95 pages in sight) costs about 4 fps. What holds the game under 60 is the
+  creatures: one filling the screen takes the creature net about 66 ms on the GPU (~62 ms of it
+  its 3×3 convolutions), with or without the walls (`engine/examples/dream_net_bench.rs` times
+  it). Local training runs on the CPU take the game to 40-50 fps too.
+- **Creatures hide behind the bulges** (checked 2026-11-16): they're drawn by the engine's own
+  camera (`engine/src/render/flesh.rs`), which now runs after the PS1 camera and starts from its
+  depth, the shell's bulges in it (`DreamRenderer::lay_depth`, `lay_depth.wgsl`), in place of
+  the level's flat walls drawn depth-only. Where a bulge cuts across a creature the edge is a PS1
+  pixel wide.
+- **Lighting and fog** match the PS1 material's: flat with no automata, the shell and the
+  PS1 material differ by about 1% outdoors and in the cellar, the rest the PS1's affine texture
+  warp, which the shell leaves out.
+- **The old whole-screen dream** has no camera, picture or display of its own in the PS1 pass.
+- **Not yet:** the premade models don't move once grown (motion is step 4); psx-bevy is ours
+  now (forked from the template) but the shell's code lives in `dream-renderer` and
+  `game/src/dream_atlas.rs`, to be sorted out in the big review.
 
 ## Open questions
 

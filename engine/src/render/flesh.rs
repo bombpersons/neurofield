@@ -361,8 +361,13 @@ impl Material2d for OverlayMaterial {
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct FleshLayers(pub bool);
 
+/// The camera drawing the creatures into the flesh image.
 #[derive(Component)]
-struct FleshCamera;
+pub struct FleshCamera;
+
+/// The level's parts drawn depth-only for the flesh camera, to hide the creatures behind them.
+#[derive(Component)]
+pub struct Occluder;
 
 #[derive(Component)]
 struct Overlay;
@@ -659,7 +664,7 @@ pub(crate) fn spawn(
 ) -> Vec<Entity> {
     let mut out: Vec<Entity> = level_meshes
         .iter()
-        .map(|m| commands.spawn((Mesh3d(m.clone()), MeshMaterial3d(occluder.clone()), RenderLayers::layer(FLESH_LAYER))).id())
+        .map(|m| commands.spawn((Mesh3d(m.clone()), MeshMaterial3d(occluder.clone()), RenderLayers::layer(FLESH_LAYER), Occluder)).id())
         .collect();
     if !scene.creatures_move {
         out.extend(spawn_flesh(commands, meshes, images, materials, &scene.flesh, view));

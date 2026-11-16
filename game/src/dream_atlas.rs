@@ -123,6 +123,9 @@ struct DreamGpu {
     /// draw again on a frame with no new job (the walls are the shell's alone there).
     last_psx: Option<(u32, View, Step)>,
     psx_drawn: bool,
+    /// The PS1 camera's depth this frame, the shell marched into it (psx_pass), for the
+    /// creatures' camera to start from (creature_depth).
+    ps1_depth: Option<bevy::render::render_resource::Texture>,
     /// The CPU's G-buffer of the last frame drawn, to compare once its work is done.
     check: Option<Check>,
 }
@@ -511,10 +514,20 @@ impl DreamAtlas {
 }
 
 /// The dream renderer in the render world, on Bevy's device, behind a camera of its own; and
-/// the window's display moved after it.
+/// the window's display moved after it. Or, drawn in the PS1 camera's pass (psx_pass), in that.
 pub fn setup(app: &mut App, atlas: &DreamAtlas) {
     let shared = atlas.shared.clone();
     let image = atlas.image.clone();
+    if atlas.psx_pass {
+        // Drawn in the PS1 camera's own pass: no camera, picture or display of its own.
+        app.add_plugins((ExtractComponentPlugin::<ShellView>::default(), ExtractComponentPlugin::<CreatureView>::default()));
+        app.add_systems(Update, (mark_level_camera, mark_creature_camera, hide_level_meshes, hide_occluders));
+        app.sub_app_mut(RenderApp)
+            .insert_resource(DreamGpu { shared, renderer: None, last_psx: None, psx_drawn: false, ps1_depth: None, check: None })
+            .add_systems(Core3d, psx_pass.after(main_opaque_pass_3d).before(main_transparent_pass_3d).in_set(Core3dSystems::MainPass))
+            .add_systems(Core3d, creature_depth.before(main_opaque_pass_3d).in_set(Core3dSystems::MainPass));
+        return;
+    }
     app.add_systems(Startup, move |mut commands: Commands| {
         // (A projection, though it draws nothing, or Bevy never works out its target's size
         // and so never runs it.)
@@ -526,21 +539,38 @@ pub fn setup(app: &mut App, atlas: &DreamAtlas) {
         ));
     });
     app.add_systems(Update, display_after);
-    if atlas.psx_pass {
-        app.add_plugins(ExtractComponentPlugin::<ShellView>::default());
-        app.add_systems(Update, (mark_level_camera, hide_level_meshes));
-        app.sub_app_mut(RenderApp).add_systems(Core3d, psx_pass.after(main_opaque_pass_3d).before(main_transparent_pass_3d).in_set(Core3dSystems::MainPass));
-    }
     app.sub_app_mut(RenderApp)
-        .insert_resource(DreamGpu { shared, renderer: None, last_psx: None, psx_drawn: false, check: None })
+        .insert_resource(DreamGpu { shared, renderer: None, last_psx: None, psx_drawn: false, ps1_depth: None, check: None })
         .init_schedule(DreamGraph)
         .add_systems(DreamGraph, dream);
 }
 
-/// The level's camera marked for the dream to draw in its pass (psx_pass).
-fn mark_level_camera(mut commands: Commands, cams: Query<Entity, (With<engine::render::LevelCamera>, Without<ShellView>)>) {
-    for c in &cams {
+/// The level's camera marked for the dream to draw in its pass (psx_pass), its depth readable
+/// for the creatures' camera (creature_depth).
+fn mark_level_camera(mut commands: Commands, mut cams: Query<(Entity, &mut Camera3d), (With<engine::render::LevelCamera>, Without<ShellView>)>) {
+    use bevy::render::render_resource::TextureUsages;
+    for (c, mut cam) in &mut cams {
+        cam.depth_texture_usages = (TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING).into();
         commands.entity(c).insert(ShellView);
+    }
+}
+
+/// The creatures' camera (the engine's flesh camera) marked to start from the PS1 camera's
+/// depth (creature_depth), and so drawn after it.
+fn mark_creature_camera(mut commands: Commands, mut cams: Query<(Entity, &mut bevy::camera::Camera), (With<engine::render::FleshCamera>, Without<CreatureView>)>) {
+    for (c, mut cam) in &mut cams {
+        cam.order = CREATURE_ORDER;
+        commands.entity(c).insert(CreatureView);
+    }
+}
+
+/// The level's flat walls no longer hide the creatures: the PS1 camera's depth does, with the
+/// shell's bulges and hollows (creature_depth).
+fn hide_occluders(mut parts: Query<&mut Visibility, With<engine::render::Occluder>>) {
+    for mut v in &mut parts {
+        if *v != Visibility::Hidden {
+            *v = Visibility::Hidden;
+        }
     }
 }
 
@@ -569,10 +599,6 @@ fn dream(mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<Render
     let shared_arc = gpu.shared.clone();
     let mut shared = shared_arc.lock().unwrap();
     make_renderer(gpu, &mut shared, &device, &queue);
-    // Drawn in the PS1 camera's pass instead (psx_pass).
-    if shared.job.as_ref().is_some_and(|j| j.psx_pass) {
-        return;
-    }
     let Some(r) = gpu.renderer.as_mut() else { return };
     if let Some(check) = gpu.check.take() {
         compare(r, &check);
@@ -598,6 +624,26 @@ fn dream(mut gpu: ResMut<DreamGpu>, device: Res<RenderDevice>, queue: Res<Render
 #[extract_app(RenderApp)]
 pub struct ShellView;
 
+/// The creatures' camera, which starts from the PS1 camera's depth (creature_depth).
+#[derive(Component, Clone, Copy, ExtractComponent)]
+#[extract_app(RenderApp)]
+pub struct CreatureView;
+
+/// The creatures' camera's order: after the level's (0), before psx-bevy's screen pass (999).
+const CREATURE_ORDER: isize = 500;
+
+/// Before the creatures' camera draws: its depth is the PS1 camera's (the shell's bulges in
+/// it, psx_pass), stretched over it, so the walls hide them where they bulge in front.
+fn creature_depth(view: ViewQuery<(&ViewTarget, &ViewDepthStencilTexture), With<CreatureView>>, mut gpu: ResMut<DreamGpu>, mut ctx: RenderContext) {
+    let gpu = &mut *gpu;
+    let Some(from) = gpu.ps1_depth.take() else { return };
+    let Some(r) = gpu.renderer.as_mut() else { return };
+    let (target, depth) = view.into_inner();
+    let size = target.main_texture().size();
+    let into = depth.get_attachment(bevy::render::render_resource::StoreOp::Store);
+    r.lay_depth(ctx.command_encoder(), &from, into, (size.width, size.height));
+}
+
 /// In the PS1 camera's pass, after its opaque meshes (`--dream-psx`): the level's walls are the
 /// shell's, marched into the camera's own depth (so what's drawn there hides it where nearer,
 /// and what's drawn after is hidden by its bulges) and laid into its frame, PS1-shaded.
@@ -620,6 +666,7 @@ fn psx_pass(view: ViewQuery<(&ViewTarget, &ViewDepthStencilTexture), With<ShellV
         eprintln!("dream atlas: drawing the walls in the PS1 camera's pass");
     }
     let (target, depth) = view.into_inner();
+    gpu.ps1_depth = Some(depth.texture().clone());
     let depth = depth.texture().create_view(&Default::default());
     if let Err(e) = r.encode_psx(ctx.command_encoder(), width, &v, &step, target.main_texture_view(), target.main_texture_format(), &depth) {
         eprintln!("dream atlas: {e}");
@@ -873,11 +920,14 @@ pub fn draw(
             atlas.stills
         );
     }
-    if let Ok(mut sprite) = sprite.single_mut() {
-        if sprite.image != atlas.image {
-            sprite.image = atlas.image.clone();
+    // Drawn in the PS1 camera's pass: no picture of its own to show.
+    if !atlas.psx_pass {
+        if let Ok(mut sprite) = sprite.single_mut() {
+            if sprite.image != atlas.image {
+                sprite.image = atlas.image.clone();
+            }
+            sprite.rect = Some(Rect::new(0.0, 0.0, (width * atlas.up) as f32, (H * atlas.up) as f32));
         }
-        sprite.rect = Some(Rect::new(0.0, 0.0, (width * atlas.up) as f32, (H * atlas.up) as f32));
     }
 }
 

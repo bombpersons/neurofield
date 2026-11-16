@@ -735,6 +735,9 @@ pub struct DreamRenderer {
     /// The pipeline laying the shell's pixels into a camera's frame (`encode_psx`), by the
     /// frame's format: it, its bind group and its uniform.
     blit: Option<(wgpu::TextureFormat, wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer)>,
+    /// The pipeline laying one camera's depth into another's (`lay_depth`): it, its layout and
+    /// its uniform.
+    lay: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Buffer)>,
     next_set: usize,
     /// Milliseconds the last frame took, start to finish, waiting for the GPU.
     pub last_ms: f32,
@@ -1370,6 +1373,7 @@ impl DreamRenderer {
             nca_models: [-1, -1],
             nca_dirty: false,
             blit: None,
+            lay: None,
             next_set: 1,
             last_ms: 0.0,
             profiler: std::sync::Mutex::new(profiler),
@@ -1639,6 +1643,55 @@ impl DreamRenderer {
         pass.set_viewport(0.0, 0.0, width as f32, h as f32, 0.0, 1.0);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// `from` (Depth32Float, with TEXTURE_BINDING) laid into `into`, a depth attachment of
+    /// `size` pixels of the same view, stretched over it nearest: so a camera drawing after
+    /// `encode_psx`'s (the creatures') is hidden by the shell's bulges as the PS1 camera's
+    /// things are.
+    pub fn lay_depth(&mut self, encoder: &mut wgpu::CommandEncoder, from: &wgpu::Texture, into: wgpu::RenderPassDepthStencilAttachment, size: (u32, u32)) {
+        if self.lay.is_none() {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("lay_depth.wgsl"), source: wgpu::ShaderSource::Wgsl(include_str!("lay_depth.wgsl").into()) });
+            let uniform = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lay depth"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("lay depth"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                    wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                ],
+            });
+            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("lay depth"),
+                layout: Some(&self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("lay depth"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 })),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[] }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.lay = Some((pipeline, layout, uniform));
+        }
+        let Some((pipeline, layout, uniform)) = &self.lay else { return };
+        self.queue.write_buffer(uniform, 0, bytemuck::cast_slice(&[size.0, size.1, 0, 0]));
+        let view = from.create_view(&wgpu::TextureViewDescriptor { aspect: wgpu::TextureAspect::DepthOnly, ..Default::default() });
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lay depth"),
+            layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("lay depth"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(into),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[]);
         pass.draw(0..3, 0..1);
     }
 

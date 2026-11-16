@@ -13,7 +13,7 @@ Config(
     levels: Some("levels"),
     // The creature (dream) network: the game draws the creatures with it, and as PS1
     // models while the player sees clearly.
-    dream: Some("runs/dream_pilot/dream.safetensors"),
+    dream: Some("runs/distil3/dream_0030000.safetensors"),
     // Filmed eyes for the level turned to flesh (`game --sculpt`, the editor's
     // Play > Flesh walls).
     eyes: Some("data/eye"),

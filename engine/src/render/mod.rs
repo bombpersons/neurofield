@@ -26,7 +26,7 @@ use crate::world::tex;
 use psx_bevy::psx::{PsxBeyond, PsxMaterial, PsxView};
 use std::collections::HashMap;
 
-pub use flesh::{DreamCreatures, FleshLayers, FleshTarget};
+pub use flesh::{DreamCreatures, FleshCamera, FleshLayers, FleshTarget, Occluder};
 
 pub const TF: f32 = T as f32;
 /// Level triangles are split until no edge is longer than this (world units):
