@@ -75,6 +75,14 @@ class Targets(Dataset):
         )
 
 
+def streakiness(x, where):
+    """The mean step between neighbouring pixels of x ([B, C, H, W]), down and across, where
+    `where` ([B, 1, H, W]) is 1."""
+    down = ((x[:, :, 1:] - x[:, :, :-1]).abs() * where[:, :, 1:]).mean()
+    across = ((x[:, :, :, 1:] - x[:, :, :, :-1]).abs() * where[:, :, :, 1:]).mean()
+    return down + across
+
+
 class Trainer:
     def __init__(self, data, out, batch=16, lr=3e-4, workers=2, device=None, lpips_weight=0.5, ema_decay=0.999,
                  clip_from=None, cuts=4, part_weight=0.25, whole_weight=0.5, negative_weight=0.3, halo_weight=0.5):
@@ -158,9 +166,10 @@ class Trainer:
             part_s, whole_s, neg, ce = scores(self.clip, self.text, self.candidates, self.position, composite(back, pred),
                                               q, whole, judged, self.cuts, self.amp)
             part_s = part_s.nan_to_num(0).sum() / (~part_s.isnan()).sum().clamp(min=1)
-            # CLIP left horizontal streaks in the faint alpha round the creatures: keep it smooth there.
+            # CLIP left horizontal streaks in the faint alpha round the creatures, and, with only
+            # the alpha kept smooth there, in their colour: keep both smooth there.
             halo = (ta < 0.3).float()
-            streaks = ((pa[:, :, 1:] - pa[:, :, :-1]).abs() * halo[:, :, 1:]).mean() + ((pa[:, :, :, 1:] - pa[:, :, :, :-1]).abs() * halo[:, :, :, 1:]).mean()
+            streaks = streakiness(pa, halo) + streakiness(pred[:, :3] * pa, halo)
             loss = loss + clip_weight * (self.part_weight * ce - self.whole_weight * whole_s.mean() + self.negative_weight * neg.mean() + self.halo_weight * streaks)
             clip_terms = (ce, part_s, whole_s.mean(), neg.mean())
         return (loss, l1, perceptual, *clip_terms)
