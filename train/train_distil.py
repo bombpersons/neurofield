@@ -167,8 +167,9 @@ class Trainer:
                                               q, whole, judged, self.cuts, self.amp)
             part_s = part_s.nan_to_num(0).sum() / (~part_s.isnan()).sum().clamp(min=1)
             # CLIP left horizontal streaks in the faint alpha round the creatures, and, with only
-            # the alpha kept smooth there, in their colour: keep both smooth there.
-            halo = (ta < 0.3).float()
+            # the alpha kept smooth there, in their colour: keep both smooth there, which takes in
+            # the net's own faint alpha (the game shows it from 0.3), not only the target's.
+            halo = ((ta < 0.3) | (pa.detach() < 0.7)).float()
             streaks = streakiness(pa, halo) + streakiness(pred[:, :3] * pa, halo)
             loss = loss + clip_weight * (self.part_weight * ce - self.whole_weight * whole_s.mean() + self.negative_weight * neg.mean() + self.halo_weight * streaks)
             clip_terms = (ce, part_s, whole_s.mean(), neg.mean())
